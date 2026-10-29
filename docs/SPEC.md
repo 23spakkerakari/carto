@@ -152,7 +152,7 @@ These hold for every line of code. Each has at least one automated test.
 | **Entity**            | A business object family named by the customer (Order, Claim, Member, Employee, File) that groups linked identifier fields.                                                                                       |
 | **Transaction**       | All events belonging to one business record's journey, assembled by following key links.                                                                                                                          |
 | **Batch**             | A grouping identifier that spans many transactions (a nightly file containing 5,000 claims). Linked to transactions, never merged into one.                                                                       |
-| **Node**              | A step in the flow graph: `(system, event type)`.                                                                                                                                                                 |
+| **Node**              | A step in the flow graph: a `(system, template)` by default, or the named event type a reviewer groups templates into (Section 9.8).                                                                                                                                                                 |
 | **Hop / Edge**        | A transition between two nodes observed in transactions, with volume and latency statistics.                                                                                                                      |
 | **Flow**              | The common paths that transactions of one entity take through the graph.                                                                                                                                          |
 | **Expectation**       | A rule, learned or configured, about what should happen next and by when (hop deadline, file schedule, volume baseline).                                                                                          |
@@ -279,7 +279,7 @@ The system is split into **edge** and **core** even though both run inside the c
 
 Why: (1) it limits blast radius inside the customer's network; (2) it makes the security review concrete ("here is the one component that touches PHI"); (3) it lets us later host core as SaaS without redesign, because core never needed raw data.
 
-The boundary is enforced in code: core services have no code path that accepts raw identifier values except the search box query, which is forwarded to the edge tokenize endpoint and never stored.
+The boundary is enforced in code: core services have no code path that accepts raw identifier values except the search box query, which is forwarded to the edge tokenize endpoint and never stored, and the reveal response, which core forwards to the requesting user and never stores, logs or caches (Section 8.4).
 
 ### 5.3 Components
 
@@ -462,7 +462,9 @@ PARTITION BY toYYYYMMDD(observed_at)
 ORDER BY (tenant_id, token, observed_at, event_id, field_ref, form)
 TTL toDateTime(observed_at) + INTERVAL 30 DAY;
 
--- transaction membership (append-only; latest assignment wins via version)
+-- transaction membership (append-only; latest assignment wins via version per (txn_id, event_id);
+-- a moved event keeps its old row under the merged-away txn_id, so a reader that starts from an
+-- event takes argMax(txn_id, version) and a reader that starts from a transaction uses survivors)
 CREATE TABLE txn_events (
   tenant_id LowCardinality(String),
   txn_id String,
@@ -475,7 +477,7 @@ ORDER BY (tenant_id, txn_id, observed_at, event_id)
 TTL toDateTime(observed_at) + INTERVAL 90 DAY;
 ```
 
-Also: `hop_stats_hourly` (aggregated counts, error counts, latency sketch bytes per hop per hour; retention 13 months) and `field_value_samples` (bottom-k token samples per field for verification).
+Also: `hop_transitions` (one row per consecutive node pair within a transaction: the two event ids, node ids, latency, error flag; retention as events), `hop_stats_hourly` (aggregated counts, error counts, latency sketch bytes per hop per hour, fed from `hop_transitions` for the current day and rebuilt nightly for the previous day from the ordered surviving transactions; retention 13 months) and `field_value_samples` (bottom-k token samples per field for verification).
 
 Retention TTLs are set from configuration at install and on change (migration job rewrites TTLs).
 
@@ -492,15 +494,20 @@ Key tables (all include `tenant_id`, `created_at`, `updated_at`; migrations via 
 | `field_sketches`                   | `field_id, window_start, minhash bytea, hll bytea, bottomk bytea`                                                                                                                             |
 | `key_links`                        | `id, field_a, form_a, field_b, form_b, link_type (exact / bridge / composite), score, evidence_json, status (proposed / accepted / rejected / auto_accepted / stale), decided_by, decided_at` |
 | `composite_rules`                  | `id, key_link_id, components_json (field+form+weight), window_seconds`                                                                                                                        |
-| `entities`                         | `id, name, description`                                                                                                                                                                       |
+| `entities`                         | `id, name, description, max_span_days`                                                                                                                                                                       |
 | `entity_fields`                    | `entity_id, field_id, form`                                                                                                                                                                   |
-| `nodes`                            | `id, system_id, template_id or event_type, display_name, is_terminal`                                                                                                                         |
+| `nodes`                            | `id (system_id/template_id), system_id, template_id, event_type_label, display_name, version`                                                                                                                         |
 | `hops`                             | `id, from_node, to_node, entity_id, support, p_next, latency_p50/p95/p99, is_manual_score, is_manual_confirmed`                                                                               |
-| `txn_token_index`                  | `token, txn_id, last_seen, expires_at` (PK token)                                                                                                                                             |
+| `txn_token_index`                  | `tenant_id, token, txn_id, last_seen, expires_at` (PK `tenant_id, token`)                                                                                                                                             |
 | `txn_merges`                       | `from_txn, to_txn, merged_at` (union-find history)                                                                                                                                            |
-| `transactions`                     | `txn_id, entity_id, first_seen, last_seen, current_node, status, event_count, flow_variant`                                                                                                   |
-| `batch_keys`                       | `token, field_ref, fanout, first_seen`                                                                                                                                                        |
-| `batches`                          | `batch_id, token, field_ref, first_seen, txn_count, completed_count`                                                                                                                          |
+| `transactions`                     | `txn_id, entity_id, first_seen, last_seen, current_node, status (in_progress / completed / errored / stalled), event_count, flow_variant, merged_into`                                                                                                   |
+| `batch_keys`                       | `tenant_id, token, field_ref, fanout, first_seen` (PK `tenant_id, token`)                                                                                                                                                        |
+| `batches`                          | `batch_id, token, field_ref, node_id, first_seen, txn_count, expected_count (nullable), completed_count`                                                                                                                          |
+| `batch_txns`                       | `batch_id, txn_id`                                                                                                                                                                             |
+| `txn_token_fanout`                 | `tenant_id, token, day, txn_count` (hub detection, Section 9.7)                                                                                                                              |
+| `terminal_nodes`                   | `entity_id, node_id, share, computed_at` (Section 9.8)                                                                                                                                        |
+| `flow_variants`                    | `entity_id, node_path, count, window_end`                                                                                                                                                      |
+| `system_clock_offsets`             | `system_id, offset_ms, estimated_at, link_count` (Section 9.8; kept off `systems`, whose ETag is its update time)                                                                             |
 | `expectations`                     | `id, kind (hop_deadline / schedule / volume / error_rate / freshness), target_json, params_json, source (learned / configured), enabled, calendar_id`                                         |
 | `calendars`                        | `id, timezone (IANA), business_hours_json, holidays_json`                                                                                                                                     |
 | `alerts`                           | `id, dedupe_key, expectation_id, severity, status (open / acked / resolved / snoozed), title, summary, evidence_json, affected_count, opened_at, resolved_at`                                 |
@@ -733,15 +740,15 @@ Every decision is audited and versioned. Rejected pairs are remembered and not r
 
 ### 9.7 Transaction assembly
 
-Runs every 30 s on new events by ingest watermark.
+Runs every 30 s on new events by store watermark (`stored_at`, ADR 0046).
 
 1. **Keys per event:** tokens of `(field, form)` pairs that participate in accepted transaction links or bridges.
-2. **Hub detection:** track distinct transactions per token per day. A token exceeding the fanout threshold (default 50) becomes a **batch key**: it is removed from the merge index, a `batches` record is created, and transactions carrying it are linked to the batch. The nightly claims file with 5,000 claims becomes one batch with 5,000 linked transactions, not one giant transaction.
+2. **Hub detection:** track distinct transactions per token per day. A token exceeding the fanout threshold (default 50) becomes a **batch key**: it is removed from the merge index, a `batches` record is created, and transactions carrying it are linked to the batch. The nightly claims file with 5,000 claims becomes one batch with 5,000 linked transactions, not one giant transaction. Ends of batch-role links (Section 9.3) are batch keys from the start; the fanout threshold applies to transaction-role tokens.
 3. **Union-find:** for each event, look up its keys in `txn_token_index`. No hit: create a transaction (ULID). One hit: join it. Several hits: merge into the oldest transaction, record in `txn_merges`, repoint index entries, and append new `txn_events` versions for moved events.
-4. **Guardrails:** refuse a merge that would exceed 10,000 events or a time span beyond the entity's max span (default 14 days). Refused merges increment an `ambiguous_merge` counter on the responsible link and surface it in review.
+4. **Guardrails:** refuse a merge that would exceed 10,000 events or a time span beyond the entity's max span (default 14 days). Refused merges increment an `ambiguous_merges` counter on the responsible link and surface it in review.
 5. **Expiry:** index entries expire after the entity's max span of inactivity.
-6. **Ordering:** events within a transaction are ordered by `observed_at` corrected for estimated clock skew (Section 9.8), ties broken by source sequence then ingest order.
-7. **Status:** `completed` (reached a terminal node), `errored` (last event has error severity), `stalled` (set by detector), `in_progress`.
+6. **Ordering:** events within a transaction are ordered by `observed_at` corrected for estimated clock skew (Section 9.8), ties broken by `ingested_at`, then `event_id` (the canonical event carries no source sequence).
+7. **Status:** `completed` (its current node is terminal for its entity, or the transaction is settled: no event for the entity's quiet span, Section 9.8), `errored` (the last event's severity is `error` or `fatal`), `stalled` (set by the detector), `in_progress`. Precedence when several hold: `stalled`, `errored`, `completed`, `in_progress`.
 8. **Late events** are merged normally; status and alerts are re-evaluated.
 
 Performance target: assembly keeps up with 2,000 events/s on the reference node, with the index in PostgreSQL (UNLOGGED tables are not allowed; durability matters) and batch upserts.
@@ -750,8 +757,8 @@ Performance target: assembly keeps up with 2,000 events/s on the reference node,
 
 - **Nodes:** `(system, template)` by default; reviewers can group templates into one named event type ("Warehouse: PO created").
 - **Hops:** consecutive nodes within transactions. Hourly aggregates in `hop_stats_hourly`: count, error count, DDSketch of latency.
-- **Hop probability** `p_next(X to Y)`: share of completed transactions visiting X whose next node is Y.
-- **Terminal nodes:** nodes after which at least 95% of completed transactions (older than the entity's p99 completion time) have no further events.
+- **Hop probability** `p_next(X to Y)`: share of settled transactions (below) visiting X whose next node is Y.
+- **Terminal nodes:** per entity, nodes after which at least 95% of the entity's settled transactions have no further events. A transaction is settled when no event has arrived for the entity's quiet span: three times its observed p99 inter-event gap, capped at the entity's max span, which is also the default before any gap is observed. (Defining `completed` by terminal nodes and terminal nodes by completed transactions, as earlier wording did, bootstraps nothing.)
 - **Flow variants:** the top 10 node sequences per entity with counts, shown in the UI.
 - **Clock skew:** for directed links with tight lags (IQR under 10 s), a consistently negative lag between two systems means their clocks disagree. Estimate a per-system offset by the median of negative lags, use it only for ordering, never rewrite stored timestamps, and show a warning when the offset exceeds 30 s.
 
@@ -931,6 +938,8 @@ Internal (edge to core and core to edge, mTLS only, not exposed through ingress)
 
 Conventions: cursor pagination (`?cursor=&limit=`, max 500), RFC 7807 problem details for errors, request IDs, `ETag`/`If-Match` on mutable resources to prevent lost updates.
 
+Trace responses: `GET /traces/search` returns transaction and batch summaries (ids, entity, status, node path, times, the forms that matched), never tokens; `GET /traces/{txn_id}` lists each event's identifiers (field, form, shape, token) so the Reveal button can name what to reveal (Section 13 keeps them behind "Details"); a transaction id merged into another answers 303 to the survivor.
+
 ---
 
 ## 13. UI
@@ -940,7 +949,7 @@ Accessible (WCAG 2.2 AA target), keyboard-navigable, works at 1280 px and above;
 | Screen                     | Contents                                                                                                                                                                                                                       |
 | -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | **Home / Status board**    | Flow cards (green/amber/red), open alerts, "Where is my \_\_\_?" search                                                                                                                                                        |
-| **Trace**                  | Search by any identifier; results list; timeline view of a transaction: hops, systems, timestamps, latency vs. normal (shaded band from p50 to p95), errors, current location, linked batch; Reveal button for permitted users |
+| **Trace**                  | Search by any identifier; results list; timeline view of a transaction: hops, systems, timestamps, latency vs. normal (shaded band from p50 to p95), errors, current location, linked batch; Reveal button for permitted users; a transaction older than the event retention shows its membership and node path only, with events marked expired |
 | **Map**                    | System graph (React Flow): nodes by system, hops with volume and latency, manual-hop badges, stale-link warnings, clock-skew warnings; click a hop for stats and recent transactions                                           |
 | **Map › Review**           | Proposed links queue with evidence in plain language, accept/reject/association; entity naming; node naming                                                                                                                    |
 | **Alerts**                 | List with filters; detail with path, causes, evidence, impact, deliveries, ticket links, timeline of the alert                                                                                                                 |
@@ -1075,12 +1084,12 @@ Maintain the full version in `docs/threat-model.md` and review it at each milest
 | --- | ---------------------------------------------------------- | --------------------------------------------------------------------------------------------- | ---------------------------------------------------------- |
 | 1   | Stolen connector credentials used to read customer systems | Secret manager references, least privilege, read-only verification, rotation, egress policies | Secrets never present in DB, API responses or logs (tests) |
 | 2   | Core database exfiltration                                 | Core holds tokens, shapes and low-cardinality attributes only                                 | Leak test                                                  |
-| 3   | Dictionary attack on tokens through search                 | Rate limits, audit, self-alert on unusual search volume per user, key never leaves edge       | Rate-limit and audit tests                                 |
+| 3   | Dictionary attack on tokens through search                 | Rate limits, audit, self-alert on unusual search volume per user, key never leaves edge       | Rate-limit, audit and step-up tests (M3); self-alert test (M4)                                 |
 | 4   | Malicious log content causing XSS                          | Text-only rendering, strict CSP                                                               | Playwright XSS corpus                                      |
 | 5   | Prompt injection through log content                       | Data fencing, no tools, schema-validated output, human confirmation                           | Injection corpus yields only schema-valid suggestions      |
 | 6   | SSRF via connector or channel URLs                         | DNS resolution checks, IP pinning, allowlists                                                 | SSRF suite (metadata IPs, rebinding, redirects)            |
 | 7   | ReDoS, XXE, zip bombs                                      | RE2, defusedxml, archive limits                                                               | Payload fixtures                                           |
-| 8   | Insider bulk-revealing values                              | Separate grant, step-up auth, rate limits, audit, alert on bulk reveal                        | Authz and rate tests                                       |
+| 8   | Insider bulk-revealing values                              | Separate grant, step-up auth, rate limits, audit, alert on bulk reveal                        | Authz, step-up and rate tests (M3); bulk-reveal alert test (M4)                                       |
 | 9   | Supply chain compromise                                    | Signed images, SBOM, pinned dependencies, scanners, CODEOWNERS                                | CI gates                                                   |
 | 10  | Log flood or denial of service                             | Backpressure, per-source quotas, buffer caps, flood sampling that keeps errors                | Load tests                                                 |
 | 11  | Audit tampering                                            | Hash chain, INSERT-only grants, external anchoring                                            | `audit verify` test                                        |
@@ -1127,7 +1136,7 @@ pytest + Hypothesis. Properties that must hold:
 - Normalization is idempotent; forms are deterministic.
 - Tokens are deterministic per key version and differ across key versions and domains.
 - The classifier never emits a raw value from a field classified as identifier, person, amount, secret or quarantined.
-- Union-find merges never lose or duplicate events; merge order doesn't change final membership.
+- Union-find merges never lose or duplicate events; merge order doesn't change final membership when no guardrail fires (under a guardrail the refused merges are reported on the link).
 - Parsers never crash or hang on fuzzed input (bounded time per record).
 - Coverage of at least 85% on `edge/pipeline`, `core/linker`, `core/assembler`, `core/detector`.
 
@@ -1137,13 +1146,13 @@ testcontainers for PostgreSQL, ClickHouse, an SFTP server, an SMTP catcher (Mail
 
 ### 18.3 Security tests
 
-- **Leak test (most important):** the simulator plants unique marker values in every sensitive and high-cardinality field. The test scans everything crossing edge to core, all core database contents, all service logs, all notifications, LLM gateway payloads and offline bundles. Any marker found fails the build.
+- **Leak test (most important):** the simulator plants unique marker values in every sensitive and high-cardinality field. The test scans everything crossing edge to core (the reveal response is checked separately: the markers must appear in the reveal response body and nowhere else), all core database contents, all service logs, all notifications, LLM gateway payloads and offline bundles. Any marker found fails the build.
 - **Read-only tests:** SQL connector against databases where the test user has write grants (connector must refuse to enable); SFTP mock server records operations (only list/stat allowed); Semgrep rule self-test.
 - Authorization matrix, SSRF suite, XSS end-to-end, ReDoS/XXE/zip-bomb fixtures, CSRF, cookie flags, audit chain verification, OWASP ZAP baseline against the running Compose stack.
 
 ### 18.4 Eval harness
 
-`make eval SCENARIO=all` runs simulator scenarios end to end and compares engine output to ground truth:
+`make eval SCENARIO=<scenario>` runs one simulator scenario end to end (CI runs each) and compares engine output to ground truth:
 
 | Metric                                                      | v1 target (simulator)                                         |
 | ----------------------------------------------------------- | ------------------------------------------------------------- |
@@ -1163,11 +1172,11 @@ Output: JSON plus a Markdown report. CI stores history; PRs touching the engine 
 
 ### 18.5 End-to-end
 
-Playwright runs user journeys 4.2 to 4.7 against the Compose stack fed by the simulator in live mode, including axe accessibility checks.
+Playwright runs user journeys 4.2 to 4.7 against the Compose stack fed by the simulator in live mode, including axe accessibility checks. The XSS corpus and the axe checks also run against the mocked API in the web build.
 
 ### 18.6 Load
 
-k6 (API) and a Python load generator (ingest) validate Section 17 targets on the reference node before each milestone sign-off from M3 on.
+k6 (API) and a Python load generator (ingest) validate the Section 17 targets whose feature exists by that milestone, on the reference node, before each milestone sign-off from M3 on.
 
 ---
 
@@ -1309,7 +1318,7 @@ Build in order. Each milestone ends with: acceptance criteria passing in CI, an 
 
 - Transaction assembly with hub/batch handling and guardrails, flow graph and hop stats, clock skew estimation, trace search (edge tokenize), trace timeline UI, map graph UI, reveal flow with step-up.
 
-**Accept:** transaction F1 and batch targets met; searching any system's identifier returns the full path; trace search p95 under 2 s at target volume.
+**Accept:** transaction F1 and batch targets met; searching any system's identifier returns the full path; trace search p95 under 2 s at the Section 17 volume (30 days, 200M events) on the reference node, with CI asserting the query shape on one day of scenario A.
 
 ### M4: Watch
 

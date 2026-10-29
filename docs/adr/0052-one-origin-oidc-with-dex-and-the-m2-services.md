@@ -44,3 +44,11 @@ origin.
 
 - `authlib` is a core dependency; Dex is a container image in the dev profile only.
 - The web scaffold (ADR 0009) is built in this milestone with the review screen.
+
+## Amendments
+
+- 2026-10-28 (M3 plan revision): step-up is not wired. `OidcClient.begin` sends no `max_age` or
+  `prompt`, `GET /auth/login` takes no parameters, and the callback issues a new session and
+  redirects to `/` (`core/carto_core/api/oidc.py`, `routes_auth.py`). What exists is
+  `OidcSettings.step_up_max_age_seconds` and `Principal.authenticated_at` from `auth_time`.
+  The M3 plan (decision 9) builds the step-up flow.

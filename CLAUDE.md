@@ -56,7 +56,11 @@ import, lint or test it.
   waits on that founder call and the partner gate; `fix-c2` is not merged into it yet. Next:
   M3 trace (write docs/plans/M3.md first).
 - M3 Trace: plan drafted 2026-10-20 on branch `m3-trace` (docs/plans/M3.md, cut from
-  `m2-map-discovery` at 1e1b2d4). Eight founder questions open; code waits on the M2
+  `m2-map-discovery` at 1e1b2d4); revised 2026-10-28 on branch `m3-trace-spec` (cut from
+  `spec-data-layer` at c2e9a75) after five read-only reviews of the code against the plan:
+  corrections in the plan's "What the code read changed", editorial spec fixes in 3, 5.2, 7.2,
+  7.3, 9.7, 9.8, 12, 13, 15, 18, 21, threat-model rows 3 and 8, an amendment on ADR 0052.
+  Thirteen founder questions open (five of them spec changes); code waits on the M2
   acceptance, the answers and the `fix-c2` rebase. ADRs from 0060 when code starts.
 - Spec direction 2026-10-21 on branch `spec-data-layer` (ADR 0059, proposed): hosted data layer,
   business rules and hosted deployment as v2 (spec 22.2 to 22.4); partial failures, stale data

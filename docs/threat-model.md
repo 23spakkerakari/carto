@@ -7,12 +7,12 @@ bottom. Each row names the mitigation and the automated check that proves it.
 | --- | --- | --- | --- | --- |
 | 1 | Stolen connector credentials used to read customer systems | Secret manager references, least privilege, read-only verification, rotation, egress policies | Secrets never present in DB, API responses or logs (tests) | M1 |
 | 2 | Core database exfiltration | Core holds tokens, shapes and low-cardinality attributes only | Leak test (Section 18.3) | M1 |
-| 3 | Dictionary attack on tokens through search | Rate limits, audit, self-alert on unusual search volume per user, key never leaves edge | Rate-limit and audit tests | M3 |
+| 3 | Dictionary attack on tokens through search | Rate limits, audit, self-alert on unusual search volume per user, key never leaves edge | Rate-limit and audit tests | M3 (rate limits, audit, step-up); self-alert on search volume M4 |
 | 4 | Malicious log content causing XSS | Text-only rendering (React escaping, ESLint sink rules, no Markdown or auto-linking of customer strings), strict CSP in the build and on the web proxy | Playwright XSS corpus (`web/e2e/xss.spec.ts`), CSP watch (`web/e2e/csp.spec.ts`), build check | M2 (built 2026-10-18) |
 | 5 | Prompt injection through log content | Payloads built from metadata tables only, nonce-fenced as data, no tools, strict output schema with enumerated label types, invalid output discarded and counted, suggestions shown as "Suggested" until confirmed, egress allowlist, audit per call | Injection corpus yields only schema-valid suggestions (`core/tests/test_core_llm_injection.py`), egress tests, provider conformance | M2 (built 2026-10-18, ADR 0054) |
 | 6 | SSRF via connector or channel URLs | DNS resolution checks, IP pinning, allowlists | SSRF suite (metadata IPs, rebinding, redirects) | M1 |
 | 7 | ReDoS, XXE, zip bombs | RE2, defusedxml, archive limits | Payload fixtures | M1 |
-| 8 | Insider bulk-revealing values | Separate grant, step-up auth, rate limits, audit, alert on bulk reveal | Authz and rate tests | M3 |
+| 8 | Insider bulk-revealing values | Separate grant, step-up auth, rate limits, audit, alert on bulk reveal | Authz and rate tests | M3 (grant, step-up, rate limits, audit); alert on bulk reveal M4 |
 | 9 | Supply chain compromise | Signed images, SBOM, pinned dependencies, scanners, CODEOWNERS | CI gates | M0 (lockfile with hashes, scanners, SBOM signing, CODEOWNERS, Renovate); images from M1 |
 | 10 | Log flood or denial of service | Backpressure, per-source quotas, buffer caps, flood sampling that keeps errors | Load tests | M1 |
 | 11 | Audit tampering | Hash chain, INSERT-only grants, external anchoring | `audit verify` test | M1 edge (hourly anchor, ADR 0033); M2 core chain, append-only trigger, `carto-core audit-verify` (ADR 0051); external anchoring of the core log M6 |
