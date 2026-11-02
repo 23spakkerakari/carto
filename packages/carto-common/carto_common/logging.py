@@ -137,11 +137,23 @@ __all__ = [
     "redact",
 ]
 
-QUIET_LIBRARY_LOGGERS: Final[tuple[str, ...]] = ("httpx", "httpcore", "hpack", "urllib3")
+QUIET_LIBRARY_LOGGERS: Final[tuple[str, ...]] = (
+    "httpx",
+    "httpcore",
+    "hpack",
+    "urllib3",
+    "presidio-analyzer",
+    "decision_process",
+    "spacy",
+    "drain3",
+)
 """Third-party loggers held at WARNING: at INFO and DEBUG they write the full request URL with
-its query string (``HTTP Request: GET https://host/path?param=value``) or wire-level detail, which
-can carry identifier values the redaction masks are not guaranteed to recognise (spec 14.12, 2.3
-invariant 7). Their warnings and errors still flow through :func:`redact`."""
+its query string (``HTTP Request: GET https://host/path?param=value``), wire-level detail, or, for
+the PII detector (``presidio-analyzer`` and its ``decision_process`` logger) and the template
+miner, the raw text around a detected entity and the message being mined, which can carry
+identifier values the redaction masks are not guaranteed to recognise (spec 14.12, 2.3 invariant
+7; the 2026-11-02 leak run caught an amount in presidio's "Context list is" debug line). Their
+warnings and errors still flow through :func:`redact`."""
 
 REDACTED: Final = "[REDACTED]"
 DROPPED: Final = "[DROPPED]"
@@ -742,8 +754,8 @@ def configure_logging(
     libraries (uvicorn, httpx, database drivers) and stray ``logging.getLogger()`` calls are
     rendered through :func:`redact` too, never through ``logging.lastResort``. Libraries that
     configure their own handlers must be told not to (uvicorn: ``log_config=None``). The HTTP
-    client loggers of :data:`QUIET_LIBRARY_LOGGERS` are held at WARNING because their INFO lines
-    carry request URLs and query strings.
+    client, detector and miner loggers of :data:`QUIET_LIBRARY_LOGGERS` are held at WARNING
+    because their INFO and DEBUG lines carry request URLs, query strings and raw log text.
 
     Python warnings are logged as WARNING records of the :data:`WARNINGS_LOGGER` logger, and
     uncaught exceptions (main thread, other threads, and the "exception ignored" path of
