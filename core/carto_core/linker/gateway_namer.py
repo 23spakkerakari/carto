@@ -27,7 +27,12 @@ from typing import TYPE_CHECKING
 from carto_common.logging import get_logger
 from carto_core.linker.families import EntityNamer, entity_id_for
 from carto_core.linker.naming import MAX_NAME_LEN
-from carto_core.llm_gateway.gateway import GatewayDisabledError, LlmGateway, PayloadRefusedError
+from carto_core.llm_gateway.gateway import (
+    DailyCapExceededError,
+    GatewayDisabledError,
+    LlmGateway,
+    PayloadRefusedError,
+)
 from carto_core.llm_gateway.payload import MetadataReader, PayloadError, build_name_entity_payload
 from carto_core.llm_gateway.schemas import FieldSummary, ProviderError
 
@@ -85,7 +90,13 @@ class GatewayNamer:
                 _MembersReader(self._reader, members), self._tenant, entity_id
             )
             answer = self._gateway.suggest_entity_name(self._tenant, request)
-        except (GatewayDisabledError, ProviderError, PayloadError, PayloadRefusedError) as exc:
+        except (
+            DailyCapExceededError,
+            GatewayDisabledError,
+            ProviderError,
+            PayloadError,
+            PayloadRefusedError,
+        ) as exc:
             log.info("entity name from the dictionary", reason=type(exc).__name__)
             return self._fall_back(members)
         except Exception as exc:  # a reader or sink failure must never stop the family rebuild

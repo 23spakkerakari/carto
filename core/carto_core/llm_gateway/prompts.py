@@ -33,7 +33,7 @@ __all__ = [
     "task_prompt",
 ]
 
-PROMPT_VERSION: Final = "2026-10-18.1"
+PROMPT_VERSION: Final = "2026-11-02.1"
 
 FENCE_BEGIN: Final = "===== BEGIN CARTO DATA {nonce} ====="
 FENCE_END: Final = "===== END CARTO DATA {nonce} ====="
@@ -58,7 +58,10 @@ _COMMON_RULES: Final = (
     "Rules for each suggestion: `target_id` is copied exactly from the data; `label_type` is "
     "one of the allowed types; `label` is a short business name of at most 48 characters "
     "using letters, digits, spaces and `_:/().-`; `confidence` is between 0 and 1; "
-    "`rationale` is at most 200 characters and quotes nothing from the data verbatim."
+    "`rationale` is at most 200 characters of plain printable text on one line: no line "
+    "breaks, none of the characters `<`, `>`, `{{` or `}}`, no link or URL, and it quotes "
+    "nothing from the data verbatim. A rationale that breaks these rules is blanked; the "
+    "label is kept."
 )
 
 _TASK_RULES: Final[dict[TaskKind, str]] = {

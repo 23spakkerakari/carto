@@ -4,11 +4,13 @@ overwrite each other, an unknown field the profiler meets becomes a tokenized id
 inventory replaces systems, sources and pins as a whole (missing sources disabled, pins applied
 to existing and later fields), sources carry their latest heartbeat, and listing pages by
 field reference. The PostgreSQL implementation runs the same cases in
-``test_core_m2_integration.py``; its SQL is checked here for shape."""
+``test_core_m2_integration.py``; its SQL is checked here for shape, and its template-ceiling
+check is run against a recording engine to show which statements it issues (ADR 0073)."""
 
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 
@@ -417,6 +419,99 @@ def test_list_fields_filters_and_pages_by_field_ref(store: InMemoryMetadataStore
     assert store.list_fields("other") == []
 
 
+class _RecordingConnection:
+    """Answers the two ceiling statements from a dict of ``(system, id)`` rows and records
+    which statements ran; anything else is a test error."""
+
+    def __init__(self, held: dict[str, set[str]], statements: list[str]) -> None:
+        self._held = held
+        self._statements = statements
+
+    def __enter__(self) -> _RecordingConnection:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        return None
+
+    def execute(self, statement: object, parameters: dict[str, object]) -> _RecordingResult:
+        text = str(statement)
+        self._statements.append(text)
+        if text == str(metadata_module._TEMPLATE_KNOWN):
+            systems = parameters["batch_systems"]
+            ids = parameters["batch_ids"]
+            assert isinstance(systems, list) and isinstance(ids, list)
+            known: dict[str, int] = {}
+            for system_id, template_id in zip(systems, ids, strict=True):
+                known.setdefault(system_id, 0)
+                if template_id in self._held.get(system_id, set()):
+                    known[system_id] += 1
+            return _RecordingResult(
+                [SimpleNamespace(system_id=s, known=k) for s, k in known.items()]
+            )
+        if text == str(metadata_module._TEMPLATE_TOTALS):
+            systems = parameters["systems"]
+            assert isinstance(systems, list)
+            return _RecordingResult(
+                [
+                    SimpleNamespace(system_id=s, total=len(self._held.get(s, set())))
+                    for s in systems
+                    if s in self._held
+                ]
+            )
+        msg = f"unexpected statement: {text[:40]}"
+        raise AssertionError(msg)
+
+
+class _RecordingResult:
+    def __init__(self, rows: list[SimpleNamespace]) -> None:
+        self._rows = rows
+
+    def all(self) -> list[SimpleNamespace]:
+        return self._rows
+
+
+class _RecordingEngine:
+    def __init__(self, held: dict[str, set[str]]) -> None:
+        self.statements: list[str] = []
+        self._held = held
+
+    def connect(self) -> _RecordingConnection:
+        return _RecordingConnection(self._held, self.statements)
+
+
+def test_postgres_ceiling_counts_totals_only_for_systems_the_batch_would_grow() -> None:
+    """ADR 0073: a batch of ids the system already holds is answered by the key probes alone;
+    the row total (a range scan over the system's rows) is issued only for the systems that
+    gain an id, and only those systems are named."""
+    engine = _RecordingEngine({"sys_orders": {"tpl_0", "tpl_1", "tpl_2"}, "sys_pay": {"tpl_x"}})
+    store = metadata_module.PostgresMetadataStore(engine)  # type: ignore[arg-type]
+    known = template(template_id="tpl_1")
+    other = template(template_id="tpl_x", system_id="sys_pay")
+    assert store.templates_over_ceiling("default", [known, known, other], ceiling=1) is None
+    assert engine.statements == [str(metadata_module._TEMPLATE_KNOWN)], "no total count"
+
+    engine.statements.clear()
+    new = template(template_id="tpl_new")
+    assert store.templates_over_ceiling("default", [known, new, other], ceiling=4) is None
+    assert engine.statements == [
+        str(metadata_module._TEMPLATE_KNOWN),
+        str(metadata_module._TEMPLATE_TOTALS),
+    ]
+    assert store.templates_over_ceiling("default", [known, new, other], ceiling=3) == "sys_orders"
+    # A system the store has never seen has no rows and no known ids: the total is asked for
+    # (it would grow) and comes back absent, which counts as zero.
+    engine.statements.clear()
+    fresh = template(template_id="tpl_a", system_id="sys_fresh")
+    assert store.templates_over_ceiling("default", [fresh], ceiling=1) is None
+    assert (
+        store.templates_over_ceiling(
+            "default", [fresh, template(template_id="tpl_b", system_id="sys_fresh")], ceiling=1
+        )
+        == "sys_fresh"
+    )
+    assert engine.statements.count(str(metadata_module._TEMPLATE_TOTALS)) == 2
+
+
 def test_postgres_statements_are_fixed_text_with_bound_parameters() -> None:
     """Spec 14.7 by inspection; the container test runs them."""
     statements = [
@@ -437,14 +532,23 @@ def test_postgres_statements_are_fixed_text_with_bound_parameters() -> None:
     assert "class = EXCLUDED" not in profile_upsert and "policy = EXCLUDED" not in profile_upsert
     assert "LEFT JOIN source_health" in str(metadata_module._SOURCES)
     assert "FOR UPDATE" not in str(metadata_module._PIN_FIELDS)
-    # ADR 0073: one grouped count per batch for the template ceiling, the batch's pairs joined
-    # from two bound arrays (no per-row concatenation, no FILTER over the system's rows); one
-    # count per inventory for the edge ceiling, taken under the tenant's advisory lock.
-    counts = str(metadata_module._TEMPLATE_COUNTS)
-    assert counts.startswith("SELECT") and "GROUP BY t.system_id" in counts
-    assert "= ANY(:systems)" in counts
-    assert "unnest(CAST(:batch_systems AS text[]), CAST(:batch_ids AS text[]))" in counts
-    assert "||" not in counts and "FILTER" not in counts
+    # ADR 0073: two grouped statements for the template ceiling. The known count is driven by
+    # the batch's pairs, bound as two arrays and unnested, so each pair is one primary-key probe
+    # (no per-row concatenation, no FILTER over the system's rows); the total is a plain count
+    # of the named systems' rows, issued only for the systems the batch would grow. One count
+    # per inventory for the edge ceiling, taken under the tenant's advisory lock.
+    known = str(metadata_module._TEMPLATE_KNOWN)
+    assert known.startswith(
+        "SELECT b.system_id, COUNT(t.id) AS known "
+        "FROM unnest(CAST(:batch_systems AS text[]), CAST(:batch_ids AS text[]))"
+    )
+    assert "LEFT JOIN templates AS t ON t.tenant_id = :tenant_id" in known
+    assert "GROUP BY b.system_id" in known
+    assert "||" not in known and "FILTER" not in known and "COUNT(*)" not in known
+    totals = str(metadata_module._TEMPLATE_TOTALS)
+    assert totals.startswith("SELECT system_id, COUNT(*) AS total FROM templates")
+    assert "= ANY(:systems)" in totals and "GROUP BY system_id" in totals
+    assert not hasattr(metadata_module, "_TEMPLATE_COUNTS"), "the one-pass count is gone"
     edges = str(metadata_module._EDGE_COUNTS)
     assert (
         edges.startswith("SELECT") and "FROM edge_inventories WHERE tenant_id = :tenant_id" in edges

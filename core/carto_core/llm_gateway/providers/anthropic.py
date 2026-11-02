@@ -1,8 +1,9 @@
 """The Anthropic Messages API adapter (ADR 0054; spec 9.9).
 
 ``POST {endpoint}/v1/messages`` with ``x-api-key`` from ``llm.api_key_file``,
-``anthropic-version: 2023-06-01``, the configured model and ``max_tokens``, the task prompt as
-``system`` and the fenced payload as the one user message. No tools are declared (spec 9.9: the
+``anthropic-version: 2023-06-01``, the configured model, ``max_tokens`` and ``temperature`` 0
+(the task is classification; the OpenAI adapter sends the same), the task prompt as ``system``
+and the fenced payload as the one user message. No tools are declared (spec 9.9: the
 model has no tools). The answer is the first ``text`` content block; token counts come from
 ``usage``. Everything else, errors included, is the shared behaviour of
 :mod:`carto_core.llm_gateway.providers`.
@@ -69,6 +70,7 @@ class AnthropicProvider:
         body: dict[str, object] = {
             "model": self._model,
             "max_tokens": self._settings.max_output_tokens,
+            "temperature": 0,
             "system": task_prompt,
             "messages": [{"role": "user", "content": payload_json}],
         }

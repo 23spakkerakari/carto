@@ -164,6 +164,7 @@ def test_the_request_shape_and_the_parsed_answer(tmp_path: Path, name: str) -> N
     body = json.loads(request.content)
     assert body["model"] == "model-x"
     assert body["max_tokens"] == 256
+    assert body["temperature"] == 0, "both adapters ask for the deterministic answer"
     assert exchange.messages(body) == (TASK_PROMPT, PAYLOAD)
     assert "tools" not in body
     if name == "anthropic":

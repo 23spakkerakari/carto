@@ -1,0 +1,139 @@
+{
+  "counts": {
+    "alerts": 0,
+    "batches": 0,
+    "entities": 2,
+    "events": 28036,
+    "faults": 2,
+    "links": 14,
+    "transactions": 1090
+  },
+  "days": 28,
+  "generated_at": "2026-11-02T11:03:18.326229Z",
+  "metrics": {
+    "batch_key_precision": {
+      "comparison": ">=",
+      "label": "Batch key detection precision",
+      "status": "n/a",
+      "target": 0.95,
+      "unit": "ratio",
+      "value": null
+    },
+    "batch_key_recall": {
+      "comparison": ">=",
+      "label": "Batch key detection recall",
+      "status": "n/a",
+      "target": 0.9,
+      "unit": "ratio",
+      "value": null
+    },
+    "entity_purity": {
+      "comparison": ">=",
+      "label": "Entity family purity",
+      "status": "pass",
+      "target": 0.95,
+      "unit": "ratio",
+      "value": 1.0
+    },
+    "false_alerts_per_flow_day": {
+      "comparison": "<=",
+      "label": "False alerts on fault-free days (per flow per day)",
+      "status": "pass",
+      "target": 1.0,
+      "unit": "per_flow_day",
+      "value": 0.0
+    },
+    "fault_detection_recall": {
+      "comparison": ">=",
+      "label": "Injected fault detection recall",
+      "status": "fail",
+      "target": 1.0,
+      "unit": "ratio",
+      "value": 0.0
+    },
+    "likely_cause_top1": {
+      "comparison": ">=",
+      "label": "Likely cause top-1 accuracy on injected faults",
+      "status": "n/a",
+      "target": 0.7,
+      "unit": "ratio",
+      "value": null
+    },
+    "link_precision_composite": {
+      "comparison": ">=",
+      "label": "Composite link precision",
+      "status": "pass",
+      "target": 0.85,
+      "unit": "ratio",
+      "value": 1.0
+    },
+    "link_precision_exact_bridge": {
+      "comparison": ">=",
+      "label": "Exact and bridge link precision",
+      "status": "pass",
+      "target": 0.95,
+      "unit": "ratio",
+      "value": 1.0
+    },
+    "link_recall_composite": {
+      "comparison": ">=",
+      "label": "Composite link recall",
+      "status": "pass",
+      "target": 0.7,
+      "unit": "ratio",
+      "value": 0.75
+    },
+    "link_recall_exact_bridge": {
+      "comparison": ">=",
+      "label": "Exact and bridge link recall",
+      "status": "fail",
+      "target": 0.9,
+      "unit": "ratio",
+      "value": 0.8
+    },
+    "manual_hop_precision": {
+      "comparison": ">=",
+      "label": "Manual hop precision",
+      "status": "n/a",
+      "target": 0.8,
+      "unit": "ratio",
+      "value": null
+    },
+    "manual_hop_recall": {
+      "comparison": ">=",
+      "label": "Manual hop recall",
+      "status": "fail",
+      "target": 0.8,
+      "unit": "ratio",
+      "value": 0.0
+    },
+    "time_to_detect_p95_seconds": {
+      "comparison": "<=",
+      "label": "Time to detect after deadline (p95)",
+      "status": "n/a",
+      "target": 120.0,
+      "unit": "seconds",
+      "value": null
+    },
+    "transaction_pairwise_f1": {
+      "comparison": ">=",
+      "label": "Transaction pairwise F1",
+      "status": "fail",
+      "target": 0.95,
+      "unit": "ratio",
+      "value": 0.0
+    },
+    "visibility_gap_attribution": {
+      "comparison": ">=",
+      "label": "Visibility gap correctly attributed",
+      "status": "n/a",
+      "target": 1.0,
+      "unit": "ratio",
+      "value": null
+    }
+  },
+  "predictions_present": true,
+  "regressions": [],
+  "scenario": "people_ops",
+  "seed": 1
+}

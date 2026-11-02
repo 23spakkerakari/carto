@@ -12,6 +12,12 @@ adapter cannot weaken:
 - **Fencing.** The payload JSON travels between nonce-bearing delimiter lines inside the user
   message; the system prompt states the task, the closed label set and the output schema
   (:mod:`.prompts`).
+- **Daily cap.** ``llm.max_calls_per_day`` (default 2,000) bounds the provider calls one
+  process makes per UTC day, every attempt counted, on the gateway's injected clock. A call past
+  it is refused before the provider is touched: counted (``carto_llm_daily_cap_total``), audited
+  as ``refused_cap`` and raised as :class:`DailyCapExceededError`, on which callers fall back
+  to the heuristic dictionary like any other failure. The counter is per process (each worker
+  has its own) and resets at the first call of a new UTC day.
 - **Retries.** At most two retries, on :class:`~.providers.TransientProviderError` only
   (408, 429, 5xx, timeouts, transport errors), with a short back-off. Each attempt is a call and
   gets its own audit row.
@@ -38,7 +44,7 @@ import re
 import threading
 import time
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING, Final
 
 from pydantic import BaseModel, ValidationError
@@ -68,6 +74,7 @@ __all__ = [
     "MAX_ATTEMPTS",
     "MAX_OUTPUT_CHARS",
     "METRIC_NAMES",
+    "DailyCapExceededError",
     "GatewayDisabledError",
     "GatewayMetrics",
     "InvalidOutputError",
@@ -95,6 +102,10 @@ METRIC_NAMES: Final[tuple[tuple[str, str], ...]] = (
         "Suggestions dropped (unknown target, duplicate, cap).",
     ),
     ("carto_llm_audit_failures_total", "Audit rows that could not be written."),
+    (
+        "carto_llm_daily_cap_total",
+        "Calls refused because llm.max_calls_per_day was reached (per process, UTC day).",
+    ),
 )
 
 _CODE_FENCE: Final = re.compile(
@@ -110,6 +121,10 @@ _REQUEST_MODELS: Final[dict[TaskKind, type[BaseModel]]] = {
 
 class GatewayDisabledError(Exception):
     """``llm.enabled`` is false: use the heuristic dictionary (spec 9.9)."""
+
+
+class DailyCapExceededError(Exception):
+    """``llm.max_calls_per_day`` is reached for this process and UTC day: use the dictionary."""
 
 
 class PayloadRefusedError(ValueError):
@@ -235,10 +250,35 @@ class LlmGateway:
         self._sleep = sleep
         self._tenant_id_max_len = tenant_id_max_len
         self._model = str(getattr(provider, "model", settings.model or ""))[:128]
+        self._cap_lock = threading.Lock()
+        self._cap_day: date | None = None
+        self._cap_calls = 0
 
     @property
     def enabled(self) -> bool:
         return self._settings.enabled
+
+    @property
+    def calls_today(self) -> int:
+        """Provider calls admitted so far on the current UTC day of the gateway's clock."""
+        with self._cap_lock:
+            return self._cap_calls if self._cap_day == self._today() else 0
+
+    def _today(self) -> date:
+        now = self._clock()
+        return (now.astimezone(UTC) if now.tzinfo is not None else now).date()
+
+    def _admit(self) -> bool:
+        """Take one call of today's allowance, or say no (module docstring, "Daily cap")."""
+        today = self._today()
+        with self._cap_lock:
+            if self._cap_day != today:
+                self._cap_day = today
+                self._cap_calls = 0
+            if self._cap_calls >= self._settings.max_calls_per_day:
+                return False
+            self._cap_calls += 1
+            return True
 
     def suggest_labels(self, tenant_id: str, request: LabelFieldRequest) -> SuggestionList:
         """Field labels for ``request.fields``; at most one suggestion per field."""
@@ -276,6 +316,20 @@ class LlmGateway:
 
         completion: Completion | None = None
         for attempt in range(MAX_ATTEMPTS):
+            if not self._admit():
+                self.metrics.inc("carto_llm_daily_cap_total")
+                self._record(
+                    tenant, task, digest, None, 0, CallStatus.REFUSED_CAP, "DailyCapExceededError"
+                )
+                log.warning(
+                    "llm call refused by the daily cap",
+                    task=task.value,
+                    status=CallStatus.REFUSED_CAP.value,
+                    cap=self._settings.max_calls_per_day,
+                    attempt=attempt + 1,
+                )
+                msg = "llm.max_calls_per_day reached for this process today"
+                raise DailyCapExceededError(msg)
             if attempt:
                 self.metrics.inc("carto_llm_retries_total")
                 self._sleep(RETRY_BACKOFF_SECONDS[min(attempt - 1, len(RETRY_BACKOFF_SECONDS) - 1)])

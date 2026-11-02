@@ -110,6 +110,13 @@ and the edge forward and inventory tests pass against the stricter contract.
 
 ## Consequences
 
+- Amendment 2026-11-02 (sweep of the LLM gateway): `llm.max_calls_per_day` (default 2,000)
+  caps gateway calls per UTC day per process; a refused call is counted
+  (`carto_llm_daily_cap_total`), audited with status `refused_cap` and the namer falls back
+  to the dictionary. The Anthropic adapter sends `temperature: 0` like the OpenAI one, and
+  the prompt now states the rationale rule (plain printable text, no `<>{}`, no links; an
+  unclean rationale is blanked and the label kept), prompt version 2026-11-02.1.
+
 - Version skew parks batches. A core that refuses a shape an older edge still emits (or a
   newer edge emits a shape this list has not learned to mask) answers 422 for the whole batch,
   and the edge parks it (ADR 0043): one value stops a batch, by design, until the edge is

@@ -25,6 +25,7 @@ from carto_core.llm_gateway.audit import (
 )
 from carto_core.llm_gateway.gateway import (
     MAX_OUTPUT_CHARS,
+    DailyCapExceededError,
     GatewayDisabledError,
     GatewayMetrics,
     InvalidOutputError,
@@ -53,7 +54,9 @@ TENANT = "default"
 TOKEN = "t1.Zm9vYmFyYmF6cXV4MTIzND"  # noqa: S105 - token-shaped, not a secret
 
 
-def _settings(tmp_path: Path, *, enabled: bool = True) -> LlmSettings:
+def _settings(
+    tmp_path: Path, *, enabled: bool = True, max_calls_per_day: int = 2000
+) -> LlmSettings:
     key = tmp_path / "key"
     key.write_text("sk-test")
     return LlmSettings(
@@ -62,6 +65,7 @@ def _settings(tmp_path: Path, *, enabled: bool = True) -> LlmSettings:
         endpoint="https://llm.example",
         model="model-x",
         api_key_file=key,
+        max_calls_per_day=max_calls_per_day,
     )
 
 
@@ -79,13 +83,20 @@ class FakeClock:
 
 
 class Harness:
-    def __init__(self, tmp_path: Path, provider: FakeProvider, *, enabled: bool = True) -> None:
+    def __init__(
+        self,
+        tmp_path: Path,
+        provider: FakeProvider,
+        *,
+        enabled: bool = True,
+        max_calls_per_day: int = 2000,
+    ) -> None:
         self.provider = provider
         self.sink = InMemoryCallAuditSink()
         self.clock = FakeClock()
         self.sleeps: list[float] = []
         self.gateway = LlmGateway(
-            _settings(tmp_path, enabled=enabled),
+            _settings(tmp_path, enabled=enabled, max_calls_per_day=max_calls_per_day),
             provider,
             self.sink,
             self.clock,
@@ -203,6 +214,13 @@ def test_the_prompt_fences_the_payload_and_states_the_contract(tmp_path: Path) -
     assert '"label_type"' in call.task_prompt, "the JSON schema is in the prompt"
     assert "purchase_order" in call.task_prompt, "the label enumeration is in the prompt"
     assert PROMPT_VERSION in call.task_prompt
+    assert PROMPT_VERSION == "2026-11-02.1", "bumped with the rationale rule"
+    # The rationale rule the output validator enforces (rationale_is_clean) is stated to the
+    # model: plain printable text, one line, no <>{} and no link, blanked when broken.
+    assert "`rationale` is at most 200 characters of plain printable text" in call.task_prompt
+    assert "no line breaks" in call.task_prompt and "no link or URL" in call.task_prompt
+    assert "`<`, `>`, `{` or `}`" in call.task_prompt
+    assert "is blanked" in call.task_prompt
     assert request.fields[0].template_text not in call.task_prompt
     assert call.output_schema["title"] == "SuggestionList"
 
@@ -425,6 +443,70 @@ def test_parse_suggestions_filters_targets_duplicates_and_cap() -> None:
     assert dropped == 3
     fenced = "```\n" + _answer(("f1", "A")) + "\n```\n"
     assert parse_suggestions(fenced, frozenset({"f1"}), 1)[0].suggestions[0].label == "A"
+
+
+# --- the daily cap ---------------------------------------------------------------------------
+
+
+def test_the_daily_cap_refuses_the_third_call_and_resets_on_the_next_utc_day(
+    tmp_path: Path,
+) -> None:
+    harness = Harness(tmp_path, FakeProvider(), max_calls_per_day=2)
+    request = _label_request("f1")
+    assert len(harness.gateway.suggest_labels(TENANT, request).suggestions) == 1
+    assert len(harness.gateway.suggest_labels(TENANT, request).suggestions) == 1
+    assert harness.gateway.calls_today == 2
+    with pytest.raises(DailyCapExceededError, match="max_calls_per_day"):
+        harness.gateway.suggest_labels(TENANT, request)
+    assert len(harness.provider.calls) == 2, "the provider was never asked"
+    assert harness.metric("daily_cap") == 1
+    assert harness.metric("calls") == 2
+    assert [r.status for r in harness.sink.records] == [
+        CallStatus.OK,
+        CallStatus.OK,
+        CallStatus.REFUSED_CAP,
+    ]
+    refused = harness.sink.records[-1]
+    assert refused.error_class == "DailyCapExceededError"
+    assert refused.payload_sha256 == hashlib.sha256(request.model_dump_json().encode()).hexdigest()
+    assert (refused.input_tokens, refused.output_tokens, refused.latency_ms) == (None, None, 0)
+    assert "carto_llm_daily_cap_total 1" in harness.gateway.metrics.render()
+
+    # The day is the UTC day of the injected clock: one second before midnight is still today.
+    harness.clock.now = datetime(2026, 10, 18, 23, 59, 59, tzinfo=UTC)
+    with pytest.raises(DailyCapExceededError):
+        harness.gateway.suggest_labels(TENANT, request)
+    assert harness.metric("daily_cap") == 2
+    harness.clock.now = datetime(2026, 10, 19, 0, 0, tzinfo=UTC)
+    assert len(harness.gateway.suggest_labels(TENANT, request).suggestions) == 1
+    assert harness.gateway.calls_today == 1
+    assert len(harness.provider.calls) == 3
+    assert harness.sink.records[-1].status is CallStatus.OK
+    assert harness.sink.records[-1].at == datetime(2026, 10, 19, 0, 0, tzinfo=UTC)
+
+
+def test_every_attempt_counts_against_the_daily_cap(tmp_path: Path) -> None:
+    script = [TransientProviderError("fake: http 5xx"), TransientProviderError("fake: timeout")]
+    harness = Harness(tmp_path, FakeProvider(script=script), max_calls_per_day=2)
+    with pytest.raises(DailyCapExceededError):
+        harness.gateway.suggest_labels(TENANT, _label_request("f1"))
+    assert len(harness.provider.calls) == 2
+    assert harness.sleeps == [0.5], "refused before the second back-off"
+    assert [r.status for r in harness.sink.records] == [
+        CallStatus.PROVIDER_ERROR,
+        CallStatus.PROVIDER_ERROR,
+        CallStatus.REFUSED_CAP,
+    ]
+    assert harness.metric("retries") == 1
+
+
+def test_a_refused_payload_takes_no_allowance(tmp_path: Path) -> None:
+    harness = Harness(tmp_path, FakeProvider(), max_calls_per_day=1)
+    with pytest.raises(PayloadRefusedError):
+        harness.gateway.suggest_labels(TENANT, {"fields": []})  # type: ignore[arg-type]
+    assert harness.gateway.calls_today == 0
+    assert len(harness.gateway.suggest_labels(TENANT, _label_request("f1")).suggestions) == 1
+    assert harness.metric("daily_cap") == 0
 
 
 # --- audit sinks -----------------------------------------------------------------------------

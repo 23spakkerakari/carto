@@ -46,6 +46,20 @@ closes the transport (verified against a real uvicorn and a raw TLS socket in
 `test_core_ingest_mtls.py`: the 408 arrives at the deadline with the header, and the next read
 on the socket is end of stream).
 
+The deadline covers the body only. Nothing in the app sees a request before its headers are
+complete, so a client that trickles the request line or the headers is bounded by the server
+alone, and uvicorn has no header deadline either: `timeout_keep_alive` runs between requests
+and is cancelled on the first byte of the next one; h11's `max_incomplete_event_size` (16 KiB,
+`server.py`) bounds a header block that never ends, not one that arrives slowly. A slow
+header trickle is therefore bounded only by `limit_concurrency` (256 connections, after which
+uvicorn answers 503) and, where a reverse proxy fronts the listener, by that proxy's
+`client_header_timeout`. In the Compose stack nothing fronts `ingest-api`: `edge-gateway`
+speaks to it directly over mTLS (the nginx `proxy-otlp` and `proxy-webhooks` services sit in
+front of the gateway's push listeners, not of `ingest-api`), so the header phase there has no
+deadline at all, and only a holder of the `edge-gateway` certificate can reach the listener to
+exploit it (threat-model row 10, the same condition as the five items above). This ADR leaves
+that as it is and records it under Consequences.
+
 The in-flight bound of ADR 0043 section 2 is now an `InflightSlots` object instead of a bare
 `BoundedSemaphore`: it is still only ever tried, never waited on, but it remembers when each
 slot was taken. `/readyz` answers 503 (`{"status": "unavailable"}`, no detail, spec 12) when
@@ -88,13 +102,22 @@ spec 8.5, not by this ADR.
 ## 3. Row ceilings on what the edge names
 
 - `ingest.max_templates_per_system` (default 50,000, 1,000 to 1,000,000). Before the ledger
-  claim, `MetadataStore.templates_over_ceiling` tells `ingest-api` in one grouped query (per
-  system of the batch: rows held, and how many of the batch's `(system, template)` pairs are
-  among them) whether any system would hold more than the ceiling once the batch's templates
-  were upserted. The batch's pairs are bound as two parallel `text[]` arrays and joined to the
-  system's rows through `unnest`, on both columns, so the planner hashes the batch side once;
-  the first cut concatenated `system_id || '/' || id` on every row of the system and tested it
-  against a list, which scanned the whole system per batch. A batch over the ceiling is a 422
+  claim, `MetadataStore.templates_over_ceiling` tells `ingest-api` whether any system would
+  hold more than the ceiling once the batch's templates were upserted, in at most two grouped
+  queries on one connection. The first binds the batch's `(system, template)` pairs as two
+  parallel `text[]` arrays, unnests them and left-joins `templates` on the full primary key
+  `(tenant_id, system_id, id)`: one key probe per pair, so its cost is the batch size (at most
+  5,000 pairs), whatever the system holds; it yields, per system, how many of the batch's ids
+  are known. The second, `COUNT(*)` of the rows per system, is an index-only range scan of the
+  system's primary-key entries, O(rows in system), up to 50,000 rows at the default ceiling;
+  it is issued only for the systems whose batch carries an id they do not hold yet. A batch of
+  known ids, the steady state of a system at or near its ceiling and of every system once its
+  templates have been seen, is answered by the key probes alone. The first cut concatenated
+  `system_id || '/' || id` on every row of the system and tested it against a list, which
+  scanned the whole system per batch; the second cut did the join and the total in one
+  statement, which still range-scanned the system's rows on every batch. The counts come back
+  as two result sets and the check is unchanged: rows held, less known ids, plus the batch's
+  distinct ids, against the ceiling. A batch over the ceiling is a 422
   `too_many_templates` whose detail names the system id only; the edge parks it, which is the
   fail-closed outcome; nothing is claimed or written; `carto_ingest_templates_refused_total`
   counts it. Ids a system already holds add nothing, so a full system keeps accepting its known
@@ -207,6 +230,13 @@ weeks of persistent refusal, on file across restarts.
   `parked_max_age_days`, so the ceiling is also a data-loss boundary after a week by default,
   which the warning per purge pass makes visible.
 - An edge clock more than a day ahead of core's refuses every batch until it is fixed.
+- The header phase of a request to `ingest-api` has no deadline (section 1): a client with
+  the `edge-gateway` certificate that trickles headers holds one of the 256 connections for as
+  long as it likes, and in the Compose stack no proxy's `client_header_timeout` stands in
+  front. The next pass over `server.py` should set uvicorn's `timeout_keep_alive` low (it bounds
+  the idle gap between requests on a kept-alive connection, which the edge's client reuses) and
+  add a header deadline, either an h11-level timer in the protocol class or a proxy with
+  `client_header_timeout` in front of the listener, as `proxy-webhooks` already has (10 s).
 - The leak test stamps the simulator's files as having arrived on the pinned clock, since the
   upload connector takes a file's mtime as `received_at` and so as `ingested_at`.
 - Deferred: `stored_at` as the version column (section 4, a ClickHouse migration); cutting
@@ -220,8 +250,10 @@ with `Connection: close` and frees the slot; a chunked body inside the deadline 
 and the realistic batch; `ingested_at` bounds; the template and edge ceilings),
 `test_core_ingest_mtls.py` (a raw TLS socket trickling a body to a real uvicorn gets the 408
 and then end of stream), `test_core_settings.py` (defaults and ranges), `test_core_metadata.py`
-(the in-memory ceilings, ids known per system, the statement shapes: `unnest` join, no
-concatenation, the advisory lock), `test_core_m2_integration.py` (Docker: both ceilings on
+(the in-memory ceilings, ids known per system, the statement shapes: `unnest` join driven by
+the batch, no concatenation, the totals statement, the advisory lock; and the PostgreSQL
+store against a recording engine, showing that a batch of known ids issues the key probes
+only and a batch that would grow a system issues the total count as well), `test_core_m2_integration.py` (Docker: both ceilings on
 PostgreSQL, the rollback of a refused inventory, the lock released with it),
 `test_core_compose_limits.py` (the healthcheck probes `/readyz`),
 `packages/carto-schema/tests/test_schema_inventory.py` (the list cap),

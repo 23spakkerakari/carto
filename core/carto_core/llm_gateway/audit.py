@@ -43,6 +43,9 @@ class CallStatus(StrEnum):
     INVALID_OUTPUT = "invalid_output"
     PROVIDER_ERROR = "provider_error"
     REFUSED = "refused"
+    REFUSED_CAP = "refused_cap"
+    """``llm.max_calls_per_day`` reached: no provider call was made (``input_tokens`` and
+    ``output_tokens`` are null, ``latency_ms`` 0)."""
 
 
 @dataclass(frozen=True, slots=True)

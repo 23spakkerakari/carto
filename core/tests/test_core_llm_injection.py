@@ -28,6 +28,7 @@ from carto_core.llm_gateway.payload import (
     InMemoryMetadataReader,
     build_label_field_payload,
     build_name_entity_payload,
+    clean_text,
     forbidden_content_check,
 )
 from carto_core.llm_gateway.prompts import FENCE_BEGIN, FENCE_END
@@ -259,6 +260,69 @@ def test_the_corpus_reaches_the_provider_only_inside_the_fence(tmp_path: Path) -
         assert marker not in call.task_prompt
     assert nonce not in inner
     assert "ignore previous instructions" not in call.task_prompt.lower()
+
+
+def _reader_with_the_corpus_in_paths_and_system_names() -> InMemoryMetadataReader:
+    """The corpus as a field path and as a system name (both reach the model as metadata,
+    cleaned by :func:`clean_text`), with the template text and attributes innocuous."""
+    reader = InMemoryMetadataReader()
+    for index, text in enumerate(CORPUS):
+        reader.add(
+            FieldRecord(
+                tenant_id=TENANT,
+                field_id=f"src_{index:02}/tpl/param_1",
+                path=text,
+                system_name=text,
+                top_shapes=("99-999",),
+                template_text="Created order <*>",
+                attributes=(AttributeRecord("status", ("ok",)),),
+                tokens=(TOKEN,),
+                event_values=("ORD-777", "Jane Public"),
+                entity_id="ent_order",
+            )
+        )
+    return reader
+
+
+@pytest.mark.parametrize("behaviour", [FakeBehaviour.BEHAVE, FakeBehaviour.OBEY_INJECTION])
+def test_an_injection_in_a_path_or_a_system_name_reaches_the_model_masked_and_fenced(
+    tmp_path: Path, behaviour: FakeBehaviour
+) -> None:
+    reader = _reader_with_the_corpus_in_paths_and_system_names()
+    request = build_label_field_payload(reader, TENANT, [r.field_id for r in reader.records])
+    provider = FakeProvider(behaviour, attacker_label=ATTACKER_LABEL)
+    gateway, sink = _gateway(tmp_path, provider)
+    result = gateway.suggest_labels(TENANT, request)
+    _assert_safe(result, request)
+    if behaviour is FakeBehaviour.OBEY_INJECTION:
+        assert result.suggestions == []
+        assert [r.status for r in sink.records] == [CallStatus.INVALID_OUTPUT]
+    else:
+        assert len(result.suggestions) == len(request.fields)
+        assert [r.status for r in sink.records] == [CallStatus.OK]
+
+    (call,) = provider.calls
+    lines = call.payload_json.split("\n")
+    inner = "\n".join(lines[1:-1])
+    assert inner == request.model_dump_json(), "the fenced block is the validated payload"
+    sent = json.loads(inner)
+    for entry, field in zip(CORPUS, sent["fields"], strict=True):
+        assert field["path"] == clean_text(entry, 256)
+        assert field["system_name"] == clean_text(entry, 128)
+        assert _marker(entry) in field["path"] and _marker(entry) in field["system_name"]
+        for value in (field["path"], field["system_name"]):
+            assert "\n" not in value and "\r" not in value, "line breaks are collapsed"
+            assert "\u202e" not in value and "\u200b" not in value, "format characters go"
+            assert TOKEN not in value
+        assert _marker(entry) not in call.task_prompt
+    token_entry = sent["fields"][20]
+    assert CORPUS[20].startswith("INJ-21")
+    assert "<*>" in token_entry["path"] and "<*>" in token_entry["system_name"], "token masked"
+    assert (
+        forbidden_content_check(call.payload_json, forbidden=[TOKEN, "ORD-777", "Jane Public"])
+        == ()
+    )
+    assert call.payload_json.count(lines[0]) == 1 and call.payload_json.count(lines[-1]) == 1
 
 
 def test_the_entity_task_is_fenced_the_same_way(tmp_path: Path) -> None:

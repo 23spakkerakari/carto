@@ -22,11 +22,13 @@ Who writes what (ADR 0056):
   is marked disabled, not deleted.
 
 Two ceilings bound what the edge can grow (ADR 0073, spec 2.3 invariant 8): templates are named
-by the edge, so :meth:`MetadataStore.templates_over_ceiling` tells ``ingest-api`` in one grouped
-query (the batch's ``(system, template)`` pairs bound as two arrays and joined to the system's
-rows, so no row is concatenated or filtered against a list) whether a batch would push a system
-past ``ingest.max_templates_per_system``, before the batch is claimed or written; the check
-takes no lock, and ``ingest-api`` documents the overshoot that concurrent batches allow.
+by the edge, so :meth:`MetadataStore.templates_over_ceiling` tells ``ingest-api`` whether a
+batch would push a system past ``ingest.max_templates_per_system``, before the batch is claimed
+or written, in at most two grouped queries: the batch's ``(system, template)`` pairs bound as two
+arrays and probed against the primary key (the cost of the batch, not of the system), then the
+row totals of only the systems the batch would grow (an index range scan over the system's rows,
+skipped when every id is known); the check takes no lock, and ``ingest-api`` documents the
+overshoot that concurrent batches allow.
 ``edge_inventories`` is keyed by the body's ``edge_id``, so :meth:`MetadataStore.replace_inventory`
 refuses a new edge past ``max_edges`` with :class:`MetadataLimitError` inside its transaction,
 and nothing of that inventory is written; the count runs under a transaction-level advisory
@@ -290,7 +292,9 @@ class MetadataStore(Protocol):
     ) -> str | None:
         """The first system whose ``templates`` rows would exceed ``ceiling`` once ``records``
         were upserted (ADR 0073), or ``None`` when every system fits. Ids the system already
-        holds add nothing. One grouped query per call, whatever the batch size."""
+        holds add nothing. At most two grouped queries per call, whatever the batch size: the
+        known count (one key probe per pair) and, only for the systems the batch would grow,
+        their row totals."""
         ...
 
     def upsert_fields(self, tenant_id: str, records: Iterable[FieldRecord]) -> int:
@@ -804,19 +808,26 @@ _TEMPLATES = sqlalchemy.text(
     "last_seen, count FROM templates WHERE tenant_id = :tenant_id "
     "AND (:any_system OR system_id = :system_id) ORDER BY system_id, id"
 )
-_TEMPLATE_COUNTS = sqlalchemy.text(
-    "SELECT t.system_id, COUNT(*) AS total, COUNT(b.id) AS known "
-    "FROM templates AS t "
-    "LEFT JOIN unnest(CAST(:batch_systems AS text[]), CAST(:batch_ids AS text[])) "
-    "AS b(system_id, id) ON b.system_id = t.system_id AND b.id = t.id "
-    "WHERE t.tenant_id = :tenant_id AND t.system_id = ANY(:systems) "
-    "GROUP BY t.system_id"
+_TEMPLATE_KNOWN = sqlalchemy.text(
+    "SELECT b.system_id, COUNT(t.id) AS known "
+    "FROM unnest(CAST(:batch_systems AS text[]), CAST(:batch_ids AS text[])) "
+    "AS b(system_id, id) "
+    "LEFT JOIN templates AS t ON t.tenant_id = :tenant_id "
+    "AND t.system_id = b.system_id AND t.id = b.id "
+    "GROUP BY b.system_id"
 )
-"""ADR 0073: per system of a batch, the rows it holds and how many of the batch's
-``(system, template)`` pairs are among them, in one query. The pairs travel as two parallel
-arrays and are joined on both columns, so the planner hashes the batch side once instead of
-concatenating every row of the system and testing it against a list; ``COUNT(b.id)`` counts
-the joined (batch-side) matches, which the primary key makes at most one per pair."""
+"""ADR 0073: per system of a batch, how many of the batch's ``(system, template)`` pairs the
+system already holds. The pairs travel as two parallel arrays and drive the join, so each pair
+is one primary-key probe (``(tenant_id, system_id, id)``) and the cost is the batch size, never
+the system's row count; ``COUNT(t.id)`` counts the pairs that found a row, at most one each."""
+_TEMPLATE_TOTALS = sqlalchemy.text(
+    "SELECT system_id, COUNT(*) AS total FROM templates "
+    "WHERE tenant_id = :tenant_id AND system_id = ANY(:systems) GROUP BY system_id"
+)
+"""ADR 0073: the rows each named system holds, an index-only range scan of the system's
+primary-key entries, O(rows in system). Issued only for the systems whose batch carries an
+id they do not hold yet: a batch of known ids (the steady state of a full system) never pays
+it."""
 _EDGE_LOCK = sqlalchemy.text(
     "SELECT pg_advisory_xact_lock(CAST(:key AS integer), hashtext(:tenant_id))"
 )
@@ -1022,20 +1033,35 @@ class PostgresMetadataStore:
             for template_id in sorted(ids):
                 batch_systems.append(system_id)
                 batch_ids.append(template_id)
-        rows = self._rows(
-            _TEMPLATE_COUNTS,
-            {
-                "tenant_id": tenant_id,
-                "systems": list(wanted),
-                "batch_systems": batch_systems,
-                "batch_ids": batch_ids,
-            },
-            "template count",
-        )
-        counts = {str(row.system_id): (int(row.total), int(row.known)) for row in rows}
-        for system_id, ids in wanted.items():
-            total, known = counts.get(system_id, (0, 0))
-            if total - known + len(ids) > ceiling:
+        try:
+            with self._engine.connect() as connection:
+                known_rows = connection.execute(
+                    _TEMPLATE_KNOWN,
+                    {
+                        "tenant_id": tenant_id,
+                        "batch_systems": batch_systems,
+                        "batch_ids": batch_ids,
+                    },
+                ).all()
+                known = {str(row.system_id): int(row.known) for row in known_rows}
+                # Systems whose batch adds nothing cannot grow: no total for them.
+                growing = [
+                    system_id
+                    for system_id, ids in wanted.items()
+                    if known.get(system_id, 0) < len(ids)
+                ]
+                totals: dict[str, int] = {}
+                if growing:
+                    total_rows = connection.execute(
+                        _TEMPLATE_TOTALS, {"tenant_id": tenant_id, "systems": growing}
+                    ).all()
+                    totals = {str(row.system_id): int(row.total) for row in total_rows}
+        except SQLAlchemyError as exc:
+            msg = f"template count lookup failed: {type(exc).__name__}"
+            raise MetadataError(msg) from exc
+        for system_id in growing:
+            ids = wanted[system_id]
+            if totals.get(system_id, 0) - known.get(system_id, 0) + len(ids) > ceiling:
                 return system_id
         return None
 

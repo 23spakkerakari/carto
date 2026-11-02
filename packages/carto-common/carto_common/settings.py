@@ -180,6 +180,15 @@ class LlmSettings(_FrozenModel):
     )
     timeout_seconds: float = Field(default=30.0, gt=0, le=300)
     max_output_tokens: int = Field(default=512, ge=64, le=4096)
+    max_calls_per_day: int = Field(
+        default=2000,
+        ge=1,
+        le=1_000_000,
+        description=(
+            "Provider calls the gateway makes per process and UTC day (every attempt counts); "
+            "past it, calls are refused and callers use the dictionary (spec 9.9)."
+        ),
+    )
 
     @field_validator("endpoint")
     @classmethod

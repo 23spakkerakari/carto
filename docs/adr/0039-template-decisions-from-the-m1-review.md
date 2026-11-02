@@ -199,8 +199,13 @@ request method and a file name, two records each, and asserts none crosses. The 
 test `test_template_text_is_redacted_and_counted` now expects `row_change <*> <*>` for a hint
 carrying an e-mail address and no redaction count, since the address is masked before the
 redactor. Measured on 2026-11-02 with the namespace in place (`make eval-engine
-ENGINE=memory`, seed 1, `sim-out-final`, the corpora of ADR 0068's after-run; the reports
-are under `eval/reports-low/`, which is not in the tree, so this table carries them):
+ENGINE=memory`, seed 1, `sim-out-final`, the corpora of ADR 0068's after-run). The eval
+harness's metric reports of that run are kept beside this ADR as
+`docs/adr/0039-eval-2026-11-02/shop.json` and `docs/adr/0039-eval-2026-11-02/people_ops.json`
+(the `eval/reports-low/` output directory is not in the tree); they carry the spec 18.4 metric
+values, their pass or fail status and the scenario's counts of events, batches, links, entities,
+transactions and faults, and no event data, names or values. This table summarises them and
+the engine counts of the same run's `*.mapping.json`:
 
 | Spec 18.4 row | shop (14 days, 114,468 events) | people_ops (28 days, 28,036 events) |
 | --- | --- | --- |

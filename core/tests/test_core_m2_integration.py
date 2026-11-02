@@ -27,6 +27,7 @@ from carto_core.ingest.ledger import ClaimState, LedgerEntry, LedgerError, Postg
 from carto_core.jobs import JobKind
 from carto_core.jobs_postgres import PostgresJobQueue
 from carto_core.metadata import (
+    EDGE_CEILING_LOCK_KEY,
     FieldProfileUpdate,
     FieldRecord,
     InventoryResult,
@@ -608,8 +609,13 @@ def test_postgres_edge_ceiling_refuses_a_new_edge_and_rolls_the_inventory_back(
             .scalars()
             .all()
         )
+        # Only this ceiling's lock (its int4 key pair lands in classid and objid): another
+        # test's advisory lock held at the same time is not this test's concern.
         locks = connection.execute(
-            sqlalchemy.text("SELECT COUNT(*) FROM pg_locks WHERE locktype = 'advisory'")
+            sqlalchemy.text(
+                "SELECT COUNT(*) FROM pg_locks WHERE locktype = 'advisory' AND classid = :key"
+            ),
+            {"key": EDGE_CEILING_LOCK_KEY},
         ).scalar_one()
     assert edges == ["edge-gateway"]
     assert locks == 0, "the advisory lock is transaction-scoped: released with the rollback"

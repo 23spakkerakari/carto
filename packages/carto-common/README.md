@@ -150,6 +150,7 @@ by every service; log the effective settings at startup so a typo is visible.
 | `llm.provider` | `CARTO_LLM__PROVIDER` | none | `anthropic`, `bedrock`, `vertex` |
 | `llm.endpoint` | `CARTO_LLM__ENDPOINT` | none | must start with `https://` |
 | `llm.model` | `CARTO_LLM__MODEL` | none | free text |
+| `llm.max_calls_per_day` | `CARTO_LLM__MAX_CALLS_PER_DAY` | 2000 | 1 to 1,000,000; per process and UTC day, every attempt counts |
 | `telemetry.enabled` | `CARTO_TELEMETRY__ENABLED` | `false` | health metrics only, never event data |
 
 `ProductSettings` holds these shared fields; a service subclasses it (or `CartoBaseSettings`) to add

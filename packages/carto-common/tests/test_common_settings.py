@@ -171,6 +171,16 @@ def test_llm_endpoint_must_be_https() -> None:
         LlmSettings(endpoint="http://llm.internal/v1")
 
 
+def test_llm_daily_cap_defaults_and_bounds() -> None:
+    """The gateway refuses calls past ``llm.max_calls_per_day`` (per process, UTC day)."""
+    assert LlmSettings().max_calls_per_day == 2000
+    assert LlmSettings(max_calls_per_day=1).max_calls_per_day == 1
+    assert LlmSettings(max_calls_per_day=1_000_000).max_calls_per_day == 1_000_000
+    for value in (0, -1, 1_000_001):
+        with pytest.raises(ValidationError, match="max_calls_per_day"):
+            LlmSettings(max_calls_per_day=value)
+
+
 def test_telemetry_is_off_unless_enabled() -> None:
     assert TelemetrySettings().enabled is False
     assert TelemetrySettings(enabled=True).enabled is True
