@@ -635,6 +635,8 @@ def test_the_runtime_guards_template_constants_with_the_detector(tmp_path: Path)
             )
             result = runtime.pipeline.process(raw_line(text, 10 + n))
             assert result.event is not None
-        assert result.event.template_text == "SFTP upload complete: <*> <*> bytes)"
+        event = result.event
+        assert event is not None
+        assert event.template_text == "SFTP upload complete: <*> <*> bytes)"
     finally:
         runtime.close()

@@ -3,6 +3,8 @@ ADR 0016)."""
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import hashlib
 import json
 import subprocess
@@ -329,7 +331,7 @@ ALICE_LINES = [f"Refund approved for Alice Smith attempt {n}" for n in range(1, 
 ALL_PARAMS_7 = " ".join([MASK] * 7)
 
 
-def _flags_alice(constants: list[str]) -> bool:
+def _flags_alice(constants: Sequence[str]) -> bool:
     """A constant filter standing in for the detector: a PERSON hit on the name."""
     return "Alice" not in constants
 
@@ -377,7 +379,7 @@ def test_the_constant_filter_keeps_a_name_out_of_the_constants(tmp_path: Path) -
 def test_the_constant_filter_runs_once_per_cluster_and_fails_closed() -> None:
     seen: list[list[str]] = []
 
-    def record(constants: list[str]) -> bool:
+    def record(constants: Sequence[str]) -> bool:
         seen.append(list(constants))
         return True
 
@@ -390,7 +392,7 @@ def test_the_constant_filter_runs_once_per_cluster_and_fails_closed() -> None:
     assert seen[1] == ["session", "opened", "user=", "host:"]
     assert len(seen) == 2
 
-    def broken(_constants: list[str]) -> bool:
+    def broken(_constants: Sequence[str]) -> bool:
         msg = "detector unavailable"
         raise RuntimeError(msg)
 
