@@ -35,10 +35,49 @@ from carto_edge.connectors.splunk_spl import (
         'index=orders "quoted \\" still quoted | collect index=x"',
         "index=orders\n| STATS count",
         "index=orders | bin _time span=1m | streamstats count | eventstats max(count)",
+        "| from datamodel:Web | stats count by host",
+        '| FROM datamodel:"Web.Pageviews" | head 5',
+        "| from lookup:carriers.csv | fields code",
+        '| from lookup("carriers.csv")',
+        'index=orders msg="a \\| b" | stats count',
     ],
 )
 def test_read_only_searches_are_accepted(search: str) -> None:
     check_search(search)
+
+
+@pytest.mark.parametrize(
+    "search",
+    [
+        "| from savedsearch:nightly_cleanup",
+        '| from savedsearch("nightly_cleanup") | head 1',
+        "| from savedsearch:x [search index=y]",
+        "index=orders | join id [| from savedsearch:x]",
+        "| from nightly_cleanup",
+        "| from",
+    ],
+)
+def test_from_reads_only_datamodels_and_lookups(search: str) -> None:
+    """``| from savedsearch:x`` runs a saved search carto cannot check, the same thing the
+    refused ``savedsearch`` command does (2026-11-01 review, H1)."""
+    with pytest.raises(SearchCheckError, match="from"):
+        check_search(search)
+
+
+@pytest.mark.parametrize(
+    "search",
+    [
+        "index=orders \\| outputlookup evil",
+        "index=orders \\[search index=x | outputlookup y]",
+        "index=orders [search index=x \\] | outputlookup y]",
+        "index=orders \\`evil_macro`",
+    ],
+)
+def test_an_unquoted_backslash_before_a_delimiter_is_refused(search: str) -> None:
+    """Outside quotes the scanner cannot be sure Splunk treats ``\\|`` as a literal; refusing
+    keeps the check from seeing one stage where Splunk may run two (2026-11-01 review, M13)."""
+    with pytest.raises(SearchCheckError, match="backslash"):
+        check_search(search)
 
 
 @pytest.mark.parametrize(
