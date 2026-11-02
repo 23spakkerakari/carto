@@ -6,8 +6,11 @@ query template and anything other than one ``SELECT`` (or ``WITH ... SELECT``) i
 ``INTO``, no locking clause, no DML or DDL anywhere in the tree, and only the named bind
 parameters ``:watermark`` and ``:batch``, plus ``:upper`` for a time-typed watermark (ADR 0035,
 where it is required; it is refused for integer and decimal watermarks); string formatting
-markers are refused outright. ADR 0037 item 1 makes the rest an allowlist: the statement reads
-base tables and CTEs only (at least one table; no table-valued functions, ``ROWS FROM``,
+markers are refused outright, and so is a block comment (``/*``) anywhere in the text, before
+parsing: MySQL executes the ``/*! ... */`` version comments sqlglot's tokenizer drops, and the
+connector runs the template text, not the parsed tree (ADR 0041 amendment 2026-11-02). ADR
+0037 item 1 makes the rest an allowlist: the statement reads base tables and CTEs only (at
+least one table; no table-valued functions, ``ROWS FROM``,
 ``OPENQUERY``, ``OPENROWSET``, ``OPENDATASOURCE``, linked-server or catalog-qualified names: a
 source reads the one database it is configured for), carries no table or optimizer hints (T-SQL
 ``OPTION (...)`` and the MySQL ``SELECT`` modifiers included) and no ``NEXT VALUE FOR``, and calls
@@ -393,6 +396,10 @@ REMOTE_SOURCES: Final = frozenset({"openquery", "openrowset", "opendatasource", 
 MAX_STATEMENT_LEN: Final = 16_384
 
 _FORMAT_MARKERS: Final = re.compile(r"%\(|%[sdfr]|\{[^{}]*\}")
+_BLOCK_COMMENT: Final = "/*"
+"""Refused anywhere in a template before parsing: sqlglot's MySQL tokenizer drops ``/*! ... */``
+version comments but MySQL executes them, and the connector runs the text as written
+(2026-11-02 review, H1). ``--`` line comments stay allowed."""
 
 _FORBIDDEN_NODES: Final[tuple[type[exp.Expression], ...]] = (
     exp.Insert,
@@ -572,6 +579,13 @@ def check_statement(sql: str, dialect: Dialect, *, upper: bool = False) -> Check
         raise StatementCheckError(msg)
     if _FORMAT_MARKERS.search(text):
         msg = "the query contains string formatting markers; use :watermark and :batch only"
+        raise StatementCheckError(msg)
+    if _BLOCK_COMMENT in text:
+        msg = (
+            "block comments (/* ... */) are not allowed in the query: MySQL runs the "
+            "/*! ... */ version comments the parser drops, and the template runs as written; "
+            "use -- line comments"
+        )
         raise StatementCheckError(msg)
     try:
         parsed = sqlglot.parse(text, read=SQLGLOT_READ[dialect])

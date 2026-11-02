@@ -222,7 +222,10 @@ class PollScheduler:
 
     async def check(self, source_id: str) -> TestResult:
         """Run the connector's ``test()`` and keep the result. An exception from the test is a
-        failed result whose only check names the exception type."""
+        failed result whose only check names the exception type. An enabling result is kept
+        only once its ``source.insecure_transport`` audit row (if the source needs one) is
+        written: when the audit raises, the kept result is a failed one, so the source is not
+        read and the next poll tests it again (2026-11-02 review, 9)."""
         connector = self._connectors[source_id]
         try:
             result = await connector.test()
@@ -234,12 +237,26 @@ class PollScheduler:
                 checks=(TestCheck(f"test_raised:{name}", ok=False),),
                 problems=(f"the connector test raised {name}",),
             )
+        if result.can_enable:
+            try:
+                await self._audit_transport(source_id)
+            except Exception as exc:  # no row, no enable (spec 8.1: the flag is audited)
+                name = type(exc).__name__
+                log.warning("scheduler.audit_failed", source_id=source_id, error=name)
+                result = TestResult(
+                    ok=False,
+                    read_only=result.read_only,
+                    checks=(*result.checks, TestCheck(f"audit_raised:{name}", ok=False)),
+                    problems=(
+                        *result.problems,
+                        f"the insecure-transport audit row could not be written: {name}",
+                    ),
+                )
         self._test_results[source_id] = result
         if result.can_enable:
             log.info(
                 "scheduler.source_enabled", source_id=source_id, read_only=result.read_only.value
             )
-            await self._audit_transport(source_id)
         return result
 
     def _weakened_transport(self, source_id: str) -> tuple[str, ...]:
@@ -253,7 +270,8 @@ class PollScheduler:
     async def _audit_transport(self, source_id: str) -> None:
         """Spec 8.1: a weakened transport is accepted only by the admin flag, "audited and shown
         as a warning". One audit row and one warning per enable (this method runs only from an
-        enabling ``check``), not per poll (ADR 0067). The row names keys, never values."""
+        enabling ``check``, before the result is kept), not per poll (ADR 0067). The row names
+        keys, never values. Raises whatever the audit raises; the caller refuses the enable."""
         keys = self._weakened_transport(source_id)
         if not keys:
             return

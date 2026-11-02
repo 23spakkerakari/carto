@@ -212,3 +212,13 @@ check was weakened. Tests: `test_edge_conn_sql_check.py`, `test_edge_conn_sql_ms
   and the `CURRENT_ROLE()` failure path without Docker. `upload.py`'s `_within` ValueError arm
   is tested; the junction tests note that they skip on the ubuntu runners; `csv.field_size_limit`
   (process-wide) is set once at import rather than from a per-source method.
+- **Block comments are refused before parsing (2026-11-02 review, H1).** sqlglot's MySQL
+  tokenizer drops `/*! ... */` version comments, but MySQL executes them, and `sql.py` runs the
+  template text, not the parsed tree: `SELECT a /*!, sys_exec('x') */ FROM t ...`,
+  `/*! INTO DUMPFILE '/tmp/x' */`, `/*! FOR UPDATE */` and `/*!50000 INTO OUTFILE '/tmp/x' */`
+  were all accepted by `check_statement` and would have run as written. The sequence `/*`
+  anywhere in the statement text is now refused on every dialect before parsing (a block
+  comment carries no value in a source query; `--` line comments stay allowed), including an
+  unterminated one and one inside a string literal, which is the fail-closed reading. The
+  message names the rule and never echoes the statement. Tests: one per form above on MySQL,
+  `/* harmless */` refused on PostgreSQL and SQL Server, `-- note` accepted on all three.

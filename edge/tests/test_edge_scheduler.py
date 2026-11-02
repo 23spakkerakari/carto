@@ -16,6 +16,7 @@ from typing import Any, ClassVar
 import pytest
 import structlog
 
+from carto_edge.audit import AuditRow, EdgeAudit
 from carto_edge.config import (
     CoreLinkSettings,
     EdgeSettings,
@@ -798,6 +799,48 @@ async def test_a_refused_test_writes_no_row_and_the_enabling_one_writes_one(
     await poll.poll_once("src_web")
     rows = audit_rows(runtime, "source.insecure_transport")
     assert [row["details"]["keys"] for row in rows] == [["verify_tls"]]
+
+
+async def test_an_audit_row_that_cannot_be_written_keeps_the_source_off(
+    runtime: EdgeRuntime, cursors: CursorStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The row is written before the enabling result is kept: when ``record()`` raises, the
+    source is not enabled and nothing is read (the next poll tests again); the enable that
+    follows a successful row writes exactly one (2026-11-02 review, 9)."""
+    original = EdgeAudit.record
+    calls: list[str] = []
+
+    def flaky(self: EdgeAudit, action: str, *args: Any, **kwargs: Any) -> AuditRow:
+        calls.append(action)
+        if len(calls) == 1:
+            raise OSError("disk full")
+        return original(self, action, *args, **kwargs)
+
+    monkeypatch.setattr(EdgeAudit, "record", flaky)
+    made: dict[str, FakeConnector] = {}
+    poll = scheduler(
+        runtime, FakeIngestor(), cursors, connector_factory=factory_for(made, weakened=("sslmode",))
+    )
+    with structlog.testing.capture_logs() as logs, pytest.raises(ConnectorError):
+        await poll.poll_once("src_web")
+    assert calls == ["source.insecure_transport"]
+    assert made["src_web"].reads == []
+    assert audit_rows(runtime, "source.insecure_transport") == []
+    kept = poll.test_results()["src_web"]
+    assert not kept.can_enable
+    assert "audit_raised:OSError" in [check.name for check in kept.checks if not check.ok]
+    assert [e["event"] for e in logs if e["event"] == "scheduler.source_enabled"] == []
+    assert [e["event"] for e in logs if e["event"] == "scheduler.insecure_transport"] == []
+    failures = [e for e in logs if e["event"] == "scheduler.audit_failed"]
+    assert [(e["source_id"], e["error"]) for e in failures] == [("src_web", "OSError")]
+    assert all("disk full" not in str(e) for e in logs)
+
+    await poll.poll_once("src_web")
+    await poll.poll_once("src_web")
+    assert made["src_web"].test_calls == 2
+    assert len(made["src_web"].reads) == 2
+    rows = audit_rows(runtime, "source.insecure_transport")
+    assert [row["details"]["keys"] for row in rows] == [["sslmode"]]
 
 
 async def test_a_verified_transport_source_writes_no_row_and_no_warning(

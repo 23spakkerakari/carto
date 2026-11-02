@@ -40,6 +40,17 @@ from carto_edge.connectors.splunk_spl import (
         "| from lookup:carriers.csv | fields code",
         '| from lookup("carriers.csv")',
         'index=orders msg="a \\| b" | stats count',
+        # union, join and append name a dataset carto can see through, or a subsearch
+        "index=orders | union [search index=refunds] | stats count",
+        "index=orders | union maxout=100 [search index=refunds]",
+        "| union datamodel:Web | stats count by host",
+        '| union datamodel:"Web.Pageviews" [search index=refunds]',
+        "index=orders | union [| from lookup:carriers.csv]",
+        "index=orders | join id lookup:carriers",
+        "index=orders | join type=left order_id [search index=refunds]",
+        "index=orders | join left=L right=R where L.id=R.id [search index=refunds]",
+        "index=orders | append maxtime=60 [search index=refunds]",
+        "index=orders | append [| inputlookup carriers.csv]",
     ],
 )
 def test_read_only_searches_are_accepted(search: str) -> None:
@@ -62,6 +73,42 @@ def test_from_reads_only_datamodels_and_lookups(search: str) -> None:
     refused ``savedsearch`` command does (2026-11-01 review, H1)."""
     with pytest.raises(SearchCheckError, match="from"):
         check_search(search)
+
+
+@pytest.mark.parametrize(
+    ("search", "command"),
+    [
+        ("| union savedsearch:nightly_cleanup", "union"),
+        ("index=a | join id savedsearch:x", "join"),
+        ("index=a | append savedsearch:x", "append"),
+        ('| union savedsearch("nightly_cleanup") | head 1', "union"),
+        ("| union savedsearch", "union"),
+        ("| UNION SavedSearch:x", "union"),
+        ("index=a | union maxout=100 savedsearch:x [search index=b]", "union"),
+        ("index=a | union savedsearch:x[search index=b]", "union"),
+        ("index=a | join type=left id savedsearch:x [search index=b]", "join"),
+        ("index=a | append maxtime=60 savedsearch:x", "append"),
+        ('index=a | union "savedsearch:x"', "union"),
+        ("index=a | union other:x", "union"),
+        ("index=a | join id custom(x)", "join"),
+        ("index=a | append report:x", "append"),
+        ("index=a [| union savedsearch:x]", "union"),
+        ("index=a [union savedsearch:x]", "union"),
+        ("index=a | join id [| union savedsearch:x]", "union"),
+        ("index=a | append [| append savedsearch:x]", "append"),
+        ("index=a | union [search index=b | join id savedsearch:x]", "join"),
+        ("index=a | join id [| from savedsearch:x]", "from"),
+    ],
+)
+def test_union_join_and_append_read_only_datamodels_and_lookups(search: str, command: str) -> None:
+    """``union``, ``join`` and ``append`` take dataset arguments as ``from`` does, so
+    ``| union savedsearch:x`` runs a saved search carto cannot check (2026-11-02 review, H2).
+    Only the ``datamodel:`` and ``lookup:`` kinds pass, at any nesting depth, and the message
+    names the command, never the search."""
+    with pytest.raises(SearchCheckError, match=f"'{command}'") as info:
+        check_search(search)
+    assert "nightly_cleanup" not in str(info.value)
+    assert "index=" not in str(info.value)
 
 
 @pytest.mark.parametrize(

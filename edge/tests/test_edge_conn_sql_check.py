@@ -80,6 +80,47 @@ def test_trailing_semicolon_and_comments_are_fine() -> None:
 
 
 @pytest.mark.parametrize(
+    ("sql", "dialect"),
+    [
+        ("SELECT a /*!, sys_exec('x') */ FROM t WHERE id > :watermark LIMIT :batch", "mysql"),
+        (
+            "SELECT a FROM t WHERE id > :watermark /*! INTO DUMPFILE '/tmp/x' */ LIMIT :batch",
+            "mysql",
+        ),
+        ("SELECT a FROM t WHERE id > :watermark LIMIT :batch /*! FOR UPDATE */", "mysql"),
+        (
+            "SELECT a FROM t WHERE id > :watermark LIMIT :batch /*!50000 INTO OUTFILE '/tmp/x' */",
+            "mysql",
+        ),
+        ("SELECT a /* harmless */ FROM t WHERE id > :watermark LIMIT :batch", "postgresql"),
+        ("SELECT TOP (:batch) a /* harmless */ FROM t WHERE id > :watermark", "mssql"),
+        ("SELECT a FROM t WHERE id > :watermark LIMIT :batch /*", "mysql"),
+    ],
+)
+def test_block_comments_are_refused_on_every_dialect(sql: str, dialect: Dialect) -> None:
+    """MySQL executes ``/*! ... */`` version comments that sqlglot's tokenizer drops, and the
+    connector runs the template text, not the parsed tree, so the check refuses the sequence
+    before parsing (2026-11-02 review, H1). The message names the rule and never echoes the
+    statement."""
+    with pytest.raises(StatementCheckError, match="block comment") as info:
+        check_statement(sql, dialect)
+    message = str(info.value)
+    for fragment in ("sys_exec", "DUMPFILE", "OUTFILE", "FOR UPDATE", "harmless", "SELECT"):
+        assert fragment not in message
+
+
+@pytest.mark.parametrize("dialect", ["postgresql", "mysql"])
+def test_line_comments_stay_accepted(dialect: Dialect) -> None:
+    sql = "SELECT id FROM t -- note\nWHERE x > :watermark LIMIT :batch"
+    assert check_statement(sql, dialect).tables == ("t",)
+
+
+def test_line_comments_stay_accepted_on_mssql() -> None:
+    sql = "SELECT TOP (:batch) id FROM t -- note\nWHERE x > :watermark"
+    assert check_statement(sql, "mssql").tables == ("t",)
+
+
+@pytest.mark.parametrize(
     ("sql", "reason"),
     [
         (
@@ -317,7 +358,7 @@ def test_everyday_scalar_and_aggregate_functions_are_allowed() -> None:
         (
             "SELECT /*+ MAX_EXECUTION_TIME(0) */ a FROM t WHERE a > :watermark LIMIT :batch",
             "mysql",
-            "optimizer hints",
+            "block comment",
         ),
         (
             "SELECT TOP (:batch) NEXT VALUE FOR dbo.seq, a FROM t WHERE a > :watermark",

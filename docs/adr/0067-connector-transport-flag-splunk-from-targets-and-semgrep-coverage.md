@@ -69,19 +69,32 @@ one warning across three polls, none for a verified source, none for a refused t
 row for the enable that follows a refusal). The guide's SQL and Splunk key tables carry the
 flag.
 
-## 2. `from` reads only `datamodel:` and `lookup:` datasets; an unquoted backslash before a delimiter is refused
+## 2. `from`, `union`, `join` and `append` read only `datamodel:` and `lookup:` datasets; an unquoted backslash before a delimiter is refused
 
 ADR 0037 item 4 keeps `savedsearch` off the Splunk command allowlist because it spawns a search
-carto cannot see. `from` was on the list as a generating command, and `| from savedsearch:<name>`
-is the same thing under an allowed name: the saved search runs with whatever stages it holds,
+carto cannot see. Four allowed commands take a dataset argument that names the same thing
+under another spelling: `from` reads a dataset, and `union`, `join` and `append` combine the
+current results with a subsearch or a dataset. `| from savedsearch:<name>`,
+`| union savedsearch:<name>`, `index=a | join id savedsearch:<name>` and
+`index=a | append savedsearch:<name>` each run the saved search with whatever stages it holds,
 `| delete` or `| collect` included, on every window of every poll. The 2026-11-01 review ran
-`check_search("| from savedsearch:nightly_cleanup")` and it was accepted (finding H1).
+`check_search("| from savedsearch:nightly_cleanup")` and it was accepted (finding H1); the
+2026-11-02 review found the three other commands open the same way (finding H2).
 
-`from` stays on the list because data models and lookups are datasets the check can see
-through, but the stage must name one of those two kinds: the text after the command has to
-match `datamodel:` or `lookup:` (also the function form `lookup(<name>)`), case-insensitive,
-quoted names allowed. `savedsearch:`, a bare name, or nothing at all is refused with a message
-that names the rule and never repeats the search.
+The four commands stay on the list because data models and lookups are datasets the check can
+see through, and their subsearch forms are checked like any other subsearch. Every stage that
+runs one of them (`DATASET_COMMANDS` in `splunk_spl.py`) has its arguments inspected: the stage
+text after the command name is split on whitespace (the scanner has already blanked
+subsearches to `[]` and kept quoted strings whole), and every token that is not a `key=value`
+option and not a subsearch is judged as a possible dataset reference. A token that starts with
+`savedsearch`, in any case and any form (`savedsearch:x`, `savedsearch("x")`, a bare
+`savedsearch`, a quoted `"savedsearch:x"`), is refused, and so is any `<kind>:<rest>` or
+`<kind>(<rest>` token whose kind is not `datamodel` or `lookup` (`report:x`, `custom(x)`).
+Bare words pass, because `join` names its fields that way (`join id lookup:carriers`,
+`join left=L right=R where L.id=R.id [...]`); `from` additionally keeps its stricter rule that
+the first argument must be a `datamodel:`, `lookup:` or `lookup(...)` dataset, so a bare name
+or nothing at all after `from` is refused as before. The check runs at every nesting depth;
+the message names the command and the rule and never repeats the search.
 
 The scanner also treated an unquoted backslash as escaping the next character, inside quotes
 and out. Inside double quotes that is Splunk's rule; outside them the scanner could not be sure
@@ -91,12 +104,17 @@ unquoted backslash immediately before `|`, `[`, `]` or a backtick; a backslash b
 character keeps its old meaning, and a backslash inside double quotes is untouched. Refusing is
 the fail-closed choice: a search that needs a literal `|` outside quotes can quote it.
 
-Alternatives: dropping `from` altogether (loses the data-model reads partners use); resolving
-the saved search through the REST API and checking its body (a second request per poll, a race
-between check and run, and the saved search can change under carto).
+Alternatives: dropping the four commands altogether (loses the data-model reads partners use
+and the subsearch joins most real searches have); resolving the saved search through the REST
+API and checking its body (a second request per poll, a race between check and run, and the
+saved search can change under carto).
 
-Tests: `edge/tests/test_edge_conn_splunk_spl.py` accepts the four dataset forms and refuses the
-six `savedsearch` and bare forms and the four backslash-before-delimiter forms.
+Tests: `edge/tests/test_edge_conn_splunk_spl.py` accepts the four `from` dataset forms and ten
+`union`, `join` and `append` forms (subsearch, option plus subsearch, `datamodel:`, `lookup:`,
+field lists and join conditions), refuses the six `savedsearch` and bare `from` forms, twenty
+`union`, `join` and `append` forms (the three from the finding, the function, bare, mixed-case,
+quoted, adjacent-subsearch and other-kind forms, and five nested inside a subsearch) and the
+four backslash-before-delimiter forms.
 
 
 ## 3. The Semgrep rule matches the call forms the connectors use
@@ -129,6 +147,19 @@ keyword regex and no new allowances:
 - Local file mutation the list did not name: `os.replace`, `shutil.move`, `shutil.copyfile`,
   `shutil.copy2`, `shutil.copytree` (`os.remove`, `os.unlink`, `os.rename` were already caught
   through `$C.remove` and friends).
+- Added on 2026-11-02 (review finding 11): httpx streaming requests (`$C.stream("POST" |
+  "PUT" | "PATCH" | "DELETE", ...)` and the `method=` forms) and request objects built by
+  hand (`httpx.Request("POST", ...)`, `method=`), which `$C.send` would carry past the
+  `build_request` patterns; `os.open` with a write flag (`os.O_WRONLY`, `os.O_RDWR`,
+  `os.O_CREAT`, `os.O_TRUNC`, `os.O_APPEND`, positional or `flags=`) or a bare integer;
+  asyncssh SFTP `mput`, `mcopy`, `setstat` and `utime` (the rest of the SFTP mutation list was
+  already matched); and SFTP opens with integer pflags: `FXF_WRITE`, `FXF_APPEND`, `FXF_CREAT`,
+  `FXF_TRUNC`, `FXF_EXCL` or an integer literal as the second argument (a `metavariable-regex`
+  over the flag expression), and any `pflags_or_mode=` keyword, which only the integer-flags
+  call uses. `os.open(p, os.O_RDONLY)`, `sftp.open(p, FXF_READ)`, `$C.stream("GET", ...)` and
+  `httpx.Request("GET", ...)` stay allowed; the fixture carries a `ruleid:` and an `ok:` line
+  for each form. A flag held in a variable is not judged, as a mode held in a variable never
+  was; the connectors pass literals.
 
 The fixture `tools/semgrep/connector-read-only.py` holds a `ruleid:` line for every new pattern
 and an `ok:` line for the read it sits next to (`build_request("GET", ...)`,
@@ -166,6 +197,12 @@ skips there, as the `carto-ctl` one does.
   source; `carto-edge audit verify` lists them like any other row. The console's source page
   (spec 8.1 "shown as a warning in the UI") does not read the edge audit file; this package
   leaves the UI part unbuilt and the warning reaches the operator through the gateway log.
+- The row is written before the enabling result is kept (2026-11-02 review, finding 9). When
+  `record()` raises, `check()` keeps a failed result instead (its extra check is
+  `audit_raised:<type>`), logs `scheduler.audit_failed` with the source id and the exception
+  type, and the source is not read; the next poll tests it again and the enable that follows a
+  successful row writes exactly one. Before this, the enabling result was stored first, so a
+  source could be read over a weakened transport with no row in the chain.
 - The flag is per source, not per deployment: an operator who accepts one unverified replica
   does not accept all of them.
 - The Semgrep rule now forbids opening any local file for writing inside a connector, which is
