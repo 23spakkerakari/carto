@@ -14,7 +14,8 @@ classifier) run `make eval` on both scenarios and the deltas are recorded in the
 
 ## Decisions recorded with this plan
 
-ADR numbers 0060 to 0066 belong to the M3 demo cut; this plan uses 0067 to 0072, one per package.
+ADR numbers 0060 to 0066 belong to the M3 demo cut; this plan uses 0067 to 0072: one per package,
+with H and T sharing 0067.
 
 | Decision | ADR |
 | --- | --- |
@@ -37,8 +38,8 @@ once at the end.
   other target are refused with the ADR 0037 message. Test: the three forms.
 - M13. `_stages` and `_matching_bracket` refuse an unquoted backslash immediately before `|`,
   `[`, `]` or a backtick instead of treating it as an escape. Test: each delimiter.
-- Dependencies: joserfc 1.7.6, filelock 4.2.1, certifi 2026.10.18, setuptools 84.1.0 in
-  `uv.lock`; pip-audit clean with `--strict`.
+- Dependencies: joserfc 1.7.7, filelock 4.2.6, certifi 2026.10.23, setuptools 84.2.1 in
+  `uv.lock` (the latest at lock time); pip-audit clean with `--strict`.
 - H2 is the `fix-c2` branch (ADR 0037 items 1 to 3, upload confinement, SFTP `config=None`).
   Merged here if it merges cleanly; otherwise recorded under Deferred with the conflict.
 
@@ -102,7 +103,9 @@ once at the end.
   `carto_worker` (it keeps `SELECT` on `settings`), and puts the `audit_log` trigger pair on
   `llm_calls` with `SELECT, INSERT` only for both roles.
 - M10. `users.d/carto.xml` defines a `carto_reader` user (readonly profile, password from the
-  `ch_reader_password` secret file) alongside the owner; the api and worker services use it.
+  `ch_reader_password` secret file) alongside the owner; the api service uses it. The worker
+  stays on the owner: the M3 demo cut makes it write the trace tables, and a worker user of
+  its own is M6.
   ADR 0071 records that the migrate-created users remain M6 work. (The compose change itself
   is applied in package D to keep `compose.yaml` under one owner.)
 
@@ -125,7 +128,7 @@ once at the end.
 - M8. `compose.yaml` defaults: `ALLOW_HTTP_ISSUER` false, back-channel unset, groups claim
   `groups`, no bootstrap bindings. `deploy/compose/dev.env` holds the Dex values; `make dev` and
   the CI compose job pass `--env-file deploy/compose/dev.env`. The guide's Login table matches.
-- M10 (compose half). `ch_reader_password` secret; api and worker use `carto_reader`.
+- M10 (compose half). `ch_reader_password` secret; the api uses `carto_reader`.
 - M15. The CI image job scans `carto-core:ci` as well; the compose job scans `carto-ctl`,
   `carto-simulator` and `carto-web` after `make images`.
 - M16. Every `uses:` is pinned to a commit SHA with the tag in a comment; `semgrep/semgrep` and
@@ -141,6 +144,27 @@ once at the end.
   files ignore everything but their README; `test_core_compose_limits.py` also asserts the
   hardening anchor and the absence of `ports:` on every service except the three proxies;
   `make dev` writes secret files with `umask 077`.
+
+## Pull requests
+
+Two PRs, both targeting `m3-trace-spec`, because the M3 demo cut (`m3-demo`) rewrites the
+decision routes, `EntityRepository.set_name`, `compose.yaml` and CI at the same time.
+
+- PR-1, branch `security-fixes-1`: packages H, T, E and C plus `uv.lock`, cherry-picked from
+  `security-fixes`. Touches no file the demo changes. Opens as soon as `make check` and
+  `make sec` are green.
+- PR-2, branch `security-fixes`: packages A, D and G, rebased onto `m3-trace-spec` after the
+  demo PR lands. Checklist for that rebase, none of which may be skipped:
+  1. Migration 0006 `down_revision` becomes `"0005"` (the demo's trace migration); the linear
+     history test's comment and the ADR 0071 note are updated to match.
+  2. `routes_links._decide` and `EntityPortAdapter.patch`: the demo enqueues a full assembly
+     inside the decision route; the audit hook of ADR 0070 must run in the same transaction as
+     that enqueue.
+  3. `EntityRepository.set_name` takes both the demo's `expected_version` and this branch's
+     `on_write`.
+  4. `make eval-engine` on both scenarios re-run on the rebased branch; deltas recorded.
+  5. ADR 0060, `docs/plans/M3-demo.md` and `CLAUDE.md` say `fix-c2` is already merged through
+     PR-1 so nobody merges it twice.
 
 ## Deferred
 
