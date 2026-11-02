@@ -86,7 +86,9 @@ MAX_ZIP_TOTAL_BYTES: Final = 50 * GIB
 MAX_LINE_BYTES: Final = 16 * MIB
 """Lines longer than this are cut (``size_bytes`` keeps the real length) to bound memory."""
 MAX_CSV_FIELD_BYTES: Final = 16 * MIB
-"""``csv.field_size_limit`` while rows are read: one cell may not hold more than a line."""
+"""``csv.field_size_limit``: one cell may not hold more than a line. The limit is process-wide
+in the csv module, so it is set once, here, when the module is imported."""
+csv.field_size_limit(MAX_CSV_FIELD_BYTES)
 
 YIELD_EVERY: Final = 1000
 _GLOB_MAGIC: Final = re.compile(r"[*?\[]")
@@ -568,7 +570,6 @@ class UploadConnector:
         text_stream = io.TextIOWrapper(
             stream, encoding=self.config.encoding, errors="replace", newline=""
         )
-        csv.field_size_limit(MAX_CSV_FIELD_BYTES)  # process-wide in the csv module
         skipped = 0
         try:
             reader = csv.DictReader(text_stream)

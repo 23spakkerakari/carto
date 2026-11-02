@@ -164,3 +164,51 @@ the cursor moved.
 `test_edge_conn_sql_mssql.py`, `test_edge_conn_sql_pg.py` and `test_edge_conn_sql_mysql.py`
 (Docker only; the MySQL case adds a login whose INSERT arrives through a role),
 `test_edge_conn_sftp.py`, `test_edge_conn_upload.py`.
+
+## Amendment 2026-11-02: SQL read-only checker follow-ups
+
+Six verified findings of the security review (`docs/plans/security-fixes-2026-11.md`, H2
+follow-ups 5 to 10) against the ADR 0037 item 1 to 3 build above. Each fix fails closed; no
+check was weakened. Tests: `test_edge_conn_sql_check.py`, `test_edge_conn_sql_mssql.py`,
+`test_edge_conn_sql_mysql.py` (now with a fake connection beside the Docker cases),
+`test_edge_conn_upload.py`.
+
+- **CTE names resolve per scope (follow-up 5).** `check_statement` collected CTE names over the
+  whole tree, so a CTE named like a base table inside a derived table hid that base table from
+  `has_table_privilege` / `HAS_PERMS_BY_NAME`, and a login with INSERT on it was VERIFIED. The
+  base tables now come from sqlglot's scope builder (`_base_tables`): a CTE hides an unqualified
+  name only in the query that defines it and the queries nested in it, never in a sibling or an
+  enclosing query, and never in its own non-recursive body. A table name that matches a CTE name
+  only by case is refused, and so is a statement whose table references the scope builder did
+  not all place.
+- **One database per source (follow-up 6).** A catalog-qualified name (`db.dbo.t`) lost its
+  catalog in `.tables`, so SQL Server's `HAS_PERMS_BY_NAME` asked about `dbo.t` in the current
+  database and answered NULL, which the check read as "cannot write". Catalog-qualified names are
+  refused on every dialect (the message names the rule, not the table), and a privilege answer
+  that is not a definite no (NULL, a missing column, no row, text) is a write finding:
+  "could not be determined (NULL)".
+- **The function name lists are live (follow-up 7).** `ALLOWED_FUNCTIONS` was consulted only
+  for `exp.Anonymous`, but sqlglot 30 parses many listed names to typed nodes, so they were
+  refused although listed (`width_bucket`, `date_bin`, `dayname`, `elt`, `substring_index`,
+  `atan`, `pi`, `sysdatetimeoffset` ...) or listed in vain (`char_length`, `ltrim`,
+  `charindex` ...). Every typed, pure, read-only function moved to `ALLOWED_FUNCTION_TYPES`
+  (37 types added, each with a comment: string, array, trigonometric, clock-read, JSON-read and
+  interval functions); the dead names were deleted (177 names before, 100 after: PostgreSQL 45
+  to 25, MySQL 78 to 49, SQL Server 54 to 26). A test parses every remaining name with its
+  dialect and asserts it is untyped, so a sqlglot upgrade that types a name fails the test
+  instead of silently refusing the function.
+- **OPTION and the MySQL SELECT modifiers are hints (follow-up 8).** Only `exp.Hint` was
+  refused; T-SQL `OPTION (...)` (`exp.QueryOption`) and `SELECT HIGH_PRIORITY` /
+  `SQL_NO_CACHE` / `SQL_BUFFER_RESULT` / `SQL_CALC_FOUND_ROWS` / `STRAIGHT_JOIN` / `SQL_*_RESULT`
+  (`Select.args["operation_modifiers"]`) passed. Both are refused, at any nesting depth.
+- **Per-query checks read their own result (follow-up 9).** `test()` built the "grants
+  through roles" `TestCheck` from the findings not already seen, so it read "read-only" whenever
+  `SHOW GRANTS ... USING` repeated the direct-grant lines, which it always does. The check now
+  carries the raw findings of its query; only the problem list is deduplicated.
+- **Test gaps and small fixes (follow-up 10).** `ROWS FROM (pg_sleep(1))` is refused with a rule
+  message (it read "not NoneType"); a remote source called as a scalar function and a
+  non-identifier catalog qualifier are tested; sqlglot's `ValueError` on `hashbytes(x)` is
+  caught like a parse error. A fake MySQL connection runs the `SHOW GRANTS ... USING` roles loop
+  and the `CURRENT_ROLE()` failure path without Docker. `upload.py`'s `_within` ValueError arm
+  is tested; the junction tests note that they skip on the ubuntu runners; `csv.field_size_limit`
+  (process-wide) is set once at import rather than from a per-source method.

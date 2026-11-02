@@ -3,6 +3,7 @@ the three kinds with ADR 0006 locators, cursor resume, and the simulator's scena
 
 from __future__ import annotations
 
+import csv
 import gzip
 import io
 import os
@@ -273,21 +274,25 @@ async def test_csv_cells_past_the_csv_modules_default_field_limit_are_read(
     assert records[0].fields is not None and len(records[0].fields["blob"]) == 300_000
 
 
+def test_the_csv_field_limit_is_set_once_at_import() -> None:
+    """Security review 2026-11 (H2 follow-up 10): ``csv.field_size_limit`` is process-wide, so
+    the module sets it when it is imported, not from a per-source method."""
+    assert csv.field_size_limit() == upload_module.MAX_CSV_FIELD_BYTES
+
+
 async def test_a_csv_row_the_reader_cannot_parse_is_skipped_not_fatal(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """One bad row (here a cell past the field limit) is skipped and counted; the rows after
     it are still read and the cursor still counts the skipped row."""
-    monkeypatch.setattr(upload_module, "MAX_CSV_FIELD_BYTES", 64)
+    csv.field_size_limit(64)  # the limit is process-wide; restored below
     path = tmp_path / "t.csv"
     path.write_text("id,blob\n1,ok\n2," + "y" * 200 + "\n3,ok\n", encoding="utf-8")
     try:
         with caplog.at_level("WARNING"):
             records = await collect(rows_source(path))
     finally:
-        import csv  # noqa: PLC0415
-
-        csv.field_size_limit(16 * 1024 * 1024)
+        csv.field_size_limit(upload_module.MAX_CSV_FIELD_BYTES)
     assert [record.locator for record in records] == ["t:row:1", "t:row:3"]
     assert records[-1].commit_cursor == {"file": str(path), "line": 3}
     assert any("skipped=1" in message for message in caplog.messages)
@@ -463,6 +468,7 @@ def linked_tree(tmp_path: Path, link: str) -> tuple[Path, Path]:
     jump = tree / "jump"
     if link == "junction":
         if os.name != "nt":
+            # The junction case skips on the ubuntu CI runners; the symlink case covers them.
             pytest.skip("junctions exist on Windows only")
         import _winapi  # noqa: PLC0415
 
@@ -490,6 +496,15 @@ async def test_links_inside_a_tree_are_not_followed(tmp_path: Path, link: str) -
     result = await make({"paths": [str(jump)]}).test()
     assert any(link in problem and "not followed" in problem for problem in result.problems)
     assert result.visible == ()
+
+
+def test_within_fails_closed_when_the_paths_cannot_be_compared(tmp_path: Path) -> None:
+    """``os.path.commonpath`` raises ValueError for a relative path against an absolute one
+    (and for two drives on Windows); the file is then outside, never inside."""
+    assert not upload_module._within("relative/a.log", str(tmp_path))
+    assert not upload_module._within(str(tmp_path / "a.log"), "relative")
+    assert upload_module._within(str(tmp_path / "a.log"), str(tmp_path))
+    assert not upload_module._within(str(tmp_path.parent), str(tmp_path))
 
 
 async def test_base_dir_confines_every_path(tmp_path: Path, logs: Path) -> None:

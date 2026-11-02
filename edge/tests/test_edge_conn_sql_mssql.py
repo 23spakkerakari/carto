@@ -151,7 +151,7 @@ class Harness:
     def __init__(
         self,
         *,
-        insert: int = 0,
+        insert: int | None = 0,
         alter: int = 0,
         sysadmin: int = 0,
         database_delete: int = 0,
@@ -522,6 +522,30 @@ async def test_insert_permission_makes_the_login_write_capable() -> None:
     assert "login can INSERT on dbo.purchase_orders" in result.problems[-1]
     assert "login can ALTER on dbo.purchase_orders" in result.problems[-1]
     assert "spec 8.1.4" in result.problems[-1]
+
+
+async def test_a_null_permission_answer_makes_the_login_write_capable() -> None:
+    """Security review 2026-11 (H2 follow-up 6): HAS_PERMS_BY_NAME answers NULL when it cannot
+    find the securable; an unknown answer fails closed."""
+    result = await make(Harness(insert=None)).test()
+    assert not result.ok
+    assert result.read_only is ReadOnlyStatus.WRITE_CAPABLE
+    assert not result.can_enable
+    assert "INSERT on dbo.purchase_orders could not be determined (NULL)" in result.problems[-1]
+    table = next(check for check in result.checks if check.name == "privileges dbo.purchase_orders")
+    assert not table.ok
+
+
+def test_a_catalog_qualified_table_is_refused_at_the_source_config() -> None:
+    """Follow-up 6: a source reads one database, the configured one."""
+    with pytest.raises(InvalidConfigError, match="one database"):
+        make(
+            Harness(),
+            query=(
+                "SELECT TOP (:batch) id, updated_at FROM wms.dbo.purchase_orders "
+                "WHERE updated_at > :watermark AND updated_at <= :upper ORDER BY updated_at"
+            ),
+        )
 
 
 async def test_sysadmin_makes_the_login_write_capable() -> None:

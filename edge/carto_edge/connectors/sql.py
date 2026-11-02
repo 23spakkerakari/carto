@@ -659,12 +659,10 @@ class SqlConnector:
                                 "grants through roles", mysql_grants_using_sql(roles), {}
                             )
                         )
-            found = [
-                finding
-                for finding in write_findings(self.config.dialect, privilege_query, rows)
-                if finding not in findings
-            ]
-            findings.extend(found)
+            # The check reads its own result; only the problem list is deduplicated (SHOW GRANTS
+            # ... USING repeats the direct grant lines; ADR 0041 amendment 2026-11-02).
+            found = list(dict.fromkeys(write_findings(self.config.dialect, privilege_query, rows)))
+            findings.extend(finding for finding in found if finding not in findings)
             label = privilege_query.table or privilege_query.name
             checks.append(
                 TestCheck(
