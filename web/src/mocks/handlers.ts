@@ -14,6 +14,7 @@ import type {
   SystemPatch,
 } from '../api/types';
 import { appendAudit, type MockDb } from './db';
+import { xssEntity, xssProblem } from './fixtures/xss';
 
 const BASE = '/api/v1';
 const MAX_LIMIT = 500;
@@ -213,6 +214,11 @@ export function createHandlers(db: MockDb) {
       if (stale) return stale;
       const body = await readBody<EntityPatch>(request);
       if (body instanceof Response) return body;
+      // Under the corpus the hostile entity cannot be renamed: the problem document the
+      // screen's error line shows carries payloads in its title and detail.
+      if (db.options.corpus === 'xss' && entity.id === xssEntity.id) {
+        return problem(xssProblem.status, xssProblem.title, xssProblem.detail);
+      }
       if (
         body.name !== undefined &&
         body.name !== null &&

@@ -128,3 +128,17 @@ and trusted the `carto.source_id` an OTLP sender set.
   host; a sender that only holds a client certificate deletes the `auth:` lines.
 - The hardening test fails on any new service that lacks the anchor, publishes a port, joins
   `ingress` or runs as root without being listed as a documented exception.
+- The console's nginx keys its `/api/` request limit (`limit_req_zone $binary_remote_addr`,
+  30 requests a second with bursts of 60) on the TCP peer. With a customer ingress in front of
+  the `web` listener every browser arrives from the ingress address, so the limit applies to
+  the ingress as one client; the pilot guide says to move the limit to the ingress or raise
+  it. A trusted-proxy key from `X-Forwarded-For` waits on the M6 ingress work (ADR 0070
+  section 1), which is also when the api's own per-user limits (spec 14.7) make the nginx
+  backstop secondary (web audit 2026-11-02).
+- The web image builds with `NODE_ENV=production` (the first cut set `development` for the
+  whole build stage so devDependencies would install, and shipped react-dom's development
+  build at twice the size); `scripts/check-build.mjs` fails on the development-build
+  fingerprints. The spec 14.7 response headers live in `web/deploy/security-headers.conf`,
+  included in every nginx location that adds a header, because nginx drops the inherited
+  `add_header` set in such a location; `scripts/check-nginx.mjs` enforces the include from
+  `npm run build`.

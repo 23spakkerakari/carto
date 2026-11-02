@@ -57,6 +57,8 @@ export function buildDb(options: MockOptions): MockDb {
     nextAuditId: shop.auditEntries.length + 1,
   };
   if (options.corpus === 'xss') {
+    // The signed-in principal is hostile too: the Shell shows it on every page.
+    Object.assign(db.me, xss.xssMe);
     db.systems.push(clone(xss.xssSystem));
     db.sources.push(clone(xss.xssSource));
     db.fields.push(...clone(xss.xssFields));

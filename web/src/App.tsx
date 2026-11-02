@@ -9,6 +9,7 @@ import { SourcesPage } from './screens/sources/SourcesPage';
 import { SystemDetailPage } from './screens/systems/SystemDetailPage';
 import { SystemsPage } from './screens/systems/SystemsPage';
 import { Shell } from './shell/Shell';
+import { ErrorBoundary } from './ui/ErrorBoundary';
 import { PageHeader } from './ui/primitives';
 
 function NotFound() {
@@ -20,21 +21,25 @@ function NotFound() {
   );
 }
 
+/** The routed tree inside one error boundary: a render-time throw on any screen shows the
+ * text-only fallback with a reload link instead of a blank page. */
 export function App() {
   return (
-    <Routes>
-      <Route element={<Shell />}>
-        <Route index element={<Navigate to="/map/review" replace />} />
-        <Route path="map/review" element={<ReviewPage />} />
-        <Route path="map/entities" element={<EntitiesPage />} />
-        <Route path="systems" element={<SystemsPage />} />
-        <Route path="systems/:id" element={<SystemDetailPage />} />
-        <Route path="setup/sources" element={<SourcesPage />} />
-        <Route path="setup/sources/:id" element={<SourceDetailPage />} />
-        <Route path="setup/fields" element={<FieldsPage />} />
-        <Route path="admin/audit" element={<AuditPage />} />
-        <Route path="*" element={<NotFound />} />
-      </Route>
-    </Routes>
+    <ErrorBoundary>
+      <Routes>
+        <Route element={<Shell />}>
+          <Route index element={<Navigate to="/map/review" replace />} />
+          <Route path="map/review" element={<ReviewPage />} />
+          <Route path="map/entities" element={<EntitiesPage />} />
+          <Route path="systems" element={<SystemsPage />} />
+          <Route path="systems/:id" element={<SystemDetailPage />} />
+          <Route path="setup/sources" element={<SourcesPage />} />
+          <Route path="setup/sources/:id" element={<SourceDetailPage />} />
+          <Route path="setup/fields" element={<FieldsPage />} />
+          <Route path="admin/audit" element={<AuditPage />} />
+          <Route path="*" element={<NotFound />} />
+        </Route>
+      </Routes>
+    </ErrorBoundary>
   );
 }

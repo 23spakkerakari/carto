@@ -1,6 +1,8 @@
 // Runs after `vite build`: the production bundle must carry neither the mock API nor its
-// service worker (they exist only in `--mode mock` and `--mode e2e`), the index must carry the
-// strict CSP meta tag and no inline script or style, and every asset must be same-origin.
+// service worker (they exist only in `--mode mock` and `--mode e2e`) nor React's development
+// runtime (a build under NODE_ENV=development ships react-dom's development build, twice the
+// size and with its diagnostics; the image build once did), the index must carry the strict
+// CSP meta tag and no inline script or style, and every asset must be same-origin.
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -31,10 +33,23 @@ walk(dist);
 if (existsSync(path.join(dist, 'mockServiceWorker.js'))) {
   failures.push('dist/mockServiceWorker.js is present');
 }
+// Strings only the development builds of react and react-dom contain.
+const DEV_BUILD_FINGERPRINTS = [
+  'react-dom-client.development',
+  'jsxDEV',
+  'Each child in a list should have a unique',
+];
 for (const file of files.filter((f) => f.endsWith('.js'))) {
   const text = readFileSync(file, 'utf8');
   if (/mockServiceWorker|setupWorker|\bmsw\b/.test(text)) {
     failures.push(`${path.relative(dist, file)} references the mock API`);
+  }
+  for (const fingerprint of DEV_BUILD_FINGERPRINTS) {
+    if (text.includes(fingerprint)) {
+      failures.push(
+        `${path.relative(dist, file)} is a React development build (contains "${fingerprint}"); build with NODE_ENV=production`,
+      );
+    }
   }
 }
 // Vite writes attribute values with HTML entities (&#39; for the quote); compare decoded text.
@@ -50,4 +65,6 @@ if (failures.length > 0) {
   for (const f of failures) console.error(`  - ${f}`);
   process.exit(1);
 }
-console.log(`check-build: ok (${files.length} files, no mock API, strict CSP meta tag present)`);
+console.log(
+  `check-build: ok (${files.length} files, no mock API, production React, strict CSP meta tag present)`,
+);

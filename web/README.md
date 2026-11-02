@@ -149,11 +149,13 @@ Node 20.19 or 22; the next Node bump in CI lifts both.
 
 ## Deployment drafts
 
-`deploy/nginx.conf` and `deploy/Dockerfile` are drafts for the orchestrator to wire into
-`deploy/compose/compose.yaml` as the `web` service (ADR 0052): nginx serves `dist/` at `/`,
-sends HSTS, the CSP and the spec 14.7 headers, proxies `/api/` to the `api` service over mutual
-TLS with the `web` client certificate from `carto-ctl pki init` (paths under `/etc/carto/pki/`
-are placeholders), and never proxies `/metrics` or `/internal`.
+`deploy/nginx.conf`, `deploy/security-headers.conf` and `deploy/Dockerfile` are drafts for the
+orchestrator to wire into `deploy/compose/compose.yaml` as the `web` service (ADR 0052): nginx
+serves `dist/` at `/`, sends HSTS, the CSP and the spec 14.7 headers (the snippet, included in
+every location that adds a header of its own, since nginx drops the inherited set there;
+`scripts/check-nginx.mjs` enforces that from `npm run build`), proxies `/api/` to the `api`
+service over mutual TLS with the `web` client certificate from `carto-ctl pki init` (paths under
+`/etc/carto/pki/` are placeholders), and never proxies `/metrics` or `/internal`.
 
 ## What M3 adds
 

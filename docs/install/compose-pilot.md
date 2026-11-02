@@ -1070,6 +1070,15 @@ other mismatch still stops the gateway.
   (HTTP, the interface carto uses), Dex 5556 (dev profile only), and the collector's health
   check (13133) and metrics (8888) on its loopback only. Your override adds egress for
   `edge-gateway` (step 8).
+- **Console request limit behind an ingress.** The `web` service's nginx limits `/api/`
+  requests to 30 a second per client address with bursts of 60 (429 beyond), keyed on the TCP
+  peer. If your ingress or load balancer terminates in front of `web` (ADR 0052 allows it on
+  the plain 8080 listener), every browser reaches nginx from the ingress address and the limit
+  applies to the ingress as one client: with more than a few concurrent users the console
+  answers 429. Move the limit to the ingress (per client there) or raise the rate in
+  `web/deploy/nginx.conf` (`limit_req_zone`, `limit_req`) when you build the image. nginx
+  never reads `X-Forwarded-For` for this; a trusted-proxy key arrives with the ingress work in
+  M6 (ADR 0070 section 1, ADR 0072). The api's own per-user limits (spec 14.7) are unaffected.
 - **Mutual TLS.** Each listener requires a client certificate signed by its own CA (TLS 1.2
   minimum), so a caller meant for another listener fails the handshake. The CA keys live on the
   `pki-ca` volume, which only `pki-init` mounts, so no running service can mint certificates.
