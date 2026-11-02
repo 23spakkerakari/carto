@@ -4,6 +4,8 @@ connection helpers and the privilege interpretation."""
 from __future__ import annotations
 
 import pytest
+import sqlglot
+from sqlglot import exp
 
 from carto_edge.connectors.base import InvalidConfigError, ResolvedHost
 from carto_edge.connectors.registry import validate_config_model
@@ -11,6 +13,8 @@ from carto_edge.connectors.sql import SqlConfig
 from carto_edge.connectors.sql_dialects import (
     ALLOWED_FUNCTION_TYPES,
     ALLOWED_FUNCTIONS,
+    SQLGLOT_READ,
+    Dialect,
     PrivilegeQuery,
     StatementCheckError,
     check_statement,
@@ -331,11 +335,84 @@ def test_everyday_scalar_and_aggregate_functions_are_allowed() -> None:
             "postgresql",
             "at least one table",
         ),
+        # Security review 2026-11 (H2 follow-up 8): T-SQL OPTION (...) and the MySQL SELECT
+        # modifiers are optimizer hints too.
+        (
+            "SELECT TOP (:batch) a FROM t WHERE a > :watermark OPTION (MAXDOP 1)",
+            "mssql",
+            "optimizer hints",
+        ),
+        (
+            "SELECT TOP (:batch) a FROM t WHERE a > :watermark OPTION (RECOMPILE, MAXDOP 1)",
+            "mssql",
+            "optimizer hints",
+        ),
+        (
+            "SELECT TOP (:batch) a FROM t WHERE a > :watermark OPTION (USE PLAN N'<x/>')",
+            "mssql",
+            "optimizer hints",
+        ),
+        ("SELECT HIGH_PRIORITY a FROM t WHERE a > :watermark LIMIT :batch", "mysql", "modifiers"),
+        ("SELECT SQL_NO_CACHE a FROM t WHERE a > :watermark LIMIT :batch", "mysql", "modifiers"),
+        (
+            "SELECT SQL_BUFFER_RESULT a FROM t WHERE a > :watermark LIMIT :batch",
+            "mysql",
+            "modifiers",
+        ),
+        (
+            "SELECT SQL_CALC_FOUND_ROWS a FROM t WHERE a > :watermark LIMIT :batch",
+            "mysql",
+            "modifiers",
+        ),
+        ("SELECT STRAIGHT_JOIN a FROM t WHERE a > :watermark LIMIT :batch", "mysql", "modifiers"),
+        (
+            "SELECT DISTINCT SQL_SMALL_RESULT a FROM t WHERE a > :watermark LIMIT :batch",
+            "mysql",
+            "modifiers",
+        ),
+        (
+            "SELECT a FROM (SELECT SQL_NO_CACHE a FROM t) s WHERE a > :watermark LIMIT :batch",
+            "mysql",
+            "modifiers",
+        ),
+        # Security review 2026-11 (H2 follow-up 10): the FROM refusals name a rule, and a remote
+        # source called as a scalar function is named as such.
+        (
+            "SELECT * FROM ROWS FROM (pg_sleep(1)) WHERE a > :watermark LIMIT :batch",
+            "postgresql",
+            r"ROWS FROM is not allowed; read base tables and CTEs only",
+        ),
+        (
+            "SELECT dblink('c', 'DELETE FROM t'), id FROM t WHERE a > :watermark LIMIT :batch",
+            "postgresql",
+            "DBLINK is not allowed; read base tables and CTEs only",
+        ),
+        (
+            "SELECT TOP (:batch) * FROM fn('x').db.dbo.t WHERE a > :watermark",
+            "mssql",
+            "catalog qualifier is not a plain name",
+        ),
+        # sqlglot raises ValueError, not ParseError, on this shape; the check still refuses.
+        (
+            "SELECT TOP (:batch) hashbytes(x) FROM t WHERE a > :watermark",
+            "mssql",
+            "does not parse as mssql",
+        ),
     ],
 )
 def test_adr_0037_refusals(sql: str, dialect: str, reason: str) -> None:
     with pytest.raises(StatementCheckError, match=reason):
         check_statement(sql, dialect)  # type: ignore[arg-type]
+
+
+def test_a_from_refusal_message_names_no_python_type() -> None:
+    """Security review 2026-11 (H2 follow-up 10): ``ROWS FROM (pg_sleep(1))`` used to be refused
+    with ``not NoneType``; every refusal reads as a rule."""
+    with pytest.raises(StatementCheckError) as info:
+        check_statement(
+            "SELECT * FROM ROWS FROM (pg_sleep(1)) WHERE a > :watermark LIMIT :batch", "postgresql"
+        )
+    assert "NoneType" not in str(info.value)
 
 
 def test_reads_that_are_not_writes_stay_allowed() -> None:
@@ -350,9 +427,168 @@ def test_reads_that_are_not_writes_stay_allowed() -> None:
         ("SELECT a FROM t TABLESAMPLE SYSTEM (1) WHERE a > :watermark LIMIT :batch", "postgresql"),
         ("SELECT a FROM t PARTITION (p0) WHERE a > :watermark LIMIT :batch", "mysql"),
         ("SELECT TOP (:batch) a FROM t FOR SYSTEM_TIME ALL WHERE a > :watermark", "mssql"),
-        ("SELECT TOP (:batch) a FROM db.dbo.t WHERE a > :watermark", "mssql"),
+        ("SELECT TOP (:batch) a FROM dbo.t WHERE a > :watermark", "mssql"),
     ]:
         assert check_statement(sql, dialect).tables  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------------------------
+# Security review 2026-11, H2 follow-ups 5 and 6: CTE scopes and one database per source
+# ---------------------------------------------------------------------------------------------
+
+
+def test_a_cte_shadows_a_name_only_inside_the_query_that_defines_it() -> None:
+    """Follow-up 5: a CTE named like a base table, defined in a derived table, hid the base table
+    from the privilege check; CTE names now resolve per scope."""
+    probe = (
+        "SELECT * FROM t JOIN (WITH t AS (SELECT 1 AS id) SELECT id FROM t) s ON s.id = t.id "
+        "WHERE t.id > :watermark LIMIT :batch"
+    )
+    assert check_statement(probe, "postgresql").tables == ("t",)
+    assert check_statement(probe, "mysql").tables == ("t",)
+    # A non-recursive CTE body that reads a same-named table reads the base table.
+    own_name = "WITH t AS (SELECT * FROM t WHERE a > :watermark) SELECT * FROM t LIMIT :batch"
+    assert check_statement(own_name, "postgresql").tables == ("t",)
+    # A derived table's CTE is not visible to a sibling subquery, where the name is a table.
+    sibling = (
+        "SELECT * FROM t JOIN (WITH u AS (SELECT 1 AS id) SELECT id FROM u) s ON s.id = t.id "
+        "WHERE EXISTS (SELECT 1 FROM u) AND t.id > :watermark LIMIT :batch"
+    )
+    assert check_statement(sibling, "postgresql").tables == ("t", "u")
+    # Top-level CTEs stay visible in subqueries, derived tables and later CTEs.
+    nested = (
+        "WITH a AS (SELECT id FROM base1), b AS (SELECT a.id FROM a JOIN base2 ON 1 = 1) "
+        "SELECT * FROM b JOIN (SELECT id FROM a) s ON s.id = b.id "
+        "WHERE EXISTS (SELECT 1 FROM a) AND b.id > :watermark LIMIT :batch"
+    )
+    assert check_statement(nested, "postgresql").tables == ("base1", "base2")
+    recursive = (
+        "WITH RECURSIVE r AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM r WHERE n < 5) "
+        "SELECT * FROM r JOIN t ON t.n = r.n WHERE t.a > :watermark LIMIT :batch"
+    )
+    assert check_statement(recursive, "postgresql").tables == ("t",)
+    # A schema-qualified name is a base table even when a CTE carries the same name.
+    qualified = (
+        "WITH c AS (SELECT 1 AS id) SELECT * FROM public.c WHERE id > :watermark LIMIT :batch"
+    )
+    assert check_statement(qualified, "postgresql").tables == ("public.c",)
+
+
+def test_a_table_name_that_differs_from_a_cte_name_only_by_case_is_refused() -> None:
+    """Which one the server reads depends on quoting rules the checker does not model."""
+    sql = 'WITH "T" AS (SELECT 1 AS id) SELECT * FROM t WHERE id > :watermark LIMIT :batch'
+    with pytest.raises(StatementCheckError, match="only by case"):
+        check_statement(sql, "postgresql")
+
+
+@pytest.mark.parametrize(
+    ("sql", "dialect"),
+    [
+        ("SELECT TOP (:batch) a FROM db.dbo.t WHERE a > :watermark", "mssql"),
+        ("SELECT TOP (:batch) a FROM [db].[dbo].[t] WHERE a > :watermark", "mssql"),
+        ("SELECT a FROM wms.public.t WHERE a > :watermark LIMIT :batch", "postgresql"),
+        (
+            "SELECT TOP (:batch) a FROM dbo.t JOIN db.dbo.u ON u.id = t.id WHERE a > :watermark",
+            "mssql",
+        ),
+    ],
+)
+def test_a_catalog_qualified_table_name_is_refused(sql: str, dialect: Dialect) -> None:
+    """Follow-up 6: ``db.dbo.t`` dropped the catalog, so HAS_PERMS_BY_NAME asked about ``dbo.t``
+    in the current database and got NULL. A source reads one database; the message names the
+    rule, not the table."""
+    with pytest.raises(StatementCheckError, match="one database") as info:
+        check_statement(sql, dialect)
+    assert "db." not in str(info.value)
+    assert "wms." not in str(info.value)
+
+
+# ---------------------------------------------------------------------------------------------
+# Security review 2026-11, H2 follow-up 7: every allowlisted name is live
+# ---------------------------------------------------------------------------------------------
+
+TYPED_SHAPES: dict[Dialect, list[str]] = {
+    "postgresql": [
+        "width_bucket(x, 0, 100, 10)",
+        "date_bin('15 minutes', x, TIMESTAMP '2001-01-01')",
+        "array_length(x, 1)",
+        "array_to_string(x, ',')",
+        "format('%I', x)",  # %s is a formatting marker the check refuses first
+        "json_agg(x)",
+        "justify_days(x)",
+        "overlay(x PLACING 'y' FROM 1)",
+        "string_to_array(x, ',')",
+    ],
+    "mysql": [
+        "dayname(x)",
+        "elt(1, x, y)",
+        "substring_index(x, '-', 1)",
+        "bit_length(x)",
+        "json_keys(x)",
+        "json_type(x)",
+        "localtime()",
+        "localtimestamp()",
+        "regexp_instr(x, 'a')",
+        "regexp_substr(x, 'a')",
+        "soundex(x)",
+        "space(2)",
+        "utc_date()",
+        "utc_time()",
+    ],
+    "mssql": [
+        "atan(x)",
+        "pi()",
+        "sysdatetimeoffset()",
+        "acos(x)",
+        "asin(x)",
+        "atn2(x, y)",
+        "cos(x)",
+        "cot(x)",
+        "degrees(x)",
+        "radians(x)",
+        "sin(x)",
+        "tan(x)",
+        "soundex(x)",
+        "space(2)",
+    ],
+}
+"""Functions sqlglot 30 parses to typed nodes, which the name lists used to list in vain."""
+
+
+def template(dialect: Dialect, call: str) -> str:
+    if dialect == "mssql":
+        return f"SELECT TOP (:batch) {call} AS v FROM t WHERE a > :watermark"  # noqa: S608
+    return f"SELECT {call} AS v FROM t WHERE a > :watermark LIMIT :batch"  # noqa: S608
+
+
+@pytest.mark.parametrize("dialect", ["postgresql", "mysql", "mssql"])
+def test_every_allowlisted_name_is_one_sqlglot_leaves_untyped(dialect: Dialect) -> None:
+    """A name sqlglot parses to a typed node is dead on the name list: the typed node is judged
+    by ALLOWED_FUNCTION_TYPES alone. Every entry must therefore parse to ``exp.Anonymous`` and
+    be accepted by the check."""
+    for name in sorted(ALLOWED_FUNCTIONS[dialect]):
+        call = f"{name}(x)"
+        tree = sqlglot.parse_one(f"SELECT {call} AS v FROM t", read=SQLGLOT_READ[dialect])  # noqa: S608
+        node = tree.expressions[0].this
+        assert isinstance(node, exp.Anonymous), (
+            f"{dialect} {name}: parses to {type(node).__name__}, so the name-list entry is dead"
+        )
+        assert check_statement(template(dialect, call), dialect).tables == ("t",), name
+
+
+@pytest.mark.parametrize("dialect", ["postgresql", "mysql", "mssql"])
+def test_typed_read_only_functions_are_accepted(dialect: Dialect) -> None:
+    for call in TYPED_SHAPES[dialect]:
+        tree = sqlglot.parse_one(f"SELECT {call} AS v FROM t", read=SQLGLOT_READ[dialect])  # noqa: S608
+        node = tree.expressions[0].this
+        assert not isinstance(node, exp.Anonymous), call
+        assert check_statement(template(dialect, call), dialect).tables == ("t",), call
+
+
+def test_the_allowed_types_are_scalar_or_aggregate_functions() -> None:
+    for cls in ALLOWED_FUNCTION_TYPES:
+        assert issubclass(cls, exp.Func), cls
+        assert not issubclass(cls, exp.Anonymous), cls
 
 
 def test_the_allowlists_hold_no_table_valued_or_writing_function() -> None:
@@ -618,9 +854,49 @@ def test_mssql_privilege_queries_and_findings() -> None:
     assert write_findings(
         "mssql",
         queries[2],
-        [{"sysadmin": 1, "db_owner": 0, "db_datawriter": None, "db_ddladmin": 0}],
+        [{"sysadmin": 1, "db_owner": 0, "db_datawriter": 0, "db_ddladmin": 0}],
     ) == ["login has the sysadmin attribute"]
     assert isinstance(queries[0], PrivilegeQuery)
+
+
+def test_a_null_or_missing_permission_result_is_a_finding() -> None:
+    """Security review 2026-11 (H2 follow-up 6): HAS_PERMS_BY_NAME returns NULL when it cannot
+    answer (the name was not found); NULL was read as "cannot write". An answer the check does
+    not have is a finding, as is a missing column or a missing row."""
+    table, database, role, _linked = privilege_queries("mssql", ["dbo.purchase_orders"])
+    assert write_findings(
+        "mssql",
+        table,
+        [{"can_insert": None, "can_update": 0, "can_delete": 0, "can_alter": 0}],
+    ) == ["INSERT on dbo.purchase_orders could not be determined (NULL)"]
+    assert write_findings(
+        "mssql", database, [{"can_insert": 0, "can_update": 0, "can_delete": 0}]
+    ) == ["ALTER at database scope could not be determined (NULL)"]
+    assert write_findings("mssql", table, []) == [
+        "privileges on dbo.purchase_orders could not be read (no row)"
+    ]
+    assert write_findings("mssql", database, []) == [
+        "privileges at database scope could not be read (no row)"
+    ]
+    assert write_findings(
+        "mssql", role, [{"sysadmin": None, "db_owner": 0, "db_datawriter": 0, "db_ddladmin": 0}]
+    ) == ["the sysadmin attribute could not be determined (NULL)"]
+    assert write_findings("mssql", role, []) == ["the login's roles could not be read (no row)"]
+    # A value that is neither a definite no nor a definite yes is not a no.
+    assert write_findings(
+        "mssql", table, [{"can_insert": "0", "can_update": 0, "can_delete": 0, "can_alter": 0}]
+    ) == ["INSERT on dbo.purchase_orders could not be determined (NULL)"]
+    pg_table, pg_role = privilege_queries("postgresql", ["purchase_orders"])
+    assert write_findings(
+        "postgresql",
+        pg_table,
+        [{"can_insert": False, "can_update": None, "can_delete": False, "can_truncate": False}],
+    ) == ["UPDATE on purchase_orders could not be determined (NULL)"]
+    assert write_findings(
+        "postgresql",
+        pg_role,
+        [{"rolsuper": False, "rolcreatedb": None, "rolcreaterole": False, "rolbypassrls": False}],
+    ) == ["the rolcreatedb attribute could not be determined (NULL)"]
 
 
 # ---------------------------------------------------------------------------------------------

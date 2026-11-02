@@ -7,11 +7,14 @@ query template and anything other than one ``SELECT`` (or ``WITH ... SELECT``) i
 parameters ``:watermark`` and ``:batch``, plus ``:upper`` for a time-typed watermark (ADR 0035,
 where it is required; it is refused for integer and decimal watermarks); string formatting
 markers are refused outright. ADR 0037 item 1 makes the rest an allowlist: the statement reads
-base tables and CTEs only (at least one table; no table-valued functions, ``OPENQUERY``,
-``OPENROWSET``, ``OPENDATASOURCE`` or linked-server names), carries no table or optimizer
-hints and no ``NEXT VALUE FOR``, and calls only aggregates plus the scalar functions in
-:data:`ALLOWED_FUNCTION_TYPES` and the per-dialect names in :data:`ALLOWED_FUNCTIONS`. A
-function that is missing is added in code, never through a setting.
+base tables and CTEs only (at least one table; no table-valued functions, ``ROWS FROM``,
+``OPENQUERY``, ``OPENROWSET``, ``OPENDATASOURCE``, linked-server or catalog-qualified names: a
+source reads the one database it is configured for), carries no table or optimizer hints (T-SQL
+``OPTION (...)`` and the MySQL ``SELECT`` modifiers included) and no ``NEXT VALUE FOR``, and calls
+only aggregates plus the scalar functions in :data:`ALLOWED_FUNCTION_TYPES` and the per-dialect
+names in :data:`ALLOWED_FUNCTIONS`. A function that is missing is added in code, never through a
+setting. CTE names resolve per query scope (sqlglot's scope builder), so a CTE hides a base table
+only inside the query that defines it (ADR 0041 amendment 2026-11-02).
 
 Layer 2 is the session: PostgreSQL connects with ``default_transaction_read_only=on``, a
 ``statement_timeout`` and ``TimeZone=UTC`` and polls inside ``BEGIN READ ONLY`` (set through
@@ -42,7 +45,7 @@ from typing import Any, Final, Literal
 
 import sqlglot
 from sqlglot import exp
-from sqlglot.errors import ParseError
+from sqlglot.optimizer.scope import traverse_scope
 
 from carto_edge.connectors.base import InvalidConfigError, ResolvedHost
 from carto_edge.secrets import Credentials
@@ -121,6 +124,8 @@ ALLOWED_FUNCTION_TYPES: Final[frozenset[type[exp.Func]]] = frozenset(
         exp.RegexpReplace,
         exp.RegexpLike,
         exp.RegexpExtract,
+        exp.RegexpInstr,  # MySQL REGEXP_INSTR: position of a match, pure
+        exp.RegexpSubstr,  # MySQL REGEXP_SUBSTR: the matched text, pure
         exp.Initcap,
         exp.Pad,
         exp.Reverse,
@@ -142,6 +147,18 @@ ALLOWED_FUNCTION_TYPES: Final[frozenset[type[exp.Func]]] = frozenset(
         exp.ToChar,
         exp.ToBase64,
         exp.FromBase64,
+        exp.Format,  # PostgreSQL format(): printf-style text, pure
+        exp.Overlay,  # PostgreSQL overlay(): replace a substring, pure
+        exp.SubstringIndex,  # MySQL SUBSTRING_INDEX: text before the nth delimiter, pure
+        exp.Elt,  # MySQL ELT: the nth argument, pure
+        exp.Soundex,  # MySQL and SQL Server SOUNDEX: a phonetic code, pure
+        exp.Space,  # MySQL and SQL Server SPACE: n blanks, pure
+        exp.BitLength,  # MySQL BIT_LENGTH: the length in bits, pure
+        exp.Dayname,  # MySQL DAYNAME: the weekday name, pure
+        # Arrays (PostgreSQL): reads of a value, never a set-returning function
+        exp.ArraySize,  # array_length, pure
+        exp.ArrayToString,  # array_to_string, pure
+        exp.StringToArray,  # string_to_array, pure
         # Numbers
         exp.Round,
         exp.Abs,
@@ -155,14 +172,35 @@ ALLOWED_FUNCTION_TYPES: Final[frozenset[type[exp.Func]]] = frozenset(
         exp.Ln,
         exp.Log,
         exp.SafeDivide,
+        exp.WidthBucket,  # PostgreSQL width_bucket: the histogram bucket of a value, pure
+        exp.Sin,  # the trigonometric functions of SQL Server (and the others): pure
+        exp.Cos,
+        exp.Tan,
+        exp.Cot,
+        exp.Asin,
+        exp.Acos,
+        exp.Atan,
+        exp.Atan2,  # SQL Server ATN2
+        exp.Degrees,
+        exp.Radians,
+        exp.Pi,
         # Dates and times
         exp.CurrentTimestamp,
+        exp.CurrentTimestampLTZ,  # SQL Server SYSDATETIMEOFFSET(): the clock with its offset
         exp.CurrentDate,
         exp.CurrentTime,
         exp.CurrentDatetime,
         exp.UtcTimestamp,
+        exp.UtcDate,  # MySQL UTC_DATE(): the clock, read-only
+        exp.UtcTime,  # MySQL UTC_TIME(): the clock, read-only
+        exp.Localtime,  # MySQL LOCALTIME(): the clock, read-only
+        exp.Localtimestamp,  # MySQL LOCALTIMESTAMP(): the clock, read-only
         exp.TimestampTrunc,
         exp.DateTrunc,
+        exp.DateBin,  # PostgreSQL date_bin: align a timestamp to a stride, pure
+        exp.JustifyDays,  # PostgreSQL justify_days / justify_hours / justify_interval: pure
+        exp.JustifyHours,
+        exp.JustifyInterval,
         exp.Extract,
         exp.TimeToStr,
         exp.StrToTime,
@@ -211,6 +249,9 @@ ALLOWED_FUNCTION_TYPES: Final[frozenset[type[exp.Func]]] = frozenset(
         exp.JSONExtractScalar,
         exp.JSONBExtract,
         exp.JSONBExtractScalar,
+        exp.JSONKeys,  # MySQL JSON_KEYS: the keys of a document, pure
+        exp.JSONType,  # MySQL JSON_TYPE: the type of a value, pure
+        exp.JSONArrayAgg,  # PostgreSQL json_agg (an aggregate sqlglot types as one)
         # Session facts and identifiers
         exp.CurrentUser,
         exp.CurrentSchema,
@@ -229,50 +270,30 @@ ALLOWED_FUNCTIONS: Final[dict[Dialect, frozenset[str]]] = {
     "postgresql": frozenset(
         {
             "age",
-            "array_length",
-            "array_to_string",
             "cardinality",
-            "char_length",
-            "character_length",
             "clock_timestamp",
-            "date_bin",
             "every",
-            "format",
-            "gen_random_uuid",
             "isfinite",
-            "json_agg",
             "json_array_length",
-            "json_extract_path",
-            "json_extract_path_text",
             "json_typeof",
             "jsonb_agg",
             "jsonb_array_length",
             "jsonb_extract_path",
             "jsonb_extract_path_text",
             "jsonb_typeof",
-            "justify_days",
-            "justify_hours",
-            "justify_interval",
-            "ltrim",
             "make_date",
-            "make_timestamp",
             "make_timestamptz",
             "num_nonnulls",
             "num_nulls",
             "octet_length",
-            "overlay",
             "quote_ident",
             "quote_literal",
             "quote_nullable",
-            "rtrim",
             "statement_timestamp",
-            "string_to_array",
-            "substr",
             "timezone",
             "to_json",
             "to_jsonb",
             "transaction_timestamp",
-            "width_bucket",
         }
     ),
     "mysql": frozenset(
@@ -281,17 +302,8 @@ ALLOWED_FUNCTIONS: Final[dict[Dialect, frozenset[str]]] = {
             "addtime",
             "bin",
             "bin_to_uuid",
-            "bit_length",
-            "char_length",
-            "character_length",
             "conv",
             "crc32",
-            "curtime",
-            "dayname",
-            "dayofmonth",
-            "dayofweek",
-            "dayofyear",
-            "elt",
             "export_set",
             "field",
             "find_in_set",
@@ -306,22 +318,15 @@ ALLOWED_FUNCTIONS: Final[dict[Dialect, frozenset[str]]] = {
             "json_contains",
             "json_contains_path",
             "json_depth",
-            "json_keys",
             "json_length",
             "json_pretty",
             "json_quote",
             "json_search",
-            "json_type",
             "json_unquote",
             "json_valid",
-            "localtime",
-            "localtimestamp",
-            "ltrim",
             "makedate",
-            "maketime",
             "microsecond",
             "mid",
-            "monthname",
             "now",
             "oct",
             "octet_length",
@@ -329,97 +334,58 @@ ALLOWED_FUNCTIONS: Final[dict[Dialect, frozenset[str]]] = {
             "period_add",
             "period_diff",
             "quote",
-            "regexp_instr",
-            "regexp_substr",
-            "rtrim",
             "sec_to_time",
-            "sha",
-            "sha1",
-            "soundex",
-            "space",
             "strcmp",
             "subdate",
-            "substring_index",
             "subtime",
             "sysdate",
             "time_format",
             "time_to_sec",
             "timediff",
-            "to_days",
             "to_seconds",
             "unix_timestamp",
-            "utc_date",
-            "utc_time",
-            "uuid",
             "uuid_to_bin",
             "weekday",
-            "weekofyear",
             "yearweek",
         }
     ),
     "mssql": frozenset(
         {
-            "acos",
-            "asin",
-            "atan",
-            "atn2",
             "binary_checksum",
-            "charindex",
             "checksum",
             "choose",
-            "cos",
-            "cot",
             "datalength",
-            "datediff_big",
-            "datename",
             "datetime2fromparts",
-            "datetimefromparts",
             "datetimeoffsetfromparts",
-            "datetrunc",
             "db_id",
             "db_name",
-            "degrees",
             "difference",
-            "eomonth",
             "getutcdate",
-            "hashbytes",
             "isdate",
             "isjson",
             "isnumeric",
-            "log10",
             "nchar",
             "parse",
             "parsename",
             "patindex",
-            "pi",
             "quotename",
-            "radians",
-            "schema_name",
-            "sin",
             "smalldatetimefromparts",
-            "soundex",
-            "space",
-            "square",
             "str",
             "string_escape",
-            "suser_sname",
             "switchoffset",
-            "sysdatetime",
-            "sysdatetimeoffset",
             "sysutcdatetime",
-            "tan",
-            "timefromparts",
             "todatetimeoffset",
-            "try_convert",
             "try_parse",
             "user_name",
         }
     ),
 }
-"""ADR 0037 item 1: per dialect, the functions sqlglot leaves untyped (``exp.Anonymous``) that a
-template may still call, lower-cased. Everything else untyped is refused by name, so ``nextval``,
-``pg_sleep``, ``sleep``, ``load_file``, ``xp_cmdshell``, user-defined functions and whatever a
-vendor adds next are refused without anyone listing them."""
+"""ADR 0037 item 1: per dialect, the functions sqlglot 30 leaves untyped (``exp.Anonymous``) that
+a template may still call, lower-cased. Everything else untyped is refused by name, so
+``nextval``, ``pg_sleep``, ``sleep``, ``load_file``, ``xp_cmdshell``, user-defined functions and
+whatever a vendor adds next are refused without anyone listing them. A name sqlglot parses to a
+typed node is judged by :data:`ALLOWED_FUNCTION_TYPES` instead and does not belong here
+(``test_every_allowlisted_name_is_one_sqlglot_leaves_untyped`` keeps the list live)."""
 
 REMOTE_SOURCES: Final = frozenset({"openquery", "openrowset", "opendatasource", "dblink"})
 """Named in the refusal: these reach another server, where the embedded text may write."""
@@ -515,12 +481,16 @@ def _check_function(node: exp.Func, dialect: Dialect) -> None:
 
 
 def _check_table_source(table: exp.Table) -> None:
-    """ADR 0037 item 1: a FROM or JOIN item is a base table or CTE, without hints."""
+    """ADR 0037 item 1: a FROM or JOIN item is a base table or CTE, without hints, named with at
+    most a schema (a source reads the one database it is configured for)."""
     if table.args.get("hints"):
         label = f" on {table.name}" if table.name else ""
         msg = f"table hints are not allowed{label}"
         raise StatementCheckError(msg)
     tail = "; read base tables and CTEs only"
+    if table.args.get("rows_from"):
+        msg = f"ROWS FROM is not allowed{tail}"
+        raise StatementCheckError(msg)
     for function in table.find_all(exp.Anonymous):
         name = str(function.name).lower()
         if name in REMOTE_SOURCES:
@@ -529,19 +499,62 @@ def _check_table_source(table: exp.Table) -> None:
     for part in ("catalog", "db"):
         qualifier = table.args.get(part)
         if qualifier is not None and not isinstance(qualifier, exp.Identifier):
-            msg = f"FROM must name a table; its {part} is {type(qualifier).__name__}{tail}"
+            msg = f"FROM must name a table; its {part} qualifier is not a plain name{tail}"
             raise StatementCheckError(msg)
     source = table.this
-    if isinstance(source, exp.Identifier):
-        return
     if isinstance(source, exp.Func):
         msg = f"table-valued function {_function_name(source)}() is not allowed in FROM{tail}"
         raise StatementCheckError(msg)
     if isinstance(source, exp.Dot):
         msg = f"four-part (linked server) names are not allowed{tail}"
         raise StatementCheckError(msg)
-    msg = f"FROM must name a table, not {type(source).__name__}{tail}"
-    raise StatementCheckError(msg)
+    if not isinstance(source, exp.Identifier) or not source.name:
+        msg = f"FROM must name a table{tail}"
+        raise StatementCheckError(msg)
+    if table.args.get("catalog") is not None:
+        # The privilege check runs in the configured database; a name that reaches into another
+        # one would be checked against the wrong table (or none: HAS_PERMS_BY_NAME returns NULL).
+        msg = (
+            "catalog-qualified table names are not allowed; a source reads one database, "
+            "name tables as table or schema.table"
+        )
+        raise StatementCheckError(msg)
+
+
+def _base_tables(tree: exp.Select) -> list[str]:
+    """The base tables the statement reads, ``schema.table`` when qualified, resolved per
+    query scope: a CTE hides an unqualified name only in the query that defines it and the
+    queries nested in that one, never in a sibling or an enclosing query, and never in its own
+    non-recursive body. A name that matches a CTE only by case is refused (which one the server
+    reads depends on quoting rules the check does not model), and so is a statement whose table
+    references the scope builder did not all place."""
+    placed: set[int] = set()
+    tables: list[str] = []
+    try:
+        scopes = list(traverse_scope(tree))
+    except Exception as exc:  # whatever the scope builder raises, the statement is refused
+        msg = "the query's table references could not be resolved"
+        raise StatementCheckError(msg) from exc
+    for scope in scopes:
+        ctes = {str(name).lower(): str(name) for name in scope.cte_sources}
+        for table in scope.tables:
+            placed.add(id(table))
+            name = str(table.name)
+            schema = str(table.db)
+            if not schema:
+                cte = ctes.get(name.lower())
+                if cte == name:
+                    continue
+                if cte is not None:
+                    msg = "a table name differs from a CTE name only by case; rename the CTE"
+                    raise StatementCheckError(msg)
+            full = f"{schema}.{name}" if schema else name
+            if full not in tables:
+                tables.append(full)
+    if any(id(table) not in placed for table in tree.find_all(exp.Table)):
+        msg = "the query's table references could not all be resolved"
+        raise StatementCheckError(msg)
+    return tables
 
 
 def check_statement(sql: str, dialect: Dialect, *, upper: bool = False) -> CheckedStatement:
@@ -562,7 +575,7 @@ def check_statement(sql: str, dialect: Dialect, *, upper: bool = False) -> Check
         raise StatementCheckError(msg)
     try:
         parsed = sqlglot.parse(text, read=SQLGLOT_READ[dialect])
-    except ParseError as exc:
+    except Exception as exc:  # sqlglot raises ParseError, ValueError or TypeError
         msg = f"the query does not parse as {dialect}"
         raise StatementCheckError(msg) from exc
     expressions = [expression for expression in parsed if expression is not None]
@@ -586,6 +599,15 @@ def check_statement(sql: str, dialect: Dialect, *, upper: bool = False) -> Check
             raise StatementCheckError(msg)
         if isinstance(node, exp.Hint):
             msg = "optimizer hints are not allowed"
+            raise StatementCheckError(msg)
+        if isinstance(node, exp.QueryOption):
+            msg = "optimizer hints are not allowed (OPTION clause)"
+            raise StatementCheckError(msg)
+        if isinstance(node, exp.Select) and node.args.get("operation_modifiers"):
+            msg = (
+                "SELECT modifiers (HIGH_PRIORITY, STRAIGHT_JOIN, SQL_NO_CACHE, SQL_BUFFER_RESULT, "
+                "SQL_CALC_FOUND_ROWS ...) are not allowed; they are optimizer hints"
+            )
             raise StatementCheckError(msg)
         if isinstance(node, exp.NextValueFor):
             msg = "NEXT VALUE FOR is not allowed (it advances a sequence)"
@@ -612,18 +634,7 @@ def check_statement(sql: str, dialect: Dialect, *, upper: bool = False) -> Check
                 "WHERE <column> > :watermark AND <column> <= :upper, ADR 0035)"
             )
         raise StatementCheckError(msg)
-    ctes = {str(cte.alias_or_name).lower() for cte in tree.find_all(exp.CTE)}
-    tables: list[str] = []
-    for table in tree.find_all(exp.Table):
-        name = str(table.name)
-        if not name:
-            continue
-        schema = str(table.db)
-        if not schema and name.lower() in ctes:
-            continue
-        full = f"{schema}.{name}" if schema else name
-        if full not in tables:
-            tables.append(full)
+    tables = _base_tables(tree)
     if not tables:
         msg = "the query must read at least one table"
         raise StatementCheckError(msg)
@@ -836,14 +847,27 @@ def mysql_grants_using_sql(roles: Sequence[str]) -> str:
     return "SHOW GRANTS FOR CURRENT_USER() USING " + ", ".join(roles)
 
 
+def _definitely_false(value: object) -> bool:
+    """A privilege answer that says no: ``False`` or ``0``. NULL (the securable was not found),
+    a missing column, text or anything else is not a no (ADR 0041 amendment 2026-11-02)."""
+    return value is False or (isinstance(value, int) and not isinstance(value, bool) and value == 0)
+
+
 def _truthy(value: object) -> bool:
     return value is True or (isinstance(value, int) and not isinstance(value, bool) and value == 1)
+
+
+def _expected_privileges(dialect: Dialect, query: PrivilegeQuery) -> tuple[str, ...]:
+    if query.name == "database":
+        return _MSSQL_DATABASE_PRIVILEGES
+    return _PG_TABLE_PRIVILEGES if dialect == "postgresql" else _MSSQL_TABLE_PRIVILEGES
 
 
 def write_findings(
     dialect: Dialect, query: PrivilegeQuery, rows: Sequence[Mapping[str, Any]]
 ) -> list[str]:
-    """Explanations of every write capability the rows reveal; empty means read-only so far."""
+    """Explanations of every write capability the rows reveal; empty means read-only so far. An
+    answer the check does not have (a NULL, a missing column, no row) is a finding too."""
     findings: list[str] = []
     if dialect == "mysql":
         if query.name == "roles":
@@ -852,21 +876,32 @@ def write_findings(
             for line in row.values():
                 findings.extend(_mysql_grant_findings(str(line)))
         return findings
-    for row in rows:
-        if query.name in {"table", "database"}:
-            where = f"on {query.table}" if query.name == "table" else "at database scope"
-            for key, value in row.items():
-                if str(key).startswith("can_") and _truthy(value):
-                    privilege = str(key)[4:].upper()
+    if query.name in {"table", "database"}:
+        where = f"on {query.table}" if query.name == "table" else "at database scope"
+        if not rows:
+            findings.append(f"privileges {where} could not be read (no row)")
+        for row in rows:
+            for privilege in _expected_privileges(dialect, query):
+                value = row.get(f"can_{privilege.lower()}")
+                if _truthy(value):
                     findings.append(f"login can {privilege} {where}")
-        elif query.name == "linked servers":
-            # ADR 0037 item 2: a visible linked server is a path to writes elsewhere.
+                elif not _definitely_false(value):
+                    findings.append(f"{privilege} {where} could not be determined (NULL)")
+        return findings
+    if query.name == "linked servers":
+        # ADR 0037 item 2: a visible linked server is a path to writes elsewhere.
+        for row in rows:
             name = str(next(iter(row.values()), "?"))[:MAX_GRANT_LINE_CHARS]
             findings.append(f"login sees linked server {name}")
-        else:
-            for key, value in row.items():
-                if _truthy(value):
-                    findings.append(f"login has the {key} attribute")
+        return findings
+    if not rows:
+        findings.append("the login's roles could not be read (no row)")
+    for row in rows:
+        for key, value in row.items():
+            if _truthy(value):
+                findings.append(f"login has the {key} attribute")
+            elif not _definitely_false(value):
+                findings.append(f"the {key} attribute could not be determined (NULL)")
     return findings
 
 

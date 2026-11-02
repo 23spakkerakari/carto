@@ -1,26 +1,31 @@
-"""carto_edge.connectors.sql against MySQL in a container (spec 18.3 read-only tests): SELECT-only
-login VERIFIED, INSERT grant WRITE_CAPABLE, polling by watermark, and an INSERT through the
-connector's START TRANSACTION READ ONLY session is refused. Skipped when Docker is unreachable."""
+"""carto_edge.connectors.sql for MySQL: against a container (spec 18.3 read-only tests, marked
+``integration``, skipped when Docker is unreachable): SELECT-only login VERIFIED, INSERT grant
+WRITE_CAPABLE, polling by watermark, and an INSERT through the connector's START TRANSACTION READ
+ONLY session is refused. Against a fake connection (no Docker, security review 2026-11 H2
+follow-ups 9 and 10): the ``SHOW GRANTS ... USING`` roles loop, role grants that repeat the direct
+lines, and the ``CURRENT_ROLE()`` failure path."""
 
 from __future__ import annotations
 
 import socket
 import ssl
 import warnings
-from collections.abc import Iterator
-from datetime import datetime
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
 from sqlalchemy import text
-from sqlalchemy.exc import DBAPIError
+from sqlalchemy.exc import DBAPIError, OperationalError
 
 from carto_edge.config import SourceConfig, SourceType
 from carto_edge.connectors.base import ConnectorContext, ReadOnlyStatus, ResolvedHost
 from carto_edge.connectors.sql import SqlConnector
+from carto_edge.connectors.sql_dialects import CLOCK_SQL
 from carto_edge.pipeline.model import CursorCheckpoint, RawRecord, ReadItem
 
-pytestmark = pytest.mark.integration
+integration = pytest.mark.integration
 
 QUERY = """
 SELECT id, po_num, order_ref, status, warehouse_code, created_by, updated_at
@@ -207,6 +212,7 @@ async def collect(
     return [item for item in await collect_items(connector, cursor) if isinstance(item, RawRecord)]
 
 
+@integration
 async def test_select_only_login_is_verified(mysql: dict[str, Any]) -> None:
     connector, network = make(mysql, "carto_ro", RO_PASSWORD)
     try:
@@ -220,6 +226,7 @@ async def test_select_only_login_is_verified(mysql: dict[str, Any]) -> None:
     assert network.calls >= 2  # validated at every connect (ADR 0018)
 
 
+@integration
 async def test_insert_grant_is_refused(mysql: dict[str, Any]) -> None:
     connector, _network = make(mysql, "carto_rw", RW_PASSWORD)
     try:
@@ -232,6 +239,7 @@ async def test_insert_grant_is_refused(mysql: dict[str, Any]) -> None:
     assert "INSERT on `wms`.`purchase_orders`" in result.problems[-1]
 
 
+@integration
 async def test_an_insert_grant_held_through_a_role_is_refused(mysql: dict[str, Any]) -> None:
     """ADR 0037 item 3: SHOW GRANTS FOR CURRENT_USER() USING the login's roles."""
     connector, _network = make(mysql, "carto_role", ROLE_PASSWORD)
@@ -250,6 +258,7 @@ async def test_an_insert_grant_held_through_a_role_is_refused(mysql: dict[str, A
     ]
 
 
+@integration
 async def test_polling_by_watermark(mysql: dict[str, Any]) -> None:
     connector, _network = make(mysql, "carto_ro", RO_PASSWORD, batch=2)
     try:
@@ -271,6 +280,7 @@ async def test_polling_by_watermark(mysql: dict[str, Any]) -> None:
         await connector.close()
 
 
+@integration
 async def test_insert_through_the_connector_session_is_refused(mysql: dict[str, Any]) -> None:
     connector, _network = make(mysql, "carto_rw", RW_PASSWORD)
 
@@ -285,3 +295,282 @@ async def test_insert_through_the_connector_session_is_refused(mysql: dict[str, 
         assert len(await collect(connector)) == 5
     finally:
         await connector.close()
+
+
+# ---------------------------------------------------------------------------------------------
+# Fake connection (no Docker): the roles loop and the CURRENT_ROLE() failure path
+# ---------------------------------------------------------------------------------------------
+
+NOW = datetime(2026, 10, 8, 12, 0, tzinfo=UTC)
+DB_NOW = datetime(2026, 10, 8, 12, 0, 0)  # UTC_TIMESTAMP(6) comes back naive
+CLOCK = CLOCK_SQL["mysql"]
+FAKE_QUERY = (
+    "SELECT id, po_num, status, updated_at FROM purchase_orders "
+    "WHERE updated_at > :watermark AND updated_at <= :upper ORDER BY updated_at LIMIT :batch"
+)
+FAKE_ROWS = [
+    {"id": 1, "po_num": "88-210", "status": "SHIPPED", "updated_at": datetime(2026, 9, 23, 22, 4)},
+    {"id": 2, "po_num": "88-211", "status": "OPEN", "updated_at": datetime(2026, 9, 23, 22, 5)},
+]
+DIRECT_LINES = [
+    "GRANT USAGE ON *.* TO `carto_role`@`%`",
+    "GRANT SELECT ON `wms`.`purchase_orders` TO `carto_role`@`%`",
+    "GRANT `wms_writer`@`%` TO `carto_role`@`%`",
+]
+ROLES_SQL = "SELECT CURRENT_ROLE() AS roles"
+GRANTS_SQL = "SHOW GRANTS FOR CURRENT_USER()"
+USING_SQL = "SHOW GRANTS FOR CURRENT_USER() USING `wms_writer`@`%`"
+
+
+class FakeResult:
+    def __init__(self, rows: list[dict[str, Any]]) -> None:
+        self._rows = rows
+
+    def mappings(self) -> FakeResult:
+        return self
+
+    def all(self) -> list[dict[str, Any]]:
+        return list(self._rows)
+
+
+class FakeConnection:
+    """The SQLAlchemy Connection surface the connector uses on MySQL."""
+
+    def __init__(
+        self,
+        responder: Callable[[str, dict[str, Any]], list[dict[str, Any]]],
+        log: list[tuple[str, dict[str, Any]]],
+    ) -> None:
+        self.responder = responder
+        self.log = log
+
+    def execution_options(self, **options: Any) -> FakeConnection:
+        self.log.append(("options", dict(options)))
+        return self
+
+    def exec_driver_sql(self, statement: str) -> None:
+        self.log.append((statement, {}))
+
+    def execute(self, statement: Any, params: dict[str, Any] | None = None) -> FakeResult:
+        sql = str(statement)
+        parameters = dict(params or {})
+        self.log.append((sql, parameters))
+        return FakeResult(self.responder(sql, parameters))
+
+
+class FakeEngine:
+    def __init__(
+        self,
+        drivername: str,
+        creator: Callable[[], Any],
+        responder: Callable[[str, dict[str, Any]], list[dict[str, Any]]],
+    ) -> None:
+        self.drivername = drivername
+        self.creator = creator
+        self.responder = responder
+        self.log: list[tuple[str, dict[str, Any]]] = []
+
+    @contextmanager
+    def connect(self) -> Iterator[FakeConnection]:
+        dbapi = self.creator()
+        try:
+            yield FakeConnection(self.responder, self.log)
+        finally:
+            dbapi.close()
+
+    def dispose(self) -> None:
+        return None
+
+
+class FakeDbapiConnection:
+    def __init__(self, dialect: str, plan: Any) -> None:
+        self.dialect = dialect
+        self.plan = plan
+
+    def close(self) -> None:
+        return None
+
+
+class FakeMysql:
+    """Answers the connector's statements: the clock, the poll, ``CURRENT_ROLE()``, ``SHOW
+    GRANTS`` and ``SHOW GRANTS ... USING``."""
+
+    def __init__(
+        self,
+        *,
+        current_role: str | None = "NONE",
+        direct_lines: list[str] | None = None,
+        role_lines: list[str] | None = None,
+        roles_fail: bool = False,
+    ) -> None:
+        self.current_role = current_role
+        self.direct_lines = DIRECT_LINES if direct_lines is None else direct_lines
+        self.role_lines = role_lines if role_lines is not None else list(self.direct_lines)
+        self.roles_fail = roles_fail
+        self.engine: FakeEngine | None = None
+        self.network = FakeNetwork()
+
+    def connect(self, dialect: str, plan: Any) -> FakeDbapiConnection:
+        assert dialect == "mysql"
+        assert isinstance(plan, dict)
+        return FakeDbapiConnection(dialect, plan)
+
+    def engine_factory(self, drivername: str, creator: Callable[[], Any]) -> Any:
+        self.engine = FakeEngine(drivername, creator, self.respond)
+        return self.engine
+
+    def statements(self) -> list[str]:
+        assert self.engine is not None
+        return [sql for sql, _ in self.engine.log]
+
+    def respond(self, sql: str, params: dict[str, Any]) -> list[dict[str, Any]]:
+        if sql == CLOCK:
+            return [{"now": DB_NOW}]
+        if sql == ROLES_SQL:
+            if self.roles_fail:
+                raise OperationalError(
+                    sql, {}, Exception("FUNCTION wms.CURRENT_ROLE does not exist")
+                )
+            return [{"roles": self.current_role}]
+        if sql == GRANTS_SQL:
+            return [{"Grants for carto_role@%": line} for line in self.direct_lines]
+        if sql.startswith("SHOW GRANTS FOR CURRENT_USER() USING "):
+            return [{"Grants for carto_role@%": line} for line in self.role_lines]
+        assert sql == FAKE_QUERY
+        assert set(params) == {"watermark", "upper", "batch"}
+        return FAKE_ROWS[: params["batch"]]
+
+
+class FakeSecrets:
+    def resolve(self, secret_ref: str) -> str:
+        assert secret_ref == "local://wms-readonly"  # noqa: S105
+        return "carto_role:role-pw"
+
+
+class FakeNetwork:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, int]] = []
+
+    def resolve(self, host: str, port: int) -> ResolvedHost:
+        self.calls.append((host, port))
+        return ResolvedHost(host=host, address="10.20.3.6", port=port)
+
+
+def make_fake(fake: FakeMysql) -> SqlConnector:
+    source = SourceConfig(
+        id="src_wms_mysql",
+        system="sys_warehouse",
+        type=SourceType.SQL,
+        config={
+            "dialect": "mysql",
+            "host": "mysql.internal.example",
+            "database": "wms",
+            "query_timeout_seconds": 5,
+            "queries": [
+                {
+                    "name": "purchase_orders",
+                    "sql": FAKE_QUERY,
+                    "watermark_column": "updated_at",
+                    "primary_key": "id",
+                }
+            ],
+        },
+        secret_ref="local://wms-readonly",  # noqa: S106
+    )
+    return SqlConnector(
+        source,
+        ConnectorContext(secrets=FakeSecrets(), network=fake.network),
+        connect=fake.connect,
+        engine_factory=fake.engine_factory,
+        clock=lambda: NOW,
+    )
+
+
+async def test_fake_read_only_login_with_a_read_only_role_is_verified() -> None:
+    """ADR 0037 item 3 without Docker: the role from the GRANT line is expanded with SHOW GRANTS
+    ... USING, inside the read-only session."""
+    fake = FakeMysql(
+        role_lines=[*DIRECT_LINES, "GRANT SELECT ON `wms`.`warehouses` TO `carto_role`@`%`"]
+    )
+    result = await make_fake(fake).test()
+    assert result.problems == ()
+    assert result.ok
+    assert result.read_only is ReadOnlyStatus.VERIFIED
+    assert result.visible == ("purchase_orders",)
+    assert [check.name for check in result.checks] == [
+        "query purchase_orders",
+        "privileges roles",
+        "privileges grants",
+        "privileges grants through roles",
+    ]
+    assert all(check.ok for check in result.checks)
+    statements = fake.statements()
+    assert USING_SQL in statements
+    assert "SET SESSION max_execution_time = 5000" in statements
+    assert "START TRANSACTION READ ONLY" in statements
+    assert fake.network.calls and fake.network.calls[0] == ("mysql.internal.example", 3306)
+
+
+async def test_fake_active_roles_join_the_granted_ones() -> None:
+    fake = FakeMysql(current_role="`auditor`@`localhost`")
+    await make_fake(fake).test()
+    assert (
+        "SHOW GRANTS FOR CURRENT_USER() USING `auditor`@`localhost`, `wms_writer`@`%`"
+        in fake.statements()
+    )
+
+
+async def test_fake_role_grants_that_repeat_the_direct_lines_still_fail_their_check() -> None:
+    """Security review 2026-11 (H2 follow-up 9): SHOW GRANTS ... USING repeats the direct lines,
+    so a per-query check built from the deduplicated list read "read-only" whenever the login's
+    own grants already carried the finding. The check reads its own result; the problem list is
+    deduplicated."""
+    direct = [
+        "GRANT USAGE ON *.* TO `carto_role`@`%`",
+        "GRANT SELECT, INSERT ON `wms`.`purchase_orders` TO `carto_role`@`%`",
+        "GRANT `wms_writer`@`%` TO `carto_role`@`%`",
+    ]
+    fake = FakeMysql(
+        direct_lines=direct, role_lines=[*direct, "GRANT UPDATE ON `wms`.* TO `carto_role`@`%`"]
+    )
+    result = await make_fake(fake).test()
+    assert not result.ok
+    assert result.read_only is ReadOnlyStatus.WRITE_CAPABLE
+    checks = {check.name: check for check in result.checks}
+    assert not checks["privileges grants"].ok
+    assert "INSERT on `wms`.`purchase_orders`" in checks["privileges grants"].detail
+    through = checks["privileges grants through roles"]
+    assert not through.ok
+    assert "login has INSERT on `wms`.`purchase_orders`" in through.detail
+    assert "login has UPDATE on `wms`.*" in through.detail
+    assert result.problems[-1].count("login has INSERT on `wms`.`purchase_orders`") == 1
+    assert "login has UPDATE on `wms`.*" in result.problems[-1]
+
+
+async def test_fake_role_grants_that_only_repeat_the_direct_lines_are_write_findings() -> None:
+    direct = [
+        "GRANT USAGE ON *.* TO `carto_role`@`%`",
+        "GRANT SELECT, DELETE ON `wms`.`purchase_orders` TO `carto_role`@`%`",
+        "GRANT `wms_writer`@`%` TO `carto_role`@`%`",
+    ]
+    result = await make_fake(FakeMysql(direct_lines=direct, role_lines=direct)).test()
+    through = next(c for c in result.checks if c.name == "privileges grants through roles")
+    assert not through.ok
+    assert "DELETE" in through.detail
+
+
+async def test_fake_current_role_failure_fails_the_test() -> None:
+    """MySQL 5.7 has no CURRENT_ROLE() (ADR 0041 Consequences): the roles check fails, the test
+    is not ok and the source cannot be enabled; the direct grants are still read."""
+    fake = FakeMysql(roles_fail=True)
+    result = await make_fake(fake).test()
+    assert not result.ok
+    assert not result.can_enable
+    roles = next(check for check in result.checks if check.name == "privileges roles")
+    assert not roles.ok
+    assert "CURRENT_ROLE" in roles.detail
+    assert any("privilege check 'roles' failed" in problem for problem in result.problems)
+    assert any(check.name == "privileges grants" and check.ok for check in result.checks)
+    # The role named on the GRANT line is still expanded; only the active roles are unknown.
+    assert USING_SQL in fake.statements()
+    assert all("role-pw" not in problem for problem in result.problems)
