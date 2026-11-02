@@ -2,16 +2,23 @@
 
 Scenarios register in :mod:`carto_simulator.scenarios`. Generation is deterministic: the same
 request produces byte-identical output (spec 19, "Deterministic by seed").
+
+Batch runs have fixed dates, so a product clock would sooner or later find their events older
+than retention (ADR 0036). :func:`run_as_of` is the reference time to analyze a run as of: the
+start of the day after its last day, in UTC.
+
+ADR 0036 note: a run longer than event retention loses its first days to the range, as a
+backfill deeper than retention would.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
 from typing import Protocol
 
-from carto_simulator.ground_truth import Manifest
+from carto_simulator.ground_truth import GROUND_TRUTH_DIR, MANIFEST_FILE, Manifest
 
 GENERATOR_VERSION = "0.1.0"
 
@@ -66,6 +73,22 @@ class Scenario(Protocol):
     description: str
 
     def generate(self, request: GenerationRequest, out_dir: Path) -> GenerationResult: ...
+
+
+def as_of_for(start_date: date, days: int) -> datetime:
+    """Midnight UTC at the start of the day after the run's last day. The range of ADR 0036
+    then reaches a day past it (a zone west of UTC ends its last local day up to a day later in
+    UTC) and back over a run as long as event retention."""
+    return datetime.combine(start_date + timedelta(days=days), time(), UTC)
+
+
+def run_as_of(out_dir: Path) -> datetime:
+    """:func:`as_of_for` the run whose ground truth is under ``out_dir``. Raises ``OSError`` or
+    ``ValueError`` when the manifest is missing or unreadable."""
+    manifest = Manifest.model_validate_json(
+        (out_dir / GROUND_TRUTH_DIR / MANIFEST_FILE).read_bytes()
+    )
+    return as_of_for(manifest.start_date, manifest.days)
 
 
 def generate(request: GenerationRequest, out_dir: Path) -> GenerationResult:

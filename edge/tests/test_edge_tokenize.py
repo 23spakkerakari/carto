@@ -145,12 +145,12 @@ def test_event_cap_truncates_previous_key_entries_first() -> None:
 def test_event_cap_truncates_active_key_entries_in_field_order() -> None:
     tokenizer = Tokenizer(SINGLE, "default")
     entries: list[FieldInput] = [
-        (f"f{n:03d}", FieldClass.IDENTIFIER, ("raw", "norm"), f"AB-{n:04d}") for n in range(50)
+        (f"f{n:02d}", FieldClass.IDENTIFIER, ("raw", "norm"), f"AB-{n:04d}") for n in range(50)
     ]
     result = tokenizer.build_event_identifiers(entries, expires_at=EXPIRES)
     assert len(result.identifiers) == MAX_IDENTIFIERS_PER_EVENT
     assert result.truncated == 100 - MAX_IDENTIFIERS_PER_EVENT
-    assert result.identifiers[-1].field == "f031"
+    assert result.identifiers[-1].field == "f31"
     assert result.identifiers[-1].form == "norm"
 
 

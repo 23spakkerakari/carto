@@ -59,7 +59,7 @@ from carto_edge.keys import ASSERTION_PUBLIC_KEY_FILE
 from carto_edge.metrics import EdgeMetrics, default_metrics
 from carto_edge.pipeline.forward import SourceHealth
 from carto_edge.pipeline.ingestor import BackpressureState, IngestOutcome
-from carto_edge.pipeline.model import FieldClass, RawRecord
+from carto_edge.pipeline.model import FieldClass, RawRecord, ReadItem
 from carto_edge.pipeline.pii import RegexDetector
 from carto_edge.reveal import (
     REVEAL_AUDIENCE,
@@ -100,8 +100,8 @@ class FakeIngestor:
     calls: int = 0
     durable_calls: int = 0
 
-    def ingest(self, records: Iterable[RawRecord], *, durable: bool = False) -> IngestOutcome:
-        batch = list(records)
+    def ingest(self, records: Iterable[ReadItem], *, durable: bool = False) -> IngestOutcome:
+        batch = [record for record in records if isinstance(record, RawRecord)]
         self.calls += 1
         self.durable_calls += int(durable)
         if self.fail:

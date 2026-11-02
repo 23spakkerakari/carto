@@ -30,6 +30,8 @@ __all__ = [
     "DEFAULT_MESSAGE_FIELDS",
     "DEFAULT_TIMESTAMP_FIELDS",
     "MAX_SOURCES_FILE_BYTES",
+    "AnchorSyslogSettings",
+    "AuditSettings",
     "BufferSettings",
     "ClassifySettings",
     "ConfigError",
@@ -404,6 +406,25 @@ class RevealSettings(_Frozen):
     )
 
 
+class AnchorSyslogSettings(_Frozen):
+    """The customer's syslog or SIEM that receives the hourly audit anchor (ADR 0033): RFC 5424
+    over TCP with RFC 5425 framing, TLS on by default."""
+
+    host: str = Field(min_length=1, max_length=253, pattern=r"^[A-Za-z0-9._:-]+$")
+    port: int = Field(default=6514, ge=1, le=65535)
+    tls: bool = Field(default=True, description="Plain TCP only when the customer turns it off.")
+    ca_file: Path | None = Field(
+        default=None, description="CA bundle for the syslog server; default the system store."
+    )
+    timeout_seconds: float = Field(default=5.0, gt=0, le=60)
+
+
+class AuditSettings(_Frozen):
+    """Edge audit trail (ADR 0014, 0033)."""
+
+    anchor_syslog: AnchorSyslogSettings | None = None
+
+
 class PiiSettings(_Frozen):
     enabled: bool = True
     spacy_model: str = Field(default="en_core_web_sm", min_length=1, max_length=64)
@@ -443,6 +464,7 @@ class EdgeSettings(ProductSettings):
     reveal: RevealSettings = Field(default_factory=RevealSettings)
     pii: PiiSettings = Field(default_factory=PiiSettings)
     gateway: GatewaySettings = Field(default_factory=GatewaySettings)
+    audit: AuditSettings = Field(default_factory=AuditSettings)
 
     @property
     def keys_dir(self) -> Path:

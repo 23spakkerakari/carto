@@ -15,7 +15,7 @@ bottom. Each row names the mitigation and the automated check that proves it.
 | 8 | Insider bulk-revealing values | Separate grant, step-up auth, rate limits, audit, alert on bulk reveal | Authz and rate tests | M3 |
 | 9 | Supply chain compromise | Signed images, SBOM, pinned dependencies, scanners, CODEOWNERS | CI gates | M0 (lockfile with hashes, scanners, SBOM signing, CODEOWNERS, Renovate); images from M1 |
 | 10 | Log flood or denial of service | Backpressure, per-source quotas, buffer caps, flood sampling that keeps errors | Load tests | M1 |
-| 11 | Audit tampering | Hash chain, INSERT-only grants, external anchoring | `audit verify` test | M6 |
+| 11 | Audit tampering | Hash chain, INSERT-only grants, external anchoring | `audit verify` test | M1 edge (hourly anchor, ADR 0033); core M6 |
 | 12 | Session hijack, CSRF | Cookie flags, CSRF tokens, short sessions, step-up | Security tests, ZAP | M6 |
 | 13 | Accidental write to a source system | No write paths, read-only sessions, grant checks, Semgrep rule | Read-only tests | M0 (Semgrep rule with self-test); connectors M1 |
 | 14 | PHI leaking into chat or email | `include_identifiers` off by default, UI warning | Notification content tests | M4 |
@@ -49,7 +49,8 @@ step-up for reveal).
     AES-256-GCM per value, AAD tenant plus token); the disk buffer (`buffer.sqlite`, batches
     already tokenized, up to 20 GiB); connector credentials, referenced by `secret_ref` and
     resolved at use (`vault://` against Vault KV v2; `local://` against the KMS-wrapped
-    `secrets.sqlite`); the edge audit file (`audit.ndjson`, hash-chained; ADR 0014); the internal
+    `secrets.sqlite`); the edge audit file (`audit.ndjson`, hash-chained; ADR 0014; anchored
+    hourly and at shutdown in the product log and optionally the customer's syslog, ADR 0033); the internal
     service keys, each in its own Compose volume mounted only by its service (ADR 0031), and the
     listener CA keys in the separate `pki-ca` volume that only the `pki-init` job mounts; the analyzer's state directory, as
     sensitive as an installed edge (ADR 0025).

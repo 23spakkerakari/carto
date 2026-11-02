@@ -4,7 +4,7 @@
                        [--locator-map] [--producer TEXT]
     carto-edge gateway
     carto-edge bench --input DIR --config FILE [--seconds N] [--max-records N] [--path P]
-    carto-edge audit verify --file PATH
+    carto-edge audit verify --file PATH [--anchor SEQ:ROW_HASH ...]
     carto-edge key {status,rotate,rewrap}
     carto-edge secret {set,list,delete}
     carto-edge source test [--config FILE] [--source ID ...]
@@ -13,8 +13,10 @@
 ``gateway`` reads its settings from the environment (``CARTO_...``,
 :class:`carto_edge.config.EdgeSettings`). Exit codes: 0 success, 1 the operation failed (for
 ``audit verify``: the chain is broken), 2 a usage or configuration error. Handlers return codes;
-only ``__main__`` exits. Product logs are JSON lines on standard error (the analyzer and the
-benchmark print their summary on standard output) and pass the redaction processor of
+only ``__main__`` exits. ``audit verify --anchor`` (repeatable) also checks that the chain still
+holds each anchored row with that hash; anchors come from the ``event=audit.anchor`` lines the
+gateway writes hourly (ADR 0033). Product logs are JSON lines on standard error (the analyzer and
+the benchmark print their summary on standard output) and pass the redaction processor of
 :mod:`carto_common.logging` (spec 2.3 invariant 7).
 """
 
@@ -30,6 +32,7 @@ from typing import Final, TextIO, cast
 from pydantic import ValidationError
 
 from carto_common.logging import configure_logging
+from carto_edge.audit import parse_anchor
 from carto_edge.audit import verify as verify_audit
 from carto_edge.cli import admin
 from carto_edge.cli.analyze import (
@@ -88,8 +91,23 @@ def build_parser() -> argparse.ArgumentParser:
     actions = audit.add_subparsers(dest="audit_command", required=True, metavar="<action>")
     verify = actions.add_parser("verify", help="Recompute the hash chain of an audit file")
     verify.add_argument("--file", type=Path, required=True, help="Path of audit.ndjson")
+    verify.add_argument(
+        "--anchor",
+        action="append",
+        default=[],
+        type=_anchor_argument,
+        metavar="SEQ:ROW_HASH",
+        help="An anchor from the audit.anchor log lines or syslog (repeatable, ADR 0033)",
+    )
     admin.add_commands(commands)
     return parser
+
+
+def _anchor_argument(text: str) -> tuple[int, str]:
+    try:
+        return parse_anchor(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
 
 
 def _configure_cli_logging(level: str) -> None:
@@ -111,23 +129,38 @@ def _gateway() -> int:
     return run_gateway(settings)
 
 
-def _audit_verify(path: Path) -> int:
+_ANCHOR_VERDICTS: Final = {
+    "ok": "holds",
+    "missing": "MISSING (the chain no longer reaches that row: rows were removed)",
+    "mismatch": "MISMATCH (that row has another hash: the chain was rewritten)",
+    "broken": "not checked (the chain is broken before that row)",
+}
+
+
+def _audit_verify(path: Path, anchors: Sequence[tuple[int, str]] = ()) -> int:
     if not path.is_file():
         print(f"{PROG}: {path} is not a file", file=sys.stderr)
         return EXIT_USAGE
     try:
-        result = verify_audit(path)
+        result = verify_audit(path, anchors)
     except (OSError, UnicodeDecodeError) as exc:
         print(f"{PROG}: cannot read {path}: {describe(exc)}", file=sys.stderr)
         return EXIT_FAILURE
-    if result.ok:
+    if result.first_bad_line is None:
         emit(f"audit chain {path}: {result.rows} rows, intact")
-        return EXIT_OK
-    emit(
-        f"audit chain {path}: {result.rows} rows, BROKEN at line {result.first_bad_line} "
-        "(that row or one before it was changed, removed or reordered)"
-    )
-    return EXIT_FAILURE
+    else:
+        emit(
+            f"audit chain {path}: {result.rows} rows, BROKEN at line {result.first_bad_line} "
+            "(that row or one before it was changed, removed or reordered)"
+        )
+    if result.torn_tail_bytes:
+        emit(
+            f"torn final line of {result.torn_tail_bytes} bytes (an interrupted write); the "
+            "gateway moves it aside and records audit.recovered when it next opens the file"
+        )
+    for check in result.anchors:
+        emit(f"anchor {check.seq}: {_ANCHOR_VERDICTS.get(check.status, check.status)}")
+    return EXIT_OK if result.ok else EXIT_FAILURE
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -153,7 +186,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         except ValidationError as exc:
             print(f"{PROG}: invalid settings: {describe(exc)}", file=sys.stderr)
             return EXIT_USAGE
-    return _audit_verify(args.file)
+    return _audit_verify(args.file, args.anchor)
 
 
 if __name__ == "__main__":

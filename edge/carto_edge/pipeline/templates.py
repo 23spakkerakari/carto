@@ -11,18 +11,30 @@ Two things are done differently from a stock Drain3 setup, both for spec 2.3:
 
 - **Masking before mining.** Drain3 keeps the first message of a cluster verbatim as the
   template until a second similar message arrives, so ``PO export finished: 412 POs written
-  to SHIP_20260923_2112.csv`` would travel to core in clear as a "template". Every
-  whitespace token that carries a digit or an ``@`` is replaced by :data:`MASK` before Drain3
-  sees it, so numbers, dates, identifiers, file names, addresses and e-mail addresses are
-  parameters from the first sighting (invariant 2), and only words that never vary remain in
-  the template. Parameters are read back by aligning the template tokens with the original
-  tokens (Drain3 preserves the token count), which is exact and linear.
+  to SHIP_20260923_2112.csv`` would travel to core in clear as a "template". Before Drain3
+  sees a message (:func:`mask_tokens`), every whitespace token that carries a digit or an
+  ``@`` becomes :data:`MASK`, and so does the value half of a ``key=value`` or ``key:value``
+  token (``user=<*>``), so numbers, dates, identifiers, file names, addresses, e-mail
+  addresses and assigned values are parameters from the first sighting (invariant 2), and
+  only words that never vary remain in the template. Parameters are read back by aligning the
+  template tokens with the original tokens (Drain3 preserves the token count), which is exact
+  and linear.
+- **Secrets are masked before mining** (spec 8.3 rule 1). The value of a key that names a
+  secret (``password=...``, ``"api_key":"..."``) and the token after a secret word
+  (``password hunter``, ``Authorization: Bearer ...``, ``token: ...``) become :data:`MASK`
+  and are left out of the parameters: the classifier could not tell them from any other
+  value. A token that :func:`~carto_edge.pipeline.pii.looks_like_secret` flags becomes
+  :data:`MASK` too and stays a parameter, whose field the classifier then drops by its
+  shape. Either way the secret is never a constant nor part of the persisted Drain3 state,
+  however often it repeats.
 - **Plain-JSON persistence.** Drain3's own snapshots use ``jsonpickle``, which instantiates
   arbitrary classes on load (invariant 8: no pickle). The store serialises the parse tree and
   the clusters itself, one validated JSON file per system under ``EdgeSettings.templates_dir``,
   written atomically (``<system>.json.tmp`` then ``os.replace``), on an interval and on
-  :meth:`TemplateStore.flush`/:meth:`TemplateStore.close`. A corrupt or oversized file is
-  logged by path and ignored; mining starts fresh.
+  :meth:`TemplateStore.flush`/:meth:`TemplateStore.close`, with ASCII escapes so that any
+  string, a lone surrogate included, can be written. A failed write is logged and retried at
+  the next flush; a corrupt or oversized file is logged by path and ignored; mining starts
+  fresh.
 
 A third rule for the same invariant: Drain3 keeps a one-member cluster's message verbatim, so
 a word that appeared once (a name, a code word, free text) would become a "constant". Until a
@@ -44,10 +56,12 @@ and the first and last ``observed_at``; the offline analyzer writes it as ``temp
 from __future__ import annotations
 
 import contextlib
+import functools
 import hashlib
 import json
 import re
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -59,6 +73,8 @@ from drain3.drain import Drain, LogCluster, Node
 from drain3.template_miner_config import TemplateMinerConfig
 
 from carto_common.logging import get_logger
+from carto_edge.pipeline.classify import is_secret_name
+from carto_edge.pipeline.pii import looks_like_secret
 from carto_schema.event import (
     MAX_TEMPLATE_TEXT_LEN,
     SOURCE_ID_PATTERN,
@@ -75,6 +91,7 @@ __all__ = [
     "TemplateStore",
     "compute_template_id",
     "generalize_name",
+    "mask_tokens",
 ]
 
 MASK: Final = "<*>"
@@ -95,7 +112,10 @@ _CHANGED: Final = "cluster_template_changed"
 
 def compute_template_id(system_id: str, template_text: str) -> str:
     """``tpl_`` + the first 12 hex characters of ``sha256(system_id + "\\0" + text)`` (ADR 0016)."""
-    digest = hashlib.sha256(f"{system_id}\0{template_text}".encode()).hexdigest()
+    # surrogatepass: a lone surrogate in a message still gives an id, the same on every run,
+    # instead of an exception for the record. Valid text encodes exactly as before.
+    material = f"{system_id}\0{template_text}".encode("utf-8", errors="surrogatepass")
+    digest = hashlib.sha256(material).hexdigest()
     return f"tpl_{digest[:12]}"
 
 
@@ -106,6 +126,117 @@ def generalize_name(file_name: str) -> str:
 
 def _mask_token(token: str) -> bool:
     return "@" in token or any(char.isdigit() for char in token)
+
+
+_KEY_VALUE: Final = re.compile(r"([^=:]{1,64})([=:])(.+)", re.DOTALL)
+_KEY_PUNCTUATION: Final = "\"'`()[]{}<>,;"
+_SECRET_WORDS: Final = frozenset(
+    {
+        "password",
+        "passwd",
+        "pwd",
+        "passphrase",
+        "secret",
+        "bearer",
+        "apikey",
+        "api_key",
+        "api-key",
+        "x-api-key",
+        "authorization",
+        "proxy-authorization",
+        "cookie",
+        "set-cookie",
+        "private_key",
+        "client_secret",
+        "access_token",
+        "refresh_token",
+        "auth_token",
+        "id_token",
+    }
+)
+"""Bare words after which the next token is a secret (``password hunter``, ``Bearer xyz``).
+``token`` and ``session`` count only as a key (``token: xyz``, ``token=xyz``)."""
+_AUTH_SCHEMES: Final = frozenset({"basic", "bearer", "digest", "negotiate", "ntlm", "token"})
+"""``Authorization: Basic <secret>``: the scheme stays, the token after it is the secret."""
+_SECRET: Final = -1
+"""Marker in :func:`mask_tokens` output: a masked secret, never a parameter."""
+
+
+@functools.lru_cache(maxsize=4096)
+def _secret_key(key: str) -> bool:
+    """Whether ``key`` (a bare key or word, punctuation stripped) names a secret."""
+    if key.lower() in _SECRET_WORDS:
+        return True
+    return any(char.isalpha() for char in key) and is_secret_name(key)
+
+
+def _bare(token: str) -> str:
+    return token.strip(_KEY_PUNCTUATION)
+
+
+def mask_tokens(tokens: Sequence[str]) -> tuple[list[str], list[int]]:
+    """The tokens Drain3 sees, and for each where its parameter starts in the original token:
+    ``0`` for the whole token (when the template has :data:`MASK` there), ``n > 0`` for the
+    value half of a ``key=value`` token masked as ``key=<*>``, :data:`_SECRET` for a secret
+    that is never a parameter. See "Masking before mining" in the module docstring."""
+    masked: list[str] = []
+    starts: list[int] = []
+    secret_next = False
+    for token in tokens:
+        if secret_next:
+            if _bare(token).lower() in _AUTH_SCHEMES:
+                masked.append(token)  # Authorization: Basic <secret>: the scheme is no secret
+                starts.append(0)
+                continue
+            secret_next = False
+            masked.append(MASK)
+            starts.append(_SECRET)
+            continue
+        pair = _KEY_VALUE.fullmatch(token) if ("=" in token or ":" in token) else None
+        if pair is not None:
+            key = _bare(pair.group(1))
+            if key and _secret_key(key):
+                masked.append(pair.group(1) + pair.group(2) + MASK)
+                starts.append(_SECRET)
+                continue
+            if key and not _mask_token(pair.group(1)) and any(char.isalpha() for char in key):
+                start = pair.end(2)
+                masked.append(token[:start] + MASK)
+                starts.append(start)
+                continue
+        bare = _bare(token)
+        if (token.endswith((":", "=")) and _secret_key(bare.rstrip(":="))) or (
+            bare.lower() in _SECRET_WORDS
+        ):
+            masked.append(token)  # the word stays; the value after it is the secret
+            starts.append(0)
+            secret_next = True
+            continue
+        if _mask_token(token) or looks_like_secret(token):
+            # A secret-shaped value stays a parameter: the classifier sees its shape and drops
+            # the field (spec 8.3 rule 1). Only secrets known by their key never reach it.
+            masked.append(MASK)
+            starts.append(0)
+        else:
+            masked.append(token)
+            starts.append(0)
+    return masked, starts
+
+
+def _params(tokens: Sequence[str], starts: Sequence[int], template: str) -> list[str]:
+    """Parameters of a message, aligned with its template; secrets are never parameters."""
+    template_tokens = template.split(" ")
+    if len(template_tokens) != len(tokens):
+        return []
+    params: list[str] = []
+    for token, start, marker in zip(tokens, starts, template_tokens, strict=True):
+        if start == _SECRET:
+            continue
+        if marker == MASK:
+            params.append(token)
+        elif start > 0 and marker.endswith(MASK) and marker[: -len(MASK)] == token[:start]:
+            params.append(token[start:])
+    return params
 
 
 @dataclass(frozen=True, slots=True)
@@ -355,7 +486,8 @@ class TemplateStore:
             return "", []
         if len(tokens) > MAX_MESSAGE_TOKENS:
             tokens = tokens[:MAX_MESSAGE_TOKENS]
-        masked = " ".join(MASK if _mask_token(token) else token for token in tokens)
+        masked_tokens, starts = mask_tokens(tokens)
+        masked = " ".join(masked_tokens)
         template = state.cache.get(masked)
         if template is None and self._frozen:
             template = self._match(state, masked, len(tokens))
@@ -373,14 +505,7 @@ class TemplateStore:
                 template = " ".join(MASK for _ in tokens)  # not yet a constant: all parameters
             state.dirty = True
             self._maybe_flush()
-        template_tokens = template.split(" ")
-        params: list[str] = []
-        if len(template_tokens) == len(tokens):
-            params = [
-                token
-                for token, marker in zip(tokens, template_tokens, strict=True)
-                if marker == MASK
-            ]
+        params = _params(tokens, starts, template)
         if len(template) > MAX_TEMPLATE_TEXT_LEN:
             template = template[:MAX_TEMPLATE_TEXT_LEN]
         return template, params
@@ -506,13 +631,15 @@ class TemplateStore:
             **_drain_to_json(state.miner.drain),
             "registry": _registry_to_json(state.registry),
         }
-        data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         temporary = path.with_name(path.name + ".tmp")
         try:
+            # ASCII escapes: any string the input can hold, a lone surrogate included, has a
+            # JSON form, so one odd message never makes every later flush fail.
+            data = json.dumps(payload, ensure_ascii=True, separators=(",", ":")).encode("ascii")
             path.parent.mkdir(parents=True, exist_ok=True)
             temporary.write_bytes(data)
             temporary.replace(path)
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             _log().warning(
                 "template_state_write_failed", system_id=system_id, error=type(exc).__name__
             )

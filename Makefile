@@ -60,16 +60,16 @@ eval: ## Score engine output (or the empty prediction) against ground truth: mak
 > $(UV) run carto-eval run --scenario $(SCENARIO) --days $(DAYS) --seed $(SEED) --sim-out $(SIM_OUT)/$(SCENARIO) --out $(EVAL_OUT)
 
 analyze: ## Offline analyzer over the simulator output: make analyze SCENARIO=shop (writes $(SIM_OUT)/$(SCENARIO).carto)
-> $(UV) run carto-edge analyze --config simulator/analyze.$(SCENARIO).yaml --input $(SIM_OUT)/$(SCENARIO) --out $(SIM_OUT)/$(SCENARIO).carto --state-dir $(SIM_OUT)/$(SCENARIO).edge-state --locator-map
+> AS_OF="$$($(UV) run carto-sim as-of --out $(SIM_OUT)/$(SCENARIO))" && $(UV) run carto-edge analyze --config simulator/analyze.$(SCENARIO).yaml --input $(SIM_OUT)/$(SCENARIO) --out $(SIM_OUT)/$(SCENARIO).carto --state-dir $(SIM_OUT)/$(SCENARIO).edge-state --locator-map --as-of "$$AS_OF"
 
 leak: ## Spec 18.3 leak test over scenario $(SCENARIO): bundle, forwarded batches, logs, ClickHouse rows
 > $(UV) run pytest edge/tests/test_edge_leak.py -q -m "not integration" --scenario $(SCENARIO)
 
 bench: ## Edge pipeline throughput benchmark (spec 17, M1 acceptance: 2,000 events/s sustained)
-> $(UV) run carto-edge bench --input $(SIM_OUT)/$(SCENARIO) --config simulator/analyze.$(SCENARIO).yaml --seconds 30
+> AS_OF="$$($(UV) run carto-sim as-of --out $(SIM_OUT)/$(SCENARIO))" && $(UV) run carto-edge bench --input $(SIM_OUT)/$(SCENARIO) --config simulator/analyze.$(SCENARIO).yaml --seconds 30 --as-of "$$AS_OF"
 
 bench-gateway: ## Full gateway ingest path benchmark: buffer, cursors, forwarder (ADR 0028)
-> $(UV) run carto-edge bench --path gateway --input $(SIM_OUT)/$(SCENARIO) --config simulator/analyze.$(SCENARIO).yaml --seconds 30
+> AS_OF="$$($(UV) run carto-sim as-of --out $(SIM_OUT)/$(SCENARIO))" && $(UV) run carto-edge bench --path gateway --input $(SIM_OUT)/$(SCENARIO) --config simulator/analyze.$(SCENARIO).yaml --seconds 30 --as-of "$$AS_OF"
 
 sec: ## Security scanners available locally; CI runs the full set (ADR 0007)
 > $(UV) run bandit -c pyproject.toml -r packages edge core simulator eval tools -q

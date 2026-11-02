@@ -1,7 +1,7 @@
 """``carto-edge analyze``: the offline analyzer (spec 4.1, 8.1.1; ADR 0017, 0022, 0024, 0025).
 
     carto-edge analyze --config FILE --input DIR --out DIR [--state-dir DIR] [--tenant-id ID]
-                       [--locator-map] [--producer TEXT]
+                       [--locator-map] [--producer TEXT] [--as-of TIME]
 
 Every enabled source of the configuration must be an ``upload`` source; its ``paths`` are
 resolved against ``--input`` (the connector's ``base_dir``). The runtime is built in
@@ -14,6 +14,12 @@ templates, nothing emitted); pass 2 runs ``pipeline.process``, writes the ``raw`
 the reveal vault in chunks of :data:`CHUNK_SIZE` and streams the events into the bundle. The
 connectors' async generators are driven with :func:`asyncio.run` over a helper that hands
 records over in chunks, so memory stays flat for inputs of any size.
+
+Records whose time lies outside the plausible range (ADR 0036) are checked against the run time:
+older than event retention plus one day they are dropped (``too_old``), more than one day ahead
+they keep the ingest time. ``--as-of`` names another reference time, for exported data analyzed
+long after it was exported and for the simulator's fixed-date scenarios
+(``carto-sim as-of``); the manifest notes it. The manifest counts both cases.
 
 Exit codes: 0 the bundle was written, 1 the run failed (keys unusable, an input over the spec
 8.1.1 limits, a write failed), 2 a usage or configuration error. The summary names counts and
@@ -30,7 +36,7 @@ import sys
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from importlib import metadata
 from pathlib import Path
 from typing import Final
@@ -50,7 +56,7 @@ from carto_edge.config import (
 from carto_edge.connectors.base import ConnectorError, InvalidConfigError, ReadConnector
 from carto_edge.connectors.registry import build_connector
 from carto_edge.keys import KeyManagementError
-from carto_edge.pipeline.model import RawRecord
+from carto_edge.pipeline.model import CursorCheckpoint, RawRecord
 from carto_edge.pipeline.pii import PiiDetector
 from carto_edge.runtime import EdgeRuntime, build_connector_context, build_runtime
 from carto_schema.bundle import BundleManifest
@@ -70,6 +76,7 @@ __all__ = [
     "drain",
     "emit",
     "format_summary",
+    "parse_as_of",
     "run_analyze",
     "upload_sources",
 ]
@@ -163,6 +170,8 @@ async def _drain_async(
     total = 0
     try:
         async for record in connector.read(None):
+            if isinstance(record, CursorCheckpoint):  # the analyzer keeps no cursor
+                continue
             chunk.append(record)
             if len(chunk) >= chunk_size:
                 handle(chunk)
@@ -231,7 +240,24 @@ def _emit_chunk(
         writer.add(result, source_id)
 
 
-def _notes(runtime: EdgeRuntime) -> list[str]:
+def parse_as_of(text: str) -> datetime:
+    """``--as-of``: an ISO 8601 time with an offset (``2026-10-08T00:00:00Z``), or a date, read
+    as midnight UTC at its start. Raises ``ValueError`` naming the expected forms."""
+    value = text.strip()
+    try:
+        if len(value) == len("2026-10-08"):
+            return datetime.combine(date.fromisoformat(value), datetime.min.time(), UTC)
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        msg = "--as-of must be an ISO 8601 date or a time with an offset"
+        raise ValueError(msg) from None
+    if parsed.tzinfo is None:
+        msg = "--as-of needs an offset (for example 2026-10-08T00:00:00Z)"
+        raise ValueError(msg)
+    return parsed.astimezone(UTC)
+
+
+def _notes(runtime: EdgeRuntime, as_of: datetime | None = None) -> list[str]:
     backend = getattr(runtime.detector, "backend", type(runtime.detector).__name__)
     notes = [
         f"PII detector: {backend}.",
@@ -240,6 +266,11 @@ def _notes(runtime: EdgeRuntime) -> list[str]:
             "whole input."
         ),
     ]
+    if as_of is not None:
+        notes.append(
+            f"Event times were checked against {as_of.isoformat()} (--as-of), not the run time "
+            "(ADR 0036)."
+        )
     internal = runtime.pipeline.parser_internal_errors()
     if internal:
         notes.append(f"{internal} records hit a parser internal error and were dropped.")
@@ -258,11 +289,13 @@ def analyze(
     detector: PiiDetector | None = None,
     clock: Callable[[], datetime] | None = None,
     chunk_size: int = CHUNK_SIZE,
+    as_of: datetime | None = None,
 ) -> AnalyzeResult:
     """Run both passes and write the bundle; raises :class:`AnalyzeError` with the exit code.
 
     ``detector`` replaces the configured PII detector (tests use the regex detector for
-    speed); the command always runs the configured one.
+    speed); the command always runs the configured one. ``as_of`` is the time event times are
+    checked against (ADR 0036); by default the run time.
     """
     started = time.perf_counter()
     now = clock if clock is not None else lambda: datetime.now(UTC)
@@ -278,7 +311,13 @@ def analyze(
     settings = _settings(state, tenant_id)
     try:
         runtime = build_runtime(
-            settings, sources_file, mode="analyze", detector=detector, init_local_keys=True
+            settings,
+            sources_file,
+            mode="analyze",
+            detector=detector,
+            init_local_keys=True,
+            # By default the pipeline reads the run time itself (the wall clock).
+            range_clock=(lambda: as_of) if as_of is not None else clock,
         )
     except KeyManagementError as exc:
         msg = f"keys unusable: {describe(exc)}"
@@ -293,6 +332,7 @@ def analyze(
             created_at=now(),
             clock=now,
             chunk_size=chunk_size,
+            as_of=as_of,
         )
     finally:
         runtime.close()
@@ -324,6 +364,7 @@ def _run(
     created_at: datetime,
     clock: Callable[[], datetime],
     chunk_size: int,
+    as_of: datetime | None = None,
 ) -> tuple[BundleManifest, Path | None, dict[str, int]]:
     locator_path = default_locator_map_path(out_dir) if locator_map else None
     try:
@@ -354,7 +395,7 @@ def _run(
                 runtime.templates.registry(),
                 connector_types={source.id: source.type.value for source in sources},
                 system_of={source.id: source.system for source in sources},
-                notes=_notes(runtime),
+                notes=_notes(runtime, as_of),
             )
             dropped = writer.dropped_by_reason()
     except ConnectorError as exc:
@@ -380,6 +421,10 @@ def format_summary(result: AnalyzeResult) -> list[str]:
         f"  events          {counts.events:,}",
         f"  dropped         {counts.records_dropped:,}" + (f" ({dropped})" if dropped else ""),
         f"  parse errors    {counts.parse_errors:,}",
+        (
+            f"  out of range    {counts.events_too_old:,} too old (dropped), "
+            f"{counts.events_future:,} in the future (ingest time kept)"
+        ),
         f"  identifiers     {counts.identifiers:,} tokens",
         (
             f"  fields          kept {counts.fields_kept:,}, "
@@ -424,6 +469,12 @@ def add_analyze_arguments(parser: argparse.ArgumentParser) -> None:
         help="Eval only: write <out>.locator_map.ndjson next to the bundle (ADR 0024)",
     )
     parser.add_argument("--producer", default=None, help="Producer text for the manifest")
+    parser.add_argument(
+        "--as-of",
+        type=parse_as_of,
+        default=None,
+        help="Check event times against this ISO 8601 time instead of the run time (ADR 0036)",
+    )
 
 
 def run_analyze(args: argparse.Namespace) -> int:
@@ -436,6 +487,7 @@ def run_analyze(args: argparse.Namespace) -> int:
             tenant_id=args.tenant_id,
             locator_map=args.locator_map,
             producer=args.producer,
+            as_of=args.as_of,
         )
     except AnalyzeError as exc:
         print(f"carto-edge analyze: {exc}", file=sys.stderr)

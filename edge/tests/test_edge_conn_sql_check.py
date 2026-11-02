@@ -23,17 +23,29 @@ APPENDIX_A = """
 SELECT id, po_num, order_ref, status, warehouse_code, created_by, updated_at
 FROM purchase_orders
 WHERE updated_at > :watermark
+AND updated_at <= :upper
 ORDER BY updated_at
 LIMIT :batch
 """
+BY_ID = "SELECT id, status FROM purchase_orders WHERE id > :watermark ORDER BY id LIMIT :batch"
 
 
 def test_appendix_a_query_is_accepted() -> None:
-    checked = check_statement(APPENDIX_A, "postgresql")
+    checked = check_statement(APPENDIX_A, "postgresql", upper=True)
     assert checked.tables == ("purchase_orders",)
     assert checked.dialect == "postgresql"
     assert checked.sql.startswith("SELECT id")
-    assert check_statement(APPENDIX_A, "mysql").tables == ("purchase_orders",)
+    assert check_statement(APPENDIX_A, "mysql", upper=True).tables == ("purchase_orders",)
+
+
+def test_an_integer_watermark_query_binds_no_upper() -> None:
+    assert check_statement(BY_ID, "postgresql").tables == ("purchase_orders",)
+
+
+def test_a_time_range_query_must_bind_upper() -> None:
+    """ADR 0035 item 3: a datetime or date watermark reads (:watermark, :upper]."""
+    with pytest.raises(StatementCheckError, match="closed range"):
+        check_statement(BY_ID, "postgresql", upper=True)
 
 
 def test_tsql_top_form_is_accepted() -> None:
@@ -72,10 +84,14 @@ def test_trailing_semicolon_and_comments_are_fine() -> None:
         ("SELECT pg_sleep(10), id FROM t WHERE a > :watermark LIMIT :batch", "pg_sleep"),
         (
             "SELECT id FROM t WHERE a > :watermark AND b = :other LIMIT :batch",
-            "watermark and :batch",
+            "named bind parameters",
         ),
-        ("SELECT id FROM t WHERE a > :watermark AND b = ? LIMIT :batch", "watermark and :batch"),
-        ("SELECT id FROM t WHERE a > :watermark LIMIT 10", "both"),
+        ("SELECT id FROM t WHERE a > :watermark AND b = ? LIMIT :batch", "named bind parameters"),
+        ("SELECT id FROM t WHERE a > :watermark LIMIT 10", "must use :batch and :watermark"),
+        (
+            "SELECT id FROM t WHERE a > :watermark AND a <= :upper LIMIT :batch",
+            "datetime and date watermarks only",
+        ),
         ("SELECT id FROM t WHERE a > '%(watermark)s' LIMIT :batch", "formatting"),
         ("SELECT id FROM t WHERE a > %s LIMIT :batch", "formatting"),
         ("SELECT id FROM t WHERE a > '{watermark}' LIMIT :batch", "formatting"),
@@ -143,6 +159,8 @@ def test_postgres_pins_hostaddr_and_keeps_host_for_verify_full() -> None:
     assert kwargs["sslrootcert"] == "/etc/carto/ca.pem"
     assert "default_transaction_read_only=on" in kwargs["options"]
     assert "statement_timeout=30000" in kwargs["options"]
+    # ADR 0035 item 6: naive watermarks compare in UTC, whatever the server's default zone.
+    assert "-c TimeZone=UTC" in kwargs["options"]
     assert kwargs["password"] == "p}w;d"  # noqa: S105
 
 

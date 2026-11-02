@@ -6,8 +6,10 @@
 - ``clickhouse``: the HTTP(S) endpoint ``ingest-api`` and the workers write to and read from.
   TLS is the default (spec 14.4 "PostgreSQL and ClickHouse connections require TLS"); plain
   ``http://`` needs an explicit ``secure=false`` and is for local development only.
-- ``postgres``: the metadata store. ``sslmode`` defaults to ``require``; ``prefer`` and ``allow``
-  are not offered because they silently fall back to clear text.
+- ``postgres``: the metadata store. ``sslmode`` defaults to ``verify-full``: the server certificate
+  and its name are checked (``ca_file`` names the CA, else libpq's default root file). ``prefer``
+  and ``allow`` are not offered because they silently fall back to clear text; ``disable`` is
+  for the Compose stack's internal network and local containers only.
 - ``ingest``: the mutual-TLS listener of ``ingest-api`` (spec 12 "Internal", 14.4) and its body
   caps (spec 8.5: 5 MB compressed batches; spec 2.3 invariant 8: size limits on every input).
 
@@ -162,8 +164,11 @@ class PostgresSettings(_Frozen):
         default=None, description="File holding the password; never an environment value."
     )
     sslmode: SslMode = Field(
-        default="require",
-        description="libpq sslmode; 'disable' is for local development against a container.",
+        default="verify-full",
+        description=(
+            "libpq sslmode; verify-full checks the certificate and the host name. 'disable' is "
+            "for the Compose stack's internal network and local containers only."
+        ),
     )
     ca_file: Path | None = Field(default=None, description="libpq sslrootcert.")
     connect_timeout_seconds: int = Field(default=10, ge=1, le=300)
@@ -190,10 +195,32 @@ class IngestListenerSettings(_Frozen):
         description="Largest request body on the wire (spec 8.5: batches of at most 5 MB).",
     )
     max_decompressed_bytes: int = Field(
-        default=64 * MIB,
+        default=16 * MIB,
         ge=64 * 1024,
-        le=512 * MIB,
-        description="Largest body after zstd decompression (spec 2.3 invariant 8: no zip bombs).",
+        le=128 * MIB,
+        description=(
+            "Largest body after zstd decompression (spec 2.3 invariant 8: no zip bombs). A full "
+            "batch of 5,000 events is a few MiB of JSON."
+        ),
+    )
+    max_inflight_batches: int = Field(
+        default=8,
+        ge=1,
+        le=64,
+        description=(
+            "Ingest and heartbeat requests decoded or written at once; more are answered 429 "
+            "with Retry-After, which bounds the memory that decoded batches take."
+        ),
+    )
+    claim_timeout_seconds: int = Field(
+        default=120,
+        ge=30,
+        le=3600,
+        description=(
+            "How long a ledger claim protects a batch being written (ADR 0034). A retry within "
+            "it is answered 503; after it the claim is taken over and the batch written again. "
+            "Keep it above the edge's request timeout."
+        ),
     )
     require_client_cert: bool = Field(
         default=True,

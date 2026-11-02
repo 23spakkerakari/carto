@@ -23,6 +23,7 @@ reference belongs does not end up in a log line.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 from typing import Annotated, Final, Literal, Self
 
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -30,6 +31,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 __all__ = [
     "MAX_SECRET_REF_LENGTH",
+    "OBSERVED_AT_SLACK",
     "SECRET_REF_SCHEMES",
     "TENANT_ID_REGEX",
     "CartoBaseSettings",
@@ -39,6 +41,7 @@ __all__ = [
     "RetentionSettings",
     "SecretRef",
     "TelemetrySettings",
+    "observed_at_range",
     "validate_secret_ref",
 ]
 
@@ -108,6 +111,16 @@ class CartoBaseSettings(BaseSettings):
     )
 
 
+OBSERVED_AT_SLACK: Final = timedelta(days=1)
+"""How far past retention, and how far ahead of now, an ``observed_at`` may lie (ADR 0036)."""
+
+
+def observed_at_range(now: datetime, events_days: int) -> tuple[datetime, datetime]:
+    """The plausible ``observed_at`` range at ``now``, both ends included (ADR 0036): no older
+    than ``events_days`` plus one day, no more than one day ahead."""
+    return now - timedelta(days=events_days) - OBSERVED_AT_SLACK, now + OBSERVED_AT_SLACK
+
+
 class _FrozenModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
@@ -134,6 +147,12 @@ class RetentionSettings(_FrozenModel):
             msg = "retention.txn_membership_days must be at least retention.events_days"
             raise ValueError(msg)
         return self
+
+    def observed_at_range(self, now: datetime) -> tuple[datetime, datetime]:
+        """The plausible ``observed_at`` range at ``now``, both ends included (ADR 0036): no older
+        than events retention plus one day, no more than one day ahead. The edge drops older
+        events and stamps later ones with their ingest time; ingest-api refuses both."""
+        return observed_at_range(now, self.events_days)
 
 
 LlmProvider = Literal["anthropic", "bedrock", "vertex"]

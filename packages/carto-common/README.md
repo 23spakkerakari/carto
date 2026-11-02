@@ -56,6 +56,15 @@ are therefore rendered through `redact` as well and never reach `logging.lastRes
 that install their own handlers must be told not to: start uvicorn with `log_config=None` so its
 `uvicorn.*` loggers propagate to the root.
 
+Python warnings and uncaught exceptions take the same path (ADR 0040). `configure_logging`
+replaces `warnings.showwarning`, so a warning becomes a WARNING record of the `py.warnings`
+logger, and installs `sys.excepthook`, `threading.excepthook` and `sys.unraisablehook`, so an
+uncaught exception, one raised in a thread, and one ignored in `__del__` become CRITICAL events
+(`uncaught exception`, `uncaught exception in thread`, `unraisable exception`) with the traceback
+in `exception`, masked like any other string. The interpreter's default hooks, which print the
+raw message to stderr, are never called; a hook someone else installed first (a test runner's)
+is called after logging.
+
 ### Redaction rules (`redact`, spec 14.12 and 2.3 invariant 7)
 
 Keys are checked first, then every string value, the `event` message and dictionary keys included.
@@ -63,7 +72,7 @@ Value rules run in the order of the table.
 
 | Rule | Trigger | Result |
 | --- | --- | --- |
-| Secret-named key | Lower-case the key, split on `_`, `-`, `.`, space, camelCase and letter-digit boundaries. Any segment is `password`, `passwd`, `secret`, `token`, `apikey`, `authorization`, `cookie`, `session`, `bearer` or `credential` (singular or plural), or two adjacent segments are `api key`, `private key`, `client secret` or `access key`; unless the last segment is a qualifier: `count`, `total`, `len`, `length`, `size`, `num`, `number`, `ref`, `version`, `name`, `type`, `kind`, `present`, `expires`, `expiry`, `ttl` | value becomes `[REDACTED]`, whatever its type |
+| Secret-named key | Lower-case the key, split on `_`, `-`, `.`, space, camelCase and letter-digit boundaries. Any segment is `password`, `passwd`, `passphrase`, `pass`, `pwd`, `secret`, `token`, `apikey`, `authorization`, `auth`, `cookie`, `session`, `bearer`, `credential`, `signature` or `sig` (singular or plural), or two adjacent segments are `api key`, `private key`, `client secret` or `access key`; unless the last segment is a qualifier: `count`, `total`, `len`, `length`, `size`, `num`, `number`, `ref`, `version`, `name`, `type`, `kind`, `present`, `expires`, `expiry`, `ttl`, `scheme` | value becomes `[REDACTED]`, whatever its type |
 | Body key | Normalised key is `body`, `request_body`, `response_body`, `payload`, `raw`, `raw_value`, `raw_values`, `values` or `record` | value becomes `[DROPPED]` |
 | PEM block | `-----BEGIN` through the closing `-----END ...-----`, across lines | `[PEM]` |
 | JWT | Three base64url segments joined by dots, the first starting with `eyJ`, at a word boundary | `[JWT]` |
@@ -72,9 +81,10 @@ Value rules run in the order of the table.
 | URL userinfo | `scheme://user:password@host` (the DSNs and SFTP URLs of spec 8.1) | `scheme://user:[REDACTED]@host` |
 | E-mail address | `local@domain.tld`, not preceded by `/` (a DSN user name is not a mailbox) | `[EMAIL]` |
 | High-entropy run | 32 or more characters of `[A-Za-z0-9+/=_-]`, at least three of the classes upper, lower, digit, other, Shannon entropy of at least 3.5 bits per character | `[HIGH_ENTROPY]` |
-| Secret assignment in text | A secret word from the key rule (pairs joined by `_`, `-`, `.` or space) followed by `=` or `:` and a value: `password=hunter2`, `x-api-key: ...`, `Authorization: Basic ...`, `?token=...&next=` | the value becomes `[REDACTED]`; a value an earlier rule masked (`token=[JWT]`) keeps that mask |
+| Secret assignment in text | A secret word from the key rule (pairs joined by `_`, `-`, `.` or space) optionally closed by a quote (escaped or not), followed by `=` or `:` and a value: `password=hunter2`, `x-api-key: ...`, `Authorization: Basic ...`, `?token=...&next=`, `{"password": "..."}`, `{'password': '...'}`, `;PWD={...};`. A quoted value right after the word (`with secret "..."`) counts too. The short words `pwd`, `pass`, `auth` and `sig` must start a word or a camelCase hump (`dbPass=` matches, `bypass=` and `oauth=` do not) | the value becomes `[REDACTED]`; a value an earlier rule masked (`token=[JWT]`) keeps that mask |
 | Hex run | Eight or more lower-case hex characters holding at least one letter and one digit (UUIDs, content hashes, the simulator's `mk<8 hex>` leak markers) | its shape |
 | Identifier-shaped token | A whitespace-delimited token with a run of four or more digits, or four or more digits in total when it also contains `-` or `_` (`88-210`, `X9-0442`), that is not an ISO date (`YYYY-MM-DD`), time or timestamp (`YYYY-MM-DDTHH:MM:SS[.fff][Z or +hh:mm]`) with real month, day, hour, minute and second ranges | its shape: digits to `9`, letters to `A`, punctuation kept (spec 8.3); mask markers and ULIDs inside the token are kept |
+| Number (ADR 0040) | An `int` or `float` (not `bool`) whose decimal text holds four or more digits, leading zeros not counted, unless the last segment of its own key is a metric qualifier: `count`, `counts`, `attempt`, `attempts`, `retries`, `rows`, `records`, `events`, `batches`, `samples`, `bytes`, `ms`, `seconds`, `second`, `days`, `depth`, `size`, `len`, `length`, `limit`, `port`, `status`, `pid`, `version`, `versions`. The qualifier covers the number directly under the key, not the items of a list | its shape as a string: `customer_id=48812213` logs `"99999999"`, `total=207.81` logs `"999.99"` |
 | Folded keys | Two keys that mask to the same shape | the second becomes `<shape>#2` |
 | Nesting deeper than 16 containers, or a value that raises while walked | | `[REDACTION_ERROR]` for that key |
 
@@ -89,8 +99,10 @@ services) are left alone. `token_count=3` survives (its last segment is a qualif
 `secret_value`, `password_hash`, `session_id`, `cookies` and `x-api-key` are redacted; `secret_ref`
 survives because a reference is not a value.
 
-Other types: `None`, `bool`, `int` and `float` pass through untouched, so pass identifiers as
-strings (the edge always has them as strings) and counts as numbers. Dates and times are rendered
+Other types: `None`, `bool` and numbers of fewer than four digits pass through untouched. Log a
+count under a key ending in a metric qualifier (`events=412`, `duration_ms=12`,
+`order_count=4471`); any other number of four or more digits is treated as a value and masked
+(`total` is deliberately not a qualifier: `total=207.81` is an order amount). Dates and times are rendered
 ISO 8601, `bytes` are decoded and masked, enums contribute their value, pydantic models and
 dataclasses are walked like mappings, sets and tuples become lists, and any other object is
 `str()`-ed and masked. The processor returns only JSON-native values and never raises.
@@ -110,7 +122,7 @@ is.
 - A secret shorter than 32 characters, or made of fewer than three character classes, under a key
   that is not secret-named and outside a URL userinfo or `key=value` context. Name the key after
   what it holds (`password`, `token`, `api_key`) and the key rule hides it whatever the value.
-- Non-string scalars, and canonical ULIDs (see above).
+- Numbers of fewer than four digits, numbers under a metric key, and canonical ULIDs (see above).
 - A hex run made only of letters (`deadbeef`), which cannot be told from a word.
 - Records emitted through a handler a library installed for itself (uvicorn without
   `log_config=None`): `configure_logging` owns the root logger, nothing else.

@@ -4,7 +4,10 @@ Only ``raw`` forms are stored. Each value is encrypted under the KMS-wrapped vau
 (:meth:`carto_edge.keys.KeyManager.vault_data_key`) with a random 96-bit nonce and
 ``AAD = tenant_id || 0x00 || token`` (spec 14.4), so a ciphertext moved to another token, another
 tenant or another data key does not decrypt. ``expires_at`` follows event retention (spec
-14.10): expired entries are never returned and :meth:`RevealVault.purge_expired` removes them.
+14.10): every sighting of a value keeps the latest expiry of its token (a backfilled record
+followed by a live one must not leave the entry expired), expired entries are never returned,
+and :meth:`RevealVault.purge_expired` removes them; the gateway's housekeeping runs it hourly
+(:meth:`carto_edge.runtime.EdgeRuntime.housekeeping`).
 
 Storage is SQLite in WAL mode (ADR 0014), one connection shared across threads behind a lock.
 Nothing here logs a value or a token.
@@ -104,8 +107,9 @@ class RevealVault:
         return self._tenant_id.encode("utf-8") + AAD_SEPARATOR + token_text.encode("ascii")
 
     def put_many(self, entries: Iterable[VaultEntry]) -> int:
-        """Store entries in one transaction; an existing token is kept as it is
-        (``INSERT OR IGNORE``). Returns the number of rows the statement touched."""
+        """Store entries in one transaction. An existing token keeps its ciphertext (the same
+        value under the same token) and takes the later of the two expiries. Returns the rows
+        inserted or extended."""
         rows: list[tuple[str, int, bytes, int]] = []
         for entry in entries:
             if not TOKEN_PATTERN.fullmatch(entry.token):
@@ -124,8 +128,10 @@ class RevealVault:
             self._conn.execute("BEGIN")
             try:
                 cursor = self._conn.executemany(
-                    "INSERT OR IGNORE INTO vault (token, key_version, ciphertext, expires_at) "
-                    "VALUES (?, ?, ?, ?)",
+                    "INSERT INTO vault (token, key_version, ciphertext, expires_at) "
+                    "VALUES (?, ?, ?, ?) "
+                    "ON CONFLICT(token) DO UPDATE SET expires_at = excluded.expires_at "
+                    "WHERE excluded.expires_at > vault.expires_at",
                     rows,
                 )
                 self._conn.execute("COMMIT")

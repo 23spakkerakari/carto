@@ -7,7 +7,9 @@ import base64
 import hashlib
 import hmac
 import json
+import os
 import re
+import stat
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -389,3 +391,38 @@ def test_assertion_signature_and_shape_checks() -> None:
 def test_assertion_rejects_naive_timestamps() -> None:
     with pytest.raises(ValueError, match="timezone-aware"):
         _assertion(issued_at=datetime(2026, 10, 8, 12, 0))
+
+
+def test_local_kms_master_key_is_created_exclusively_and_owner_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    opened: list[tuple[int, int]] = []
+    real_open = os.open
+
+    def recording_open(path: str | os.PathLike[str], flags: int, mode: int = 0o777) -> int:
+        opened.append((flags, mode))
+        return real_open(path, flags, mode)
+
+    monkeypatch.setattr(os, "open", recording_open)
+    path = tmp_path / "keys" / "local-kms.key"
+    LocalKms.create(path)
+    creates = [(flags, mode) for flags, mode in opened if flags & os.O_CREAT]
+    assert creates, "the master key must be created through os.open with an explicit mode"
+    flags, mode = creates[0]
+    assert flags & os.O_EXCL
+    assert mode == 0o600
+    assert len(path.read_bytes()) == KEY_BYTES  # no newline translation on Windows
+    if os.name != "nt":
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_wrapped_key_write_is_atomic_and_owner_only(tmp_path: Path) -> None:
+    kms = LocalKms.create(tmp_path / "kms.key")
+    path = tmp_path / "keys" / "tenant-key.v1.json"
+    wrapped = kms.wrap(generate_key(), {"purpose": "test"})
+    wrapped.write(path)
+    wrapped.write(path)  # replaces
+    assert WrappedKey.read(path) == wrapped
+    assert not list(path.parent.glob("*.tmp"))
+    if os.name != "nt":
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600

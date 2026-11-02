@@ -21,6 +21,9 @@
 #   proxy-webhooks  --profile push-webhooks   HTTPS on CARTO_WEBHOOK_PORT (8443), certificate in
 #                                              ./proxy-tls, forwarded to the gateway as `proxy`
 #
+# Every service has mem_limit, cpus and pids_limit (spec 14.6, 2.3 invariant 8), sized for the
+# pilot VM of spec 5.5; ClickHouse reads its cgroup limit and keeps its own memory under it.
+#
 # First run:   make dev
 # Tear down:   docker compose -f deploy/compose/compose.yaml down -v
 
@@ -71,6 +74,9 @@ secrets:
 services:
   postgres:
     image: postgres:16.6-bookworm
+    mem_limit: 1g
+    cpus: 1.0
+    pids_limit: 256
     <<: [*hardening, *db-capabilities]
     networks: [core]
     environment:
@@ -89,6 +95,9 @@ services:
 
   clickhouse:
     image: clickhouse/clickhouse-server:24.8
+    mem_limit: 4g
+    cpus: 2.0
+    pids_limit: 2048
     <<: [*hardening, *db-capabilities]
     # The image's init step (create the database) stops its temporary server, which runs as the
     # clickhouse uid, from the root entrypoint: that signal needs KILL on top of the db set.
@@ -119,6 +128,9 @@ services:
 
   volumes-init:
     image: carto-ctl:dev
+    mem_limit: 64m
+    cpus: 0.25
+    pids_limit: 32
     build:
       context: ../..
       dockerfile: deploy/docker/base.Dockerfile
@@ -148,6 +160,9 @@ services:
 
   pki-init:
     image: carto-ctl:dev
+    mem_limit: 256m
+    cpus: 0.5
+    pids_limit: 64
     <<: *hardening
     restart: "no"
     network_mode: none
@@ -172,6 +187,9 @@ services:
 
   migrate:
     image: carto-core:dev
+    mem_limit: 512m
+    cpus: 1.0
+    pids_limit: 128
     build:
       context: ../..
       dockerfile: deploy/docker/base.Dockerfile
@@ -199,6 +217,9 @@ services:
 
   ingest-api:
     image: carto-core:dev
+    mem_limit: 1g
+    cpus: 2.0
+    pids_limit: 256
     <<: *hardening
     networks: [core, edge]
     depends_on:
@@ -226,6 +247,9 @@ services:
 
   key-init:
     image: carto-ctl:dev
+    mem_limit: 256m
+    cpus: 0.5
+    pids_limit: 64
     <<: *hardening
     restart: "no"
     network_mode: none
@@ -246,6 +270,9 @@ services:
 
   edge-gateway:
     image: carto-edge:dev
+    mem_limit: 2g
+    cpus: 2.0
+    pids_limit: 256
     build:
       context: ../..
       dockerfile: deploy/docker/base.Dockerfile
@@ -278,6 +305,9 @@ services:
 
   otel-collector:
     image: otel/opentelemetry-collector-contrib:0.111.0
+    mem_limit: 512m
+    cpus: 1.0
+    pids_limit: 256
     <<: *hardening
     networks: [edge]
     depends_on:
@@ -293,6 +323,9 @@ services:
 
   proxy-otlp:
     image: nginxinc/nginx-unprivileged:1.30.4-alpine
+    mem_limit: 128m
+    cpus: 0.5
+    pids_limit: 64
     <<: *hardening
     profiles: ["push-otlp"]
     user: "10001:10001"
@@ -306,6 +339,9 @@ services:
 
   proxy-webhooks:
     image: nginxinc/nginx-unprivileged:1.30.4-alpine
+    mem_limit: 128m
+    cpus: 0.5
+    pids_limit: 64
     <<: *hardening
     profiles: ["push-webhooks"]
     user: "10001:10001"
@@ -322,6 +358,9 @@ services:
 
   simulator:
     image: carto-simulator:dev
+    mem_limit: 1g
+    cpus: 1.0
+    pids_limit: 128
     build:
       context: ../..
       dockerfile: deploy/docker/base.Dockerfile

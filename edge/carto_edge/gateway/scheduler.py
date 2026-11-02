@@ -21,9 +21,10 @@ Then each task loops:
 
 1. Wait while :meth:`~carto_edge.pipeline.ingestor.IngestorLike.backpressure` is not ``OK``
    (spec 8.5: "when the buffer is above 80%, pull connectors slow down").
-2. Read from the committed cursor (:class:`~carto_edge.state.CursorStore`), handing records to
-   the ingestor in chunks of :data:`CHUNK_RECORDS` on a worker thread (the pipeline is CPU work
-   and must not block the event loop). Between chunks the buffer is checked again: above the
+2. Read from the committed cursor (:class:`~carto_edge.state.CursorStore`), handing records and
+   the connector's cursor checkpoints (ADR 0035) to the ingestor in chunks of
+   :data:`CHUNK_RECORDS` on a worker thread (the pipeline is CPU work and must not block the
+   event loop). Between chunks the buffer is checked again: above the
    backpressure ratio the read stops early, and a chunk the ingestor refused with
    ``buffer_full`` aborts the read without a flush, because the ingestor wants the source
    re-read from its committed cursor (see :mod:`carto_edge.pipeline.batch`).
@@ -71,7 +72,7 @@ from carto_edge.net.retry import backoff_delay
 from carto_edge.pipeline.batch import PULL_SOURCE_TYPES, buffer_refused
 from carto_edge.pipeline.forward import MAX_BACKOFF_ATTEMPT, SourceHealth
 from carto_edge.pipeline.ingestor import BackpressureState, IngestorLike
-from carto_edge.pipeline.model import RawRecord
+from carto_edge.pipeline.model import CursorCheckpoint, ReadItem
 from carto_edge.runtime import EdgeRuntime
 from carto_edge.state import CursorStore
 
@@ -283,13 +284,14 @@ class PollScheduler:
         last_received: datetime | None = None
         aborted = False
         flush = True
-        chunk: list[RawRecord] = []
+        chunk: list[ReadItem] = []
         iterator = connector.read(cursor)
         try:
-            async for record in iterator:
-                chunk.append(record)
-                records += 1
-                last_received = record.received_at
+            async for item in iterator:
+                chunk.append(item)
+                if not isinstance(item, CursorCheckpoint):  # checkpoints carry no record
+                    records += 1
+                    last_received = item.received_at
                 if len(chunk) < self._chunk:
                     continue
                 outcome = await asyncio.to_thread(self._ingestor.ingest, chunk)
@@ -391,7 +393,7 @@ class PollScheduler:
                 log.warning("scheduler.close_failed", source_id=source_id, error=type(exc).__name__)
 
 
-async def _close_iterator(iterator: AsyncIterator[RawRecord]) -> None:
+async def _close_iterator(iterator: AsyncIterator[ReadItem]) -> None:
     """Close an async generator left before its end so its ``finally`` blocks run now."""
     aclose = getattr(iterator, "aclose", None)
     if aclose is not None:

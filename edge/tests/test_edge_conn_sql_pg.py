@@ -18,7 +18,7 @@ from sqlalchemy.exc import DBAPIError
 from carto_edge.config import SourceConfig, SourceType
 from carto_edge.connectors.base import ConnectorContext, ReadOnlyStatus, ResolvedHost
 from carto_edge.connectors.sql import SqlConnector
-from carto_edge.pipeline.model import RawRecord
+from carto_edge.pipeline.model import CursorCheckpoint, RawRecord, ReadItem
 
 pytestmark = pytest.mark.integration
 
@@ -26,6 +26,7 @@ QUERY = """
 SELECT id, po_num, order_ref, status, warehouse_code, created_by, updated_at
 FROM purchase_orders
 WHERE updated_at > :watermark
+AND updated_at <= :upper
 ORDER BY updated_at
 LIMIT :batch
 """
@@ -161,10 +162,16 @@ def make(postgres: dict[str, Any], username: str, password: str, batch: int = 10
     )
 
 
+async def collect_items(
+    connector: SqlConnector, cursor: dict[str, object] | None = None
+) -> list[ReadItem]:
+    return [item async for item in connector.read(cursor)]
+
+
 async def collect(
     connector: SqlConnector, cursor: dict[str, object] | None = None
 ) -> list[RawRecord]:
-    return [record async for record in connector.read(cursor)]
+    return [item for item in await collect_items(connector, cursor) if isinstance(item, RawRecord)]
 
 
 async def test_select_only_login_is_verified(postgres: dict[str, Any]) -> None:
@@ -196,16 +203,22 @@ async def test_insert_grant_is_refused(postgres: dict[str, Any]) -> None:
 async def test_polling_by_watermark(postgres: dict[str, Any]) -> None:
     connector = make(postgres, "carto_ro", RO_PASSWORD, batch=2)
     try:
-        records = await collect(connector)
+        items = await collect_items(connector)
+        records = [item for item in items if isinstance(item, RawRecord)]
         assert [r.locator for r in records] == [f"purchase_orders:row:{n}" for n in range(1, 6)]
         assert records[0].template_hint == "row_change purchase_orders"
         assert records[0].fields is not None
         assert records[0].fields["po_num"] == "88-210"
         assert isinstance(records[0].fields["updated_at"], datetime)
-        assert records[-1].commit_cursor == {
-            "watermarks": {"purchase_orders": "2026-09-23T22:04:00"}
-        }
-        assert await collect(connector, dict(records[-1].commit_cursor or {})) == []
+        # ADR 0035: the cursor travels in checkpoints and ends at :upper (the database clock
+        # minus the settle delay), past every row; a later read finds nothing.
+        assert all(r.commit_cursor is None for r in records)
+        checkpoints = [item for item in items if isinstance(item, CursorCheckpoint)]
+        assert checkpoints and checkpoints[-1].source_id == "src_wms_db"
+        final = checkpoints[-1].cursor["watermarks"]["purchase_orders"]
+        assert final["t"] == "datetime"
+        assert datetime.fromisoformat(final["v"]) > datetime(2026, 9, 23, 22, 4)
+        assert await collect(connector, dict(checkpoints[-1].cursor)) == []
         window = [
             r
             async for r in connector.backfill(
@@ -225,6 +238,7 @@ async def test_insert_through_the_connector_session_is_refused(postgres: dict[st
         with connector._read_only_session() as connection:
             assert connection.execute(text("SHOW default_transaction_read_only")).scalar() == "on"
             assert connection.execute(text("SHOW statement_timeout")).scalar() == "5s"
+            assert connection.execute(text("SHOW TimeZone")).scalar() == "UTC"
             connection.execute(text("INSERT INTO purchase_orders (po_num) VALUES ('x')"))
 
     try:

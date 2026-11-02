@@ -29,6 +29,7 @@ from carto_schema.event import (
     ObservedAtQuality,
     Redaction,
     Severity,
+    name_carries_no_value,
 )
 from carto_schema.forms import (
     SHAPE_MAX_LEN,
@@ -94,16 +95,22 @@ tenant_ids = st.from_regex(TENANT_ID_PATTERN, fullmatch=True)
 source_ids = st.from_regex(SOURCE_ID_PATTERN, fullmatch=True)
 template_ids = st.from_regex(TEMPLATE_ID_PATTERN, fullmatch=True)
 
+# Names and templates the model accepts: no segment that looks like a value (ADR 0027).
+names = st.text(min_size=1, max_size=32).filter(name_carries_no_value)
+template_texts = st.text(max_size=200).filter(lambda text: not re.search(r"[0-9]{6}", text))
+
 identifiers = st.builds(
     Identifier,
-    field=st.text(min_size=1, max_size=32),
+    field=names,
     form=forms,
     token=tokens,
     shape=shapes,
     len=st.integers(min_value=1, max_value=100_000),
 )
 identifier_lists = st.lists(identifiers, max_size=6, unique_by=attrgetter("field", "form"))
-attributes = st.dictionaries(st.text(min_size=1, max_size=16), st.text(max_size=48), max_size=6)
+attributes = st.dictionaries(
+    names.filter(lambda name: len(name) <= 16), st.text(max_size=48), max_size=6
+)
 actors = st.builds(Actor, token=tokens, kind=st.sampled_from(list(ActorKind)))
 redactions = st.builds(
     Redaction,
@@ -129,12 +136,12 @@ def events(
         ingested_at=aware_datetimes,
         observed_at_quality=st.sampled_from(list(ObservedAtQuality)),
         template_id=template_ids,
-        template_text=st.text(max_size=200),
+        template_text=template_texts,
         severity=st.none() | st.sampled_from(list(Severity)),
         attributes=attributes,
         identifiers=identifier_lists,
         actor=st.none() | actors,
-        dropped_fields=st.lists(st.text(min_size=1, max_size=32), max_size=4),
+        dropped_fields=st.lists(names, max_size=4),
         redaction=redactions,
     )
 

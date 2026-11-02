@@ -14,8 +14,14 @@ line number, never its content.
 
 :func:`load_bundle` writes chunks of at most :data:`DEFAULT_CHUNK_SIZE` events through the same
 writer as ``ingest-api`` with ``batch_id = derive_ulid(created_at_ms, bundle_id, chunk index)``
-and the same ledger-then-writer protocol (ADR 0015), so loading a bundle twice writes nothing
-the second time and an interrupted load resumes at the first chunk the ledger lacks.
+and the same claim protocol (ADR 0034), so loading a bundle twice writes nothing the second
+time and an interrupted load resumes at the first chunk the ledger has not marked done. Chunks
+are cut before the range check, so a chunk's batch id always covers the same events.
+
+Within a chunk, events whose ``observed_at`` lies outside the plausible range at load time
+(ADR 0036) are skipped and counted, not written: ClickHouse would delete an event older than
+retention on arrival, and ingest-api would refuse a future one. A bundle older than retention
+therefore loads only its recent part.
 """
 
 from __future__ import annotations
@@ -34,7 +40,8 @@ from pydantic import ValidationError
 from carto_common.crypto import CryptoError, VerifyKey, b64url_decode
 from carto_common.ids import derive_ulid
 from carto_common.logging import get_logger
-from carto_core.ingest.ledger import LedgerEntry
+from carto_common.settings import RetentionSettings
+from carto_core.ingest.ledger import ClaimState, LedgerEntry, LedgerError
 from carto_schema.bundle import (
     DATA_FILES,
     EVENTS_FILE,
@@ -52,6 +59,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "DEFAULT_CHUNK_SIZE",
+    "DEFAULT_CLAIM_TIMEOUT",
     "MAX_LINE_BYTES",
     "MAX_MANIFEST_BYTES",
     "MAX_SIGNATURE_BYTES",
@@ -69,6 +77,8 @@ MAX_SIGNATURE_BYTES: Final = 64 * 1024
 MAX_LINE_BYTES: Final = 4 * 1024 * 1024
 """Longest event line accepted: a maximal canonical event is well under 1 MiB."""
 DEFAULT_CHUNK_SIZE: Final = MAX_EVENTS_PER_BATCH
+DEFAULT_CLAIM_TIMEOUT: Final = timedelta(seconds=120)
+"""The ``ingest.claim_timeout_seconds`` default (ADR 0034)."""
 _HASH_CHUNK: Final = 1024 * 1024
 _READ_CHUNK: Final = 256 * 1024
 _EPOCH: Final = datetime(1970, 1, 1, tzinfo=UTC)
@@ -91,11 +101,14 @@ class VerifiedBundle:
 
 @dataclass(frozen=True, slots=True)
 class LoadResult:
-    """What :func:`load_bundle` did: events written, chunks seen, chunks already in the ledger."""
+    """What :func:`load_bundle` did: events written, chunks seen, chunks already in the ledger,
+    and events skipped as older than the plausible range or in the future (ADR 0036)."""
 
     events_written: int
     chunks: int
     duplicates: int
+    too_old: int = 0
+    future: int = 0
 
 
 def _read_small(path: Path, limit: int) -> bytes:
@@ -240,6 +253,11 @@ def iter_events(verified: VerifiedBundle) -> Iterator[CanonicalEvent]:
         raise BundleError(msg)
 
 
+def _utcnow() -> datetime:
+    """The load clock (tests replace it)."""
+    return datetime.now(UTC)
+
+
 def bundle_source_id(manifest: BundleManifest) -> str:
     """The ledger ``source_id`` of a bundle's chunks: ``bundle_<bundle id, lower case>``."""
     return f"bundle_{manifest.bundle_id.lower()}"
@@ -252,36 +270,56 @@ def load_bundle(
     *,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     clock: Callable[[], datetime] | None = None,
+    retention: RetentionSettings | None = None,
+    claim_timeout: timedelta = DEFAULT_CLAIM_TIMEOUT,
 ) -> LoadResult:
-    """Write the events in chunks through the ledger-then-writer protocol (ADR 0015)."""
+    """Write the events in chunks through the claim protocol (ADR 0034), skipping the events
+    outside the plausible range (ADR 0036). Raises :class:`LedgerError` when another load holds
+    a chunk's claim, and passes on the writer's and ledger's errors; a re-run resumes."""
     if not 1 <= chunk_size <= MAX_EVENTS_PER_BATCH:
         msg = f"chunk_size must be between 1 and {MAX_EVENTS_PER_BATCH}"
         raise ValueError(msg)
     manifest = verified.manifest
-    now = clock if clock is not None else lambda: datetime.now(UTC)
+    now = clock if clock is not None else _utcnow
+    lower, upper = (retention or RetentionSettings()).observed_at_range(now())
     created_at_ms = (manifest.created_at - _EPOCH) // timedelta(milliseconds=1)
     source_id = bundle_source_id(manifest)
-    written = 0
-    duplicates = 0
+    written = duplicates = too_old = future = 0
     index = 0
 
     def flush(chunk: list[CanonicalEvent]) -> None:
-        nonlocal written, duplicates, index
+        nonlocal written, duplicates, too_old, future, index
         batch_id = derive_ulid(created_at_ms, manifest.bundle_id, str(index))
-        if ledger.contains(manifest.tenant_id, batch_id):
+        claimed_at = now()
+        entry = LedgerEntry(manifest.tenant_id, batch_id, source_id, len(chunk), claimed_at)
+        claim = ledger.claim(entry, claimed_at - claim_timeout)
+        if claim.state is ClaimState.DONE:
             duplicates += 1
             log.info("bundle chunk already loaded", bundle_id=manifest.bundle_id, chunk=index)
-        else:
-            result = writer.write_events(chunk)
-            ledger.record(LedgerEntry(manifest.tenant_id, batch_id, source_id, len(chunk), now()))
-            written += result.events
-            log.info(
-                "bundle chunk written",
-                bundle_id=manifest.bundle_id,
-                chunk=index,
-                events=result.events,
-                identifiers=result.identifiers,
-            )
+            index += 1
+            return
+        if claim.state is ClaimState.BUSY:
+            msg = f"chunk {index} is being loaded by another run; re-run later"
+            raise LedgerError(msg)
+        kept = [event for event in chunk if lower <= event.observed_at <= upper]
+        old = sum(1 for event in chunk if event.observed_at < lower)
+        try:
+            result = writer.write_events(kept)
+        except Exception:
+            ledger.release(manifest.tenant_id, batch_id, claim.claimed_at)
+            raise
+        ledger.complete(entry, now())
+        written += result.events
+        too_old += old
+        future += len(chunk) - len(kept) - old
+        log.info(
+            "bundle chunk written",
+            bundle_id=manifest.bundle_id,
+            chunk=index,
+            events=result.events,
+            identifiers=result.identifiers,
+            out_of_range=len(chunk) - len(kept),
+        )
         index += 1
 
     chunk: list[CanonicalEvent] = []
@@ -292,4 +330,10 @@ def load_bundle(
             chunk = []
     if chunk:
         flush(chunk)
-    return LoadResult(events_written=written, chunks=index, duplicates=duplicates)
+    return LoadResult(
+        events_written=written,
+        chunks=index,
+        duplicates=duplicates,
+        too_old=too_old,
+        future=future,
+    )

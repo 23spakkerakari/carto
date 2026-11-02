@@ -1,7 +1,8 @@
 # ADR 0030: Field names travel only once they repeat; maps turn their keys into values
 
 Status: accepted by the founder, 2026-10-11 (spec 8.2 item 1, 8.3, 2.3 invariant 2). Closes the
-residual risk of ADR 0027 (JSON maps keyed by names).
+residual risk of ADR 0027 (JSON maps keyed by names). Amended by ADR 0038 (segment paths, secret
+and PII checks on hidden names, per-record labels, state version 2).
 
 ## Context
 

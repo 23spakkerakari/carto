@@ -11,6 +11,12 @@ on:
 permissions:
   contents: read
 
+# Every step runs as bash -eo pipefail. Without it, `make leak | tee leak.log` reports tee's
+# status, so a failing leak test passed (docs/plans/M1-review-fixes.md, package B).
+defaults:
+  run:
+    shell: bash
+
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -149,8 +155,11 @@ jobs:
           cache-from: type=gha
       - name: Smoke test the images (run as non-root, print version)
         run: |
-          docker run --rm --read-only --cap-drop ALL --security-opt no-new-privileges carto-edge:ci --help | head -5
-          docker run --rm --read-only --cap-drop ALL --security-opt no-new-privileges carto-core:ci --help | head -5
+          # Capture first: under pipefail, head closing the pipe early fails the step.
+          edge_help="$(docker run --rm --read-only --cap-drop ALL --security-opt no-new-privileges carto-edge:ci --help)"
+          core_help="$(docker run --rm --read-only --cap-drop ALL --security-opt no-new-privileges carto-core:ci --help)"
+          sed -n 1,5p <<< "$edge_help"
+          sed -n 1,5p <<< "$core_help"
       - name: Trivy image scan
         uses: aquasecurity/trivy-action@v0.36.0
         with:

@@ -32,6 +32,7 @@ import time
 from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Final
 
@@ -45,13 +46,14 @@ from carto_edge.cli.analyze import (
     AnalyzeError,
     describe,
     emit,
+    parse_as_of,
     upload_sources,
 )
 from carto_edge.config import ConfigError, EdgeSettings, SourceConfig, load_sources_file
 from carto_edge.connectors.base import ConnectorError, InvalidConfigError, ReadConnector
 from carto_edge.connectors.registry import build_connector
 from carto_edge.keys import KeyManagementError
-from carto_edge.pipeline.model import PipelineResult, RawRecord
+from carto_edge.pipeline.model import CursorCheckpoint, PipelineResult, RawRecord
 from carto_edge.pipeline.pii import PiiDetector
 from carto_edge.runtime import EdgeRuntime, build_connector_context, build_runtime
 
@@ -110,6 +112,8 @@ async def _collect(connector: ReadConnector, limit: int) -> list[RawRecord]:
     stream = connector.read(None)
     try:
         async for record in stream:
+            if isinstance(record, CursorCheckpoint):  # no cursor in a benchmark
+                continue
             records.append(record)
             if len(records) >= limit:
                 break
@@ -217,9 +221,12 @@ def bench(
     seconds: float = DEFAULT_SECONDS,
     max_records: int = DEFAULT_MAX_RECORDS,
     detector: PiiDetector | None = None,
+    as_of: datetime | None = None,
 ) -> BenchResult:
     """Run the benchmark; raises :class:`~carto_edge.cli.analyze.AnalyzeError` with the exit
-    code. ``detector`` replaces the configured PII detector (tests only)."""
+    code. ``detector`` replaces the configured PII detector (tests only);
+    ``as_of`` is the time event times are checked against (ADR 0036, ``--as-of``), by default
+    the wall clock."""
     if seconds <= 0 or max_records < 1:
         msg = "--seconds must be positive and --max-records at least 1"
         raise AnalyzeError(msg, EXIT_USAGE)
@@ -239,7 +246,12 @@ def bench(
             raise AnalyzeError(msg, EXIT_USAGE) from exc
         try:
             runtime = build_runtime(
-                settings, sources_file, mode="analyze", detector=detector, init_local_keys=True
+                settings,
+                sources_file,
+                mode="analyze",
+                detector=detector,
+                init_local_keys=True,
+                range_clock=(lambda: as_of) if as_of is not None else None,
             )
         except KeyManagementError as exc:
             msg = f"keys unusable: {describe(exc)}"
@@ -316,6 +328,12 @@ def add_bench_arguments(parser: argparse.ArgumentParser) -> None:
         help="pipeline: parse to vault in analyzer mode (default); gateway: the full ingest path "
         "with buffer and forwarder (ADR 0028)",
     )
+    parser.add_argument(
+        "--as-of",
+        type=parse_as_of,
+        default=None,
+        help="Check event times against this ISO 8601 time instead of now (ADR 0036)",
+    )
 
 
 def run_bench(args: argparse.Namespace) -> int:
@@ -325,12 +343,22 @@ def run_bench(args: argparse.Namespace) -> int:
         if args.path == "gateway":
             lines = format_gateway_bench(
                 bench_gateway(
-                    args.config, args.input, seconds=args.seconds, max_records=args.max_records
+                    args.config,
+                    args.input,
+                    seconds=args.seconds,
+                    max_records=args.max_records,
+                    as_of=args.as_of,
                 )
             )
         else:
             lines = format_bench(
-                bench(args.config, args.input, seconds=args.seconds, max_records=args.max_records)
+                bench(
+                    args.config,
+                    args.input,
+                    seconds=args.seconds,
+                    max_records=args.max_records,
+                    as_of=args.as_of,
+                )
             )
     except AnalyzeError as exc:
         print(f"carto-edge bench: {exc}", file=sys.stderr)

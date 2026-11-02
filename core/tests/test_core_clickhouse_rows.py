@@ -4,25 +4,29 @@ writer against a fake client (column-oriented inserts, error wrapping, readiness
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
-from clickhouse_connect.driver.exceptions import DatabaseError
+from clickhouse_connect.driver.exceptions import DatabaseError, DataError, OperationalError
 
 from carto_core.db.clickhouse import (
     EVENT_COLUMNS,
     EVENT_IDENTIFIERS_TABLE,
     EVENTS_TABLE,
     IDENTIFIER_COLUMNS,
+    MAX_PARTITION_DAYS,
     ClickHouseWriter,
     WriterError,
     WriteResult,
     columns_of,
+    create_client,
     event_row,
     field_ref,
     identifier_rows,
+    partition_day_groups,
 )
+from carto_core.settings import ClickHouseSettings
 from carto_schema.event import CanonicalEvent
 
 OBSERVED = datetime(2026, 10, 6, 21, 12, 3, 412000, tzinfo=UTC)
@@ -195,7 +199,95 @@ def test_writer_wraps_client_failures_without_event_contents(failure: Exception)
     assert "CREATED" not in message
 
 
+@pytest.mark.parametrize(
+    ("failure", "permanent"),
+    [
+        (DatabaseError("Code: 53. DB::Exception: Type mismatch", code=53), True),
+        (DatabaseError("Code: 6. DB::Exception: Cannot parse text", code=6), True),
+        (DataError("cannot serialize a value"), True),
+        (DatabaseError("Code: 241. DB::Exception: Memory limit", code=241), False),
+        (DatabaseError("Code: 252. DB::Exception: Too many parts", code=252), False),
+        (DatabaseError("Code: 60. DB::Exception: Unknown table", code=60), False),
+        (OperationalError("Code: 53. after a retry", code=53), True),
+        (OperationalError("connection refused"), False),
+        (DatabaseError("no code"), False),
+        (OSError("connection reset"), False),
+    ],
+)
+def test_a_refusal_of_the_data_is_permanent_and_the_rest_is_transient(
+    failure: Exception, permanent: bool
+) -> None:
+    """ADR 0036: a permanent error is answered 422 and parks the batch; anything else is 503.
+    The server's code decides, whatever class clickhouse-connect raises it as."""
+    with pytest.raises(WriterError) as info:
+        ClickHouseWriter(FakeClient(fail=failure)).write_events([CanonicalEvent.example()])
+    assert info.value.permanent is permanent
+
+
+def test_the_error_code_is_named_in_the_message() -> None:
+    failure = DatabaseError("Code: 53. DB::Exception: Type mismatch for t1.secret", code=53)
+    with pytest.raises(WriterError) as info:
+        ClickHouseWriter(FakeClient(fail=failure)).write_events([CanonicalEvent.example()])
+    assert str(info.value) == "ClickHouse insert failed: DatabaseError (code 53)"
+
+
+def _on_day(day: int, index: int = 0) -> CanonicalEvent:
+    event = CanonicalEvent.example()
+    observed = datetime(2026, 1, 1, 12, tzinfo=UTC) + timedelta(days=day, seconds=index)
+    return event.model_copy(update={"observed_at": observed})
+
+
+def test_partition_day_groups_span_at_most_the_limit_oldest_first() -> None:
+    events = [_on_day(day) for day in range(200, -1, -1)]  # 201 days, newest first
+    groups = list(partition_day_groups(events))
+    assert [len(group) for group in groups] == [90, 90, 21]
+    days = [{event.observed_at.date() for event in group} for group in groups]
+    assert all(len(group_days) <= MAX_PARTITION_DAYS for group_days in days)
+    assert max(days[0]) < min(days[1]) and max(days[1]) < min(days[2])
+    assert sum(len(group) for group in groups) == len(events)
+
+
+def test_partition_days_are_utc_days_and_order_within_a_day_is_kept() -> None:
+    late = _on_day(0).model_copy(update={"observed_at": datetime(2026, 1, 1, 23, 30, tzinfo=UTC)})
+    local = late.observed_at.astimezone(datetime.now().astimezone().tzinfo)
+    first, second = _on_day(0, 1), _on_day(0, 0)
+    (one_day,) = partition_day_groups(
+        [first, late.model_copy(update={"observed_at": local}), second]
+    )
+    assert one_day[0] is first and one_day[2] is second
+
+
+def test_a_batch_over_many_days_is_inserted_in_day_groups() -> None:
+    client = FakeClient()
+    events = [_on_day(day) for day in range(MAX_PARTITION_DAYS + 5)]
+    result = ClickHouseWriter(client).write_events(events)
+    assert result == WriteResult(events=95, identifiers=95 * 4)
+    assert [insert["table"] for insert in client.inserts] == [
+        EVENTS_TABLE,
+        EVENT_IDENTIFIERS_TABLE,
+        EVENTS_TABLE,
+        EVENT_IDENTIFIERS_TABLE,
+    ]
+    sizes = [len(insert["data"][0]) for insert in client.inserts]
+    assert sizes == [90, 360, 5, 20]
+
+
 def test_writer_ping_reports_the_client_state() -> None:
     assert ClickHouseWriter(FakeClient(alive=True)).ping() is True
     assert ClickHouseWriter(FakeClient(alive=False)).ping() is False
     assert ClickHouseWriter(FakeClient(fail=OSError("down"))).ping() is False
+
+
+def test_create_client_never_opens_a_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    """One client is shared by the threadpool: a session id would serialize requests and fail
+    concurrent ones with SESSION_IS_LOCKED, so the client is created without one."""
+    seen: dict[str, Any] = {}
+
+    def fake_get_client(**kwargs: Any) -> object:
+        seen.update(kwargs)
+        return object()
+
+    monkeypatch.setattr("clickhouse_connect.get_client", fake_get_client)
+    create_client(ClickHouseSettings(url="http://127.0.0.1:8123", secure=False))
+    assert seen["autogenerate_session_id"] is False
+    assert "session_id" not in seen

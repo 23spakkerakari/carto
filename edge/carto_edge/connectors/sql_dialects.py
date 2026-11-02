@@ -4,14 +4,16 @@ read-only session, and how to read the login's effective privileges.
 Layer 3 of the read-only enforcement is :func:`check_statement`: ``sqlglot`` parses the admin's
 query template and anything other than one ``SELECT`` (or ``WITH ... SELECT``) is refused: no
 ``INTO``, no locking clause, no DML or DDL anywhere in the tree, none of the functions that
-write or stall (``nextval``, ``pg_sleep``, ``xp_cmdshell`` ...), and only the two named bind
-parameters ``:watermark`` and ``:batch``; string formatting markers are refused outright.
+write or stall (``nextval``, ``pg_sleep``, ``xp_cmdshell`` ...), and only the named bind
+parameters ``:watermark`` and ``:batch``, plus ``:upper`` for a time-typed watermark (ADR 0035,
+where it is required; it is refused for integer and decimal watermarks); string formatting
+markers are refused outright.
 
-Layer 2 is the session: PostgreSQL connects with ``default_transaction_read_only=on`` and a
-``statement_timeout`` and polls inside ``BEGIN READ ONLY`` (set through SQLAlchemy's
-``postgresql_readonly`` option, which psycopg turns into the read-only transaction); MySQL sets
-``max_execution_time`` and polls inside ``START TRANSACTION READ ONLY``; SQL Server has no
-read-only transaction mode, so the connection string carries ``ApplicationIntent=ReadOnly``
+Layer 2 is the session: PostgreSQL connects with ``default_transaction_read_only=on``, a
+``statement_timeout`` and ``TimeZone=UTC`` and polls inside ``BEGIN READ ONLY`` (set through
+SQLAlchemy's ``postgresql_readonly`` option, which psycopg turns into the read-only transaction);
+MySQL sets ``max_execution_time`` and polls inside ``START TRANSACTION READ ONLY``; SQL Server
+has no read-only transaction mode, so the connection string carries ``ApplicationIntent=ReadOnly``
 and ``Encrypt=yes`` and the grant check carries the weight.
 
 Layer 1, the grants, is what ``test()`` inspects with the queries from
@@ -40,6 +42,7 @@ from carto_edge.connectors.base import InvalidConfigError, ResolvedHost
 from carto_edge.secrets import Credentials
 
 __all__ = [
+    "CLOCK_SQL",
     "DENIED_FUNCTIONS",
     "MYSQL_READ_ONLY_PRIVILEGES",
     "REQUIRED_PARAMETERS",
@@ -62,7 +65,16 @@ Dialect = Literal["postgresql", "mysql", "mssql"]
 SQLGLOT_READ: Final[dict[str, str]] = {"postgresql": "postgres", "mysql": "mysql", "mssql": "tsql"}
 
 REQUIRED_PARAMETERS: Final = frozenset({"watermark", "batch"})
-"""Spec 8.1.4: only named bind parameters ``:watermark`` and ``:batch``."""
+"""Spec 8.1.4: only named bind parameters ``:watermark`` and ``:batch``; time-typed watermarks
+add ``:upper`` (ADR 0035)."""
+UPPER_PARAMETER: Final = "upper"
+
+CLOCK_SQL: Final[dict[str, str]] = {
+    "postgresql": "SELECT CURRENT_TIMESTAMP AS now",
+    "mysql": "SELECT UTC_TIMESTAMP(6) AS now",
+    "mssql": "SELECT SYSUTCDATETIME() AS now",
+}
+"""The database's own clock in UTC, the base of ``:upper`` (ADR 0035 item 3)."""
 
 DENIED_FUNCTIONS: Final = frozenset(
     {
@@ -159,8 +171,11 @@ def _function_name(node: exp.Func) -> str:
     return node.sql_name().lower()
 
 
-def check_statement(sql: str, dialect: Dialect) -> CheckedStatement:
-    """Spec 8.1.4 layer 3: refuse everything but one parameterized read-only SELECT."""
+def check_statement(sql: str, dialect: Dialect, *, upper: bool = False) -> CheckedStatement:
+    """Spec 8.1.4 layer 3: refuse everything but one parameterized read-only SELECT. With
+    ``upper`` the template must also bind ``:upper`` (a time-typed watermark, ADR 0035);
+    without it ``:upper`` is refused."""
+    required = REQUIRED_PARAMETERS | {UPPER_PARAMETER} if upper else REQUIRED_PARAMETERS
     text = sql.strip().rstrip(";").strip()
     if not text:
         msg = "the query is empty"
@@ -202,12 +217,21 @@ def check_statement(sql: str, dialect: Dialect) -> CheckedStatement:
                 raise StatementCheckError(msg)
         if isinstance(node, exp.Placeholder | exp.Parameter | exp.SessionParameter):
             name = str(node.name)
-            if name not in REQUIRED_PARAMETERS:
-                msg = "only the named bind parameters :watermark and :batch are allowed"
+            if name not in required:
+                allowed = ", ".join(f":{item}" for item in sorted(required))
+                msg = f"only the named bind parameters {allowed} are allowed"
+                if name == UPPER_PARAMETER:
+                    msg += " (:upper belongs to datetime and date watermarks only)"
                 raise StatementCheckError(msg)
             seen_parameters.add(name)
-    if seen_parameters != REQUIRED_PARAMETERS:
-        msg = "the query must use both :watermark and :batch"
+    if seen_parameters != required:
+        needed = " and ".join(f":{item}" for item in sorted(required))
+        msg = f"the query must use {needed}"
+        if upper and UPPER_PARAMETER not in seen_parameters:
+            msg += (
+                " (a time-typed watermark reads a closed range: "
+                "WHERE <column> > :watermark AND <column> <= :upper, ADR 0035)"
+            )
         raise StatementCheckError(msg)
     ctes = {str(cte.alias_or_name).lower() for cte in tree.find_all(exp.CTE)}
     tables: list[str] = []
@@ -242,7 +266,10 @@ def postgres_connect_kwargs(
     query_timeout_seconds: int,
 ) -> dict[str, Any]:
     """psycopg keyword arguments: ``hostaddr`` pins the policy's address, ``host`` keeps the
-    name for ``verify-full``, ``options`` makes every transaction read-only with a timeout."""
+    name for ``verify-full``, ``options`` makes every transaction read-only with a timeout and
+    pins the session time zone to UTC, so a naive watermark compares with ``timestamptz``
+    columns in UTC whatever the server's default zone is (ADR 0035 item 6; MySQL sessions set
+    ``time_zone = '+00:00'``)."""
     kwargs: dict[str, Any] = {
         "host": host,
         "hostaddr": resolved.address,
@@ -255,7 +282,8 @@ def postgres_connect_kwargs(
         "application_name": "carto-edge",
         "options": (
             "-c default_transaction_read_only=on "
-            f"-c statement_timeout={query_timeout_seconds * 1000}"
+            f"-c statement_timeout={query_timeout_seconds * 1000} "
+            "-c TimeZone=UTC"
         ),
     }
     if ca_file:

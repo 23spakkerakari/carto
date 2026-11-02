@@ -1,6 +1,7 @@
 """carto_edge.connectors.sql for SQL Server against a fake connection (ADR 0019: no container in
 CI yet): the pyodbc connection string with ApplicationIntent=ReadOnly, the query timeout, the
-HAS_PERMS_BY_NAME and server-role checks, polling by watermark and cursor encoding."""
+HAS_PERMS_BY_NAME and server-role checks, polling by a closed time range with tie-safe pages and
+cursor checkpoints (ADR 0035), and the typed cursor encoding."""
 
 from __future__ import annotations
 
@@ -21,14 +22,18 @@ from carto_edge.connectors.base import (
     ResolvedHost,
 )
 from carto_edge.connectors.sql import SqlConnector
+from carto_edge.connectors.sql_dialects import CLOCK_SQL
 from carto_edge.net.ssrf import SsrfError
-from carto_edge.pipeline.model import RawRecord
+from carto_edge.pipeline.model import CursorCheckpoint, RawRecord, ReadItem
 from carto_schema.event import EventKind
 
 NOW = datetime(2026, 10, 8, 12, 0, tzinfo=UTC)
+DB_NOW = datetime(2026, 10, 8, 12, 0, 0)  # SYSUTCDATETIME() comes back naive
+UPPER = datetime(2026, 10, 8, 11, 59, 30)  # DB_NOW minus the default settle_seconds (30)
+CLOCK = CLOCK_SQL["mssql"]
 QUERY = (
     "SELECT TOP (:batch) id, po_num, order_ref, status, updated_at FROM dbo.purchase_orders "
-    "WHERE updated_at > :watermark ORDER BY updated_at"
+    "WHERE updated_at > :watermark AND updated_at <= :upper ORDER BY updated_at"
 )
 ROWS = [
     {
@@ -143,8 +148,11 @@ class FakeEngine:
 
 
 class Harness:
-    def __init__(self, *, insert: int = 0, alter: int = 0, sysadmin: int = 0) -> None:
+    def __init__(
+        self, *, insert: int = 0, alter: int = 0, sysadmin: int = 0, clock: bool = True
+    ) -> None:
         self.insert, self.alter, self.sysadmin = insert, alter, sysadmin
+        self.clock = clock
         self.engine: FakeEngine | None = None
         self.dbapi: list[FakeDbapiConnection] = []
         self.network = Network()
@@ -158,7 +166,13 @@ class Harness:
         self.engine = FakeEngine(drivername, creator, self.respond)
         return self.engine
 
+    def polls(self) -> list[dict[str, Any]]:
+        assert self.engine is not None
+        return [params for sql, params in self.engine.log if sql == QUERY]
+
     def respond(self, sql: str, params: dict[str, Any]) -> list[dict[str, Any]]:
+        if sql == CLOCK:
+            return [{"now": DB_NOW}] if self.clock else []
         if "HAS_PERMS_BY_NAME" in sql:
             assert params == {"t": "dbo.purchase_orders"}
             return [
@@ -174,8 +188,10 @@ class Harness:
                 {"sysadmin": self.sysadmin, "db_owner": 0, "db_datawriter": 0, "db_ddladmin": 0}
             ]
         assert sql == QUERY
-        watermark = params["watermark"]
-        selected = [row for row in ROWS if row["updated_at"] > watermark]
+        assert set(params) == {"watermark", "upper", "batch"}
+        selected = [
+            row for row in ROWS if params["watermark"] < row["updated_at"] <= params["upper"]
+        ]
         return selected[: params["batch"]]
 
 
@@ -237,10 +253,22 @@ def make(
     )
 
 
+async def collect_items(
+    connector: SqlConnector, cursor: dict[str, object] | None = None
+) -> list[ReadItem]:
+    return [item async for item in connector.read(cursor)]
+
+
 async def collect(
     connector: SqlConnector, cursor: dict[str, object] | None = None
 ) -> list[RawRecord]:
-    return [record async for record in connector.read(cursor)]
+    return [item for item in await collect_items(connector, cursor) if isinstance(item, RawRecord)]
+
+
+def checkpoint(moment: str) -> CursorCheckpoint:
+    return CursorCheckpoint(
+        "src_wms_db", {"watermarks": {"purchase_orders": {"t": "datetime", "v": moment}}}
+    )
 
 
 def test_is_a_read_connector_and_checks_statements() -> None:
@@ -250,6 +278,18 @@ def test_is_a_read_connector_and_checks_statements() -> None:
     assert connector.tables == ("dbo.purchase_orders",)
     with pytest.raises(InvalidConfigError, match="single SELECT"):
         make(Harness(), query="UPDATE dbo.purchase_orders SET status = 'x' WHERE id > :watermark")
+
+
+def test_a_datetime_watermark_query_must_read_a_closed_range() -> None:
+    """ADR 0035 item 3: the template of a time-typed watermark binds :upper as well."""
+    with pytest.raises(InvalidConfigError, match=":upper"):
+        make(
+            Harness(),
+            query=(
+                "SELECT TOP (:batch) id, updated_at FROM dbo.purchase_orders "
+                "WHERE updated_at > :watermark ORDER BY updated_at"
+            ),
+        )
 
 
 def test_needs_a_secret_ref() -> None:
@@ -286,8 +326,8 @@ async def test_connection_string_read_only_intent_and_timeout() -> None:
     assert "PWD={p}}w;d}" in dbapi.plan
     assert "DRIVER={ODBC Driver 18 for SQL Server}" in dbapi.plan
     assert dbapi.timeout == 45
-    assert dbapi.closed  # NullPool semantics: one connection per poll, closed afterwards
-    # Each poll re-resolves the host through the policy and re-reads the login.
+    assert dbapi.closed  # NullPool semantics: one connection per statement, closed afterwards
+    # Each statement re-resolves the host through the policy and re-reads the login.
     assert len(harness.network.calls) == len(harness.dbapi)
 
 
@@ -313,18 +353,21 @@ async def test_query_timestamp_and_actor_columns_travel_with_every_record() -> N
             ]
         },
     )
-    records = await collect(connector)
+    items = await collect_items(connector)
+    records = [item for item in items if isinstance(item, RawRecord)]
     assert records
     assert all(r.timestamp_field == "updated_at" for r in records)
     assert all(r.actor_field == "created_by" for r in records)
-    # The cursor-carrying copies keep the overrides too.
-    assert any(r.commit_cursor is not None for r in records)
+    # The cursor travels in checkpoints, never on a record (ADR 0035 item 1).
+    assert all(r.commit_cursor is None for r in records)
+    assert any(isinstance(item, CursorCheckpoint) for item in items)
 
 
-async def test_polls_by_watermark_with_cursor_round_trip() -> None:
+async def test_polls_a_closed_range_in_tie_safe_pages_with_checkpoints() -> None:
     harness = Harness()
     connector = make(harness)
-    records = await collect(connector)
+    items = await collect_items(connector)
+    records = [item for item in items if isinstance(item, RawRecord)]
     assert [r.locator for r in records] == [
         "purchase_orders:row:1",
         "purchase_orders:row:2",
@@ -334,16 +377,46 @@ async def test_polls_by_watermark_with_cursor_round_trip() -> None:
     assert records[0].template_hint == "row_change purchase_orders"
     assert records[0].fields == ROWS[0]  # Python values, stringified later by the parser
     assert records[0].received_at == NOW
-    assert records[0].commit_cursor is None
-    assert records[1].commit_cursor == {"watermarks": {"purchase_orders": "2026-09-23T22:05:00"}}
-    assert records[2].commit_cursor == {"watermarks": {"purchase_orders": "2026-09-24T01:00:00"}}
-    # Two pages of batch=2: the first poll started from the epoch.
-    polls = [params for sql, params in harness.engine.log if sql == QUERY]  # type: ignore[union-attr]
-    assert polls[0] == {"watermark": datetime(1970, 1, 1), "batch": 2}
-    assert polls[1] == {"watermark": datetime(2026, 9, 23, 22, 5), "batch": 2}
-    assert await collect(connector, dict(records[-1].commit_cursor or {})) == []
-    later = [params for sql, params in harness.engine.log if sql == QUERY][-1]  # type: ignore[union-attr]
-    assert later["watermark"] == datetime(2026, 9, 24, 1, 0)  # decoded back to a datetime
+    # batch=2: a full page stops below its largest value (the trailing tie group is read again),
+    # so every page emits one row and a checkpoint; the short last page moves to :upper.
+    assert items == [
+        records[0],
+        checkpoint("2026-09-23T22:04:03"),
+        records[1],
+        checkpoint("2026-09-23T22:05:00"),
+        records[2],
+        checkpoint("2026-10-08T11:59:30"),
+    ]
+    polls = harness.polls()
+    assert polls[0] == {"watermark": datetime(1970, 1, 1), "batch": 2, "upper": UPPER}
+    assert [poll["watermark"] for poll in polls[1:]] == [
+        datetime(2026, 9, 23, 22, 4, 3),
+        datetime(2026, 9, 23, 22, 5),
+    ]
+    assert all(poll["upper"] == UPPER for poll in polls)
+    # Round trip: nothing settled after the cursor, so no query runs and the cursor stays.
+    assert await collect_items(connector, dict(items[-1].cursor)) == []  # type: ignore[union-attr]
+    assert len(harness.polls()) == 3
+
+
+async def test_an_empty_range_still_moves_the_cursor_to_upper() -> None:
+    """ADR 0035 item 3: a fully read range commits even when it held no row; the untyped cursor
+    of the first M1 build is read as the configured type."""
+    harness = Harness()
+    connector = make(harness)
+    legacy: dict[str, object] = {"watermarks": {"purchase_orders": "2026-09-24T01:00:00"}}
+    assert await collect_items(connector, legacy) == [checkpoint("2026-10-08T11:59:30")]
+    assert harness.polls() == [
+        {"watermark": datetime(2026, 9, 24, 1, 0), "batch": 2, "upper": UPPER}
+    ]
+
+
+async def test_a_cursor_of_another_type_is_refused() -> None:
+    harness = Harness()
+    with pytest.raises(ConnectorError, match="watermark_type"):
+        await collect_items(
+            make(harness), {"watermarks": {"purchase_orders": {"t": "int", "v": "5"}}}
+        )
 
 
 async def test_backfill_days_sets_the_initial_watermark() -> None:
@@ -371,6 +444,7 @@ async def test_backfill_window() -> None:
         )
     ]
     assert [r.locator for r in records] == ["purchase_orders:row:2"]
+    assert harness.polls()[0]["upper"] == datetime(2026, 9, 24, 0, 0)
 
 
 async def test_read_only_login_is_verified() -> None:
@@ -382,10 +456,29 @@ async def test_read_only_login_is_verified() -> None:
     assert result.visible == ("dbo.purchase_orders",)
     names = [check.name for check in result.checks]
     assert names == ["query purchase_orders", "privileges dbo.purchase_orders", "privileges role"]
-    first_poll = next(params for sql, params in harness.engine.log if sql == QUERY)  # type: ignore[union-attr]
+    assert harness.engine is not None
+    log = harness.engine.log
+    assert any(sql == CLOCK for sql, _ in log)  # :upper comes from the database clock
+    first_poll = harness.polls()[0]
     assert first_poll["batch"] == 1
-    assert any("HAS_PERMS_BY_NAME(:t, 'OBJECT', 'INSERT')" in sql for sql, _ in harness.engine.log)  # type: ignore[union-attr]
-    assert any("IS_SRVROLEMEMBER('sysadmin')" in sql for sql, _ in harness.engine.log)  # type: ignore[union-attr]
+    assert first_poll["upper"] == UPPER
+    assert any("HAS_PERMS_BY_NAME(:t, 'OBJECT', 'INSERT')" in sql for sql, _ in log)
+    assert any("IS_SRVROLEMEMBER('sysadmin')" in sql for sql, _ in log)
+
+
+async def test_an_unreadable_database_clock_fails_the_test_and_the_read() -> None:
+    harness = Harness(clock=False)
+    result = await make(harness).test()
+    assert not result.ok
+    assert [check.name for check in result.checks] == [
+        "database clock",
+        "privileges dbo.purchase_orders",
+        "privileges role",
+    ]
+    assert "database clock" in result.problems[0]
+    assert harness.polls() == []  # a time-range query never runs without :upper
+    with pytest.raises(ConnectorError, match="database clock"):
+        await collect_items(make(Harness(clock=False)))
 
 
 async def test_insert_permission_makes_the_login_write_capable() -> None:

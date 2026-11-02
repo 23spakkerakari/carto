@@ -5,7 +5,7 @@ until core's public key is installed, and nothing in a repr carries material."""
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -21,8 +21,9 @@ from carto_edge.config import (
     SystemConfig,
 )
 from carto_edge.keys import ASSERTION_PUBLIC_KEY_FILE, KeyManagementError
+from carto_edge.metrics import default_metrics
 from carto_edge.net.ssrf import DefaultNetworkPolicy
-from carto_edge.pipeline.model import RawRecord
+from carto_edge.pipeline.model import RawRecord, VaultEntry
 from carto_edge.pipeline.pii import RegexDetector
 from carto_edge.runtime import (
     EdgeRuntime,
@@ -163,4 +164,74 @@ def test_repr_names_mode_and_versions_only(tmp_path: Path) -> None:
     )
     text = repr(runtime)
     assert text == "EdgeRuntime(mode='analyze', key_versions=[1])"
+    runtime.close()
+
+
+def test_gateway_housekeeping_purges_expired_vault_entries_hourly(tmp_path: Path) -> None:
+    config = settings(tmp_path)
+    build_runtime(config, sources(), mode="analyze", init_local_keys=True).close()
+    runtime = build_runtime(config, sources(), mode="gateway")
+    tick = [0.0]
+    runtime.monotonic = lambda: tick[0]
+    metrics = default_metrics()
+    runtime.metrics = metrics
+    token_text = runtime.keyring.active.token("id", "CUST-88210")
+    runtime.vault.put_many([VaultEntry(token_text, "CUST-88210", NOW - timedelta(days=1))])
+    try:
+        runtime.flush()  # first tick runs the chores
+        assert runtime.vault.count() == 0
+        assert metrics.get("carto_edge_vault_purged_total") == 1
+        runtime.vault.put_many([VaultEntry(token_text, "CUST-88210", NOW - timedelta(days=1))])
+        tick[0] = 10.0
+        runtime.flush()  # ten seconds later: not yet
+        assert runtime.vault.count() == 1
+        tick[0] = 3601.0
+        runtime.flush()  # an hour later
+        assert runtime.vault.count() == 0
+    finally:
+        runtime.close()
+
+
+def test_analyze_flush_does_not_run_gateway_housekeeping(tmp_path: Path) -> None:
+    runtime = build_runtime(settings(tmp_path), sources(), mode="analyze", init_local_keys=True)
+    token_text = runtime.keyring.active.token("id", "CUST-88210")
+    runtime.vault.put_many([VaultEntry(token_text, "CUST-88210", NOW - timedelta(days=1))])
+    try:
+        runtime.flush()
+        assert runtime.vault.count() == 1
+    finally:
+        runtime.close()
+
+
+def _anchor_lines(text: str) -> list[dict[str, object]]:
+    lines = [json.loads(line) for line in text.splitlines() if line.startswith("{")]
+    return [line for line in lines if line.get("event") == "audit.anchor"]
+
+
+def test_gateway_publishes_the_audit_anchor_hourly_and_at_close(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = settings(tmp_path)
+    build_runtime(config, sources(), mode="analyze", init_local_keys=True).close()
+    runtime = build_runtime(config, sources(), mode="gateway")
+    assert runtime.anchors is not None
+    tick = [0.0]
+    runtime.monotonic = lambda: tick[0]
+    capsys.readouterr()
+    runtime.flush()
+    first = _anchor_lines(capsys.readouterr().out)
+    assert [line["seq"] for line in first] == [0]
+    runtime.audit.record("reveal", "user:1", "vault", {"revealed": 1})
+    tick[0] = 60.0
+    runtime.flush()
+    assert _anchor_lines(capsys.readouterr().out) == []
+    runtime.close()
+    last = _anchor_lines(capsys.readouterr().out)
+    assert [line["seq"] for line in last] == [1]
+    assert last[0]["row_hash"] == runtime.audit.last_hash
+
+
+def test_analyze_runtime_publishes_no_anchor(tmp_path: Path) -> None:
+    runtime = build_runtime(settings(tmp_path), sources(), mode="analyze", init_local_keys=True)
+    assert runtime.anchors is None
     runtime.close()

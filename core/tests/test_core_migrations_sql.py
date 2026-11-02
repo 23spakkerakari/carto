@@ -33,6 +33,15 @@ from carto_core.migrations import (
     render,
 )
 
+ALL_MIGRATIONS = [
+    "0001_events.sql",
+    "0002_event_identifiers.sql",
+    "0003_drop_events.sql",
+    "0004_events_replacing.sql",
+    "0005_drop_event_identifiers.sql",
+    "0006_event_identifiers_replacing.sql",
+]
+
 
 class _Result:
     def __init__(self, rows: list[tuple[Any, ...]]) -> None:
@@ -84,7 +93,7 @@ class FakeClickHouse:
 
 def test_migration_files_are_named_ordered_and_checksummed() -> None:
     migrations = load_clickhouse_migrations()
-    assert [m.name for m in migrations] == ["0001_events.sql", "0002_event_identifiers.sql"]
+    assert [m.name for m in migrations] == ALL_MIGRATIONS
     for migration in migrations:
         assert re.fullmatch(r"[0-9a-f]{64}", migration.checksum)
         expected = hashlib.sha256(migration.sql.encode("utf-8")).hexdigest()
@@ -130,7 +139,7 @@ def _rendered(name: str, days: int) -> str:
 
 
 def test_events_ddl_reproduces_spec_7_2_with_the_configured_ttl() -> None:
-    sql = _rendered("0001_events.sql", 45)
+    sql = _rendered("0004_events_replacing.sql", 45)
     assert "CREATE TABLE IF NOT EXISTS events (" in sql
     for column in (
         "tenant_id LowCardinality(String)",
@@ -148,7 +157,7 @@ def test_events_ddl_reproduces_spec_7_2_with_the_configured_ttl() -> None:
         "actor_kind LowCardinality(Nullable(String))",
     ):
         assert column in sql, column
-    assert ") ENGINE = MergeTree" in sql
+    assert ") ENGINE = ReplacingMergeTree(ingested_at)" in sql, "ADR 0034"
     assert "PARTITION BY toYYYYMMDD(observed_at)" in sql
     assert "ORDER BY (tenant_id, system_id, template_id, observed_at, event_id)" in sql
     assert "TTL toDateTime(observed_at) + INTERVAL 45 DAY;" in sql
@@ -156,7 +165,7 @@ def test_events_ddl_reproduces_spec_7_2_with_the_configured_ttl() -> None:
 
 
 def test_identifiers_ddl_reproduces_spec_7_2_with_the_configured_ttl() -> None:
-    sql = _rendered("0002_event_identifiers.sql", 7)
+    sql = _rendered("0006_event_identifiers_replacing.sql", 7)
     assert "CREATE TABLE IF NOT EXISTS event_identifiers (" in sql
     for column in (
         "tenant_id LowCardinality(String)",
@@ -169,8 +178,10 @@ def test_identifiers_ddl_reproduces_spec_7_2_with_the_configured_ttl() -> None:
         "observed_at DateTime64(3, 'UTC')",
     ):
         assert column in sql, column
+    assert ") ENGINE = ReplacingMergeTree" in sql, "ADR 0034"
     assert "PARTITION BY toYYYYMMDD(observed_at)" in sql
-    assert "ORDER BY (tenant_id, token, observed_at)" in sql
+    # ADR 0034: the event, field and form are in the key, so only true duplicates merge.
+    assert "ORDER BY (tenant_id, token, observed_at, event_id, field_ref, form)" in sql
     assert "TTL toDateTime(observed_at) + INTERVAL 7 DAY;" in sql
 
 
@@ -197,12 +208,17 @@ def test_render_substitutes_every_retention_placeholder() -> None:
 def test_apply_runs_pending_migrations_in_order_and_records_them() -> None:
     client = FakeClickHouse()
     applied = apply_clickhouse_migrations(client, RetentionSettings(events_days=45))
-    assert applied == ["0001_events.sql", "0002_event_identifiers.sql"]
+    assert applied == ALL_MIGRATIONS
     assert client.commands[0].startswith(f"CREATE TABLE IF NOT EXISTS {MIGRATION_TABLE}")
     assert "ENGINE = MergeTree" in client.commands[0] and "ORDER BY name" in client.commands[0]
     assert "CREATE TABLE IF NOT EXISTS events (" in client.commands[1]
     assert "INTERVAL 45 DAY" in client.commands[1]
     assert "CREATE TABLE IF NOT EXISTS event_identifiers (" in client.commands[2]
+    assert "DROP TABLE IF EXISTS events SYNC;" in client.commands[3]
+    assert "ENGINE = ReplacingMergeTree(ingested_at)" in client.commands[4]
+    assert "INTERVAL 45 DAY" in client.commands[4]
+    assert "DROP TABLE IF EXISTS event_identifiers SYNC;" in client.commands[5]
+    assert "ENGINE = ReplacingMergeTree" in client.commands[6]
     assert [name for name, _at, _sum in client.rows] == applied
     assert all(at.tzinfo is not None for _name, at, _sum in client.rows)
     checksums = {m.name: m.checksum for m in load_clickhouse_migrations()}
@@ -217,10 +233,8 @@ def test_apply_runs_only_the_missing_tail() -> None:
     client = FakeClickHouse()
     first = load_clickhouse_migrations()[0]
     client.rows.append((first.name, datetime.fromtimestamp(0, tz=UTC), first.checksum))
-    assert apply_clickhouse_migrations(client, RetentionSettings()) == [
-        "0002_event_identifiers.sql"
-    ]
-    assert not any("CREATE TABLE IF NOT EXISTS events (" in c for c in client.commands)
+    assert apply_clickhouse_migrations(client, RetentionSettings()) == ALL_MIGRATIONS[1:]
+    assert render(first, RetentionSettings()) not in client.commands
 
 
 def test_apply_refuses_an_applied_migration_whose_file_changed() -> None:
@@ -282,17 +296,18 @@ def test_apply_retention_rewrites_an_unreadable_ttl() -> None:
 # --- postgres scripts --------------------------------------------------------------------------
 
 
-def test_postgres_scripts_form_one_linear_history_with_the_m1_revision() -> None:
+def test_postgres_scripts_form_one_linear_history() -> None:
     assert (POSTGRES_MIGRATIONS_DIR / "alembic.ini").is_file()
     assert (POSTGRES_MIGRATIONS_DIR / "env.py").is_file()
     assert (POSTGRES_MIGRATIONS_DIR / "script.py.mako").is_file()
     config = Config()
     config.set_main_option("script_location", str(POSTGRES_MIGRATIONS_DIR))
     script = ScriptDirectory.from_config(config)
-    assert script.get_heads() == ["0001"]
+    assert script.get_heads() == ["0003"]
     revisions = list(script.walk_revisions())
-    assert [revision.revision for revision in revisions] == ["0001"]
-    assert revisions[0].down_revision is None
+    assert [revision.revision for revision in revisions] == ["0003", "0002", "0001"]
+    assert revisions[-1].down_revision is None
+    assert [revision.down_revision for revision in revisions[:-1]] == ["0002", "0001"]
 
 
 def test_clickhouse_migrations_dir_is_the_repository_layout_of_section_20() -> None:

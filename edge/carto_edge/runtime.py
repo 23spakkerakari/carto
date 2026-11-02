@@ -16,21 +16,32 @@ Keys are never created here unless the caller asks (``init_local_keys``, the ana
 convenience for a pilot without ``carto-ctl``): the gateway refuses to start without
 ``carto-ctl key init`` (spec 8.4 "generated at install"). Nothing here logs key material or a
 record value.
+
+In gateway mode :meth:`EdgeRuntime.flush`, which the gateway's housekeeping loop runs every
+``gateway.stats_flush_seconds``, also runs :meth:`EdgeRuntime.housekeeping` on its own hourly
+period: expired reveal vault entries are purged (spec 14.10) and the count is logged and counted
+in ``carto_edge_vault_purged_total``, and the audit anchor is published (ADR 0033,
+:mod:`carto_edge.audit_anchor`). :meth:`EdgeRuntime.close` publishes a last anchor in gateway
+mode, so the anchor log always ends with the row written last.
 """
 
 from __future__ import annotations
 
+import contextlib
+import time
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
-from datetime import datetime
-from typing import Literal
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from typing import Final, Literal
 
 from carto_common.crypto import Keyring
 from carto_common.logging import get_logger
 from carto_edge.audit import EdgeAudit
+from carto_edge.audit_anchor import AnchorPublisher, SyslogAnchorSender
 from carto_edge.config import EdgeSettings, SourcesFile
 from carto_edge.connectors.base import ConnectorContext
 from carto_edge.keys import ROTATION_FILE, KeyManagementError, KeyManager
+from carto_edge.metrics import EdgeMetrics
 from carto_edge.net.ssrf import DefaultNetworkPolicy
 from carto_edge.pipeline.classify import Classifier
 from carto_edge.pipeline.model import PipelineResult
@@ -45,8 +56,10 @@ from carto_edge.secrets import EdgeSecretResolver
 from carto_edge.vault import RevealVault
 
 __all__ = [
+    "HOUSEKEEPING_SECONDS",
     "EdgeRuntime",
     "Mode",
+    "build_anchor_publisher",
     "build_connector_context",
     "build_reveal_service",
     "build_runtime",
@@ -54,6 +67,9 @@ __all__ = [
 ]
 
 Mode = Literal["gateway", "analyze"]
+
+HOUSEKEEPING_SECONDS: Final = 3600.0
+"""Period of :meth:`EdgeRuntime.housekeeping` in gateway mode: hourly."""
 
 log = get_logger(component="carto_edge.runtime")
 
@@ -77,6 +93,11 @@ class EdgeRuntime:
     pipeline: EdgePipeline
     audit: EdgeAudit
     secrets: EdgeSecretResolver | None = None
+    metrics: EdgeMetrics | None = None
+    anchors: AnchorPublisher | None = None
+    housekeeping_seconds: float = HOUSEKEEPING_SECONDS
+    monotonic: Callable[[], float] = field(default=time.monotonic, repr=False)
+    _last_housekeeping: float | None = field(default=None, repr=False)
 
     def __repr__(self) -> str:
         return f"EdgeRuntime(mode={self.mode!r}, key_versions={self.key_versions!r})"
@@ -102,18 +123,56 @@ class EdgeRuntime:
         return self.vault.put_many(entries)
 
     def flush(self) -> None:
-        """Persist templates and, in gateway mode, field statistics."""
-        self.pipeline.flush()
-        if self.stats.path is not None:
-            self.stats.save()
+        """Persist templates and, in gateway mode, field statistics; in gateway mode also run
+        :meth:`housekeeping` when its period has passed. The statistics are saved and the
+        housekeeping runs even when an earlier step fails; an error propagates once every step
+        ran, with any earlier one chained as its context."""
+        try:
+            self.pipeline.flush()
+        finally:
+            try:
+                if self.stats.path is not None:
+                    self.stats.save()
+            finally:
+                if self.mode == "gateway":
+                    self.housekeeping()
+
+    def housekeeping(self, now: datetime | None = None, *, force: bool = False) -> bool:
+        """Hourly chores of the gateway (module docstring). Runs at most once per
+        ``housekeeping_seconds`` unless ``force``; returns whether it ran. A failing chore is
+        logged by exception type and does not stop the others."""
+        tick = self.monotonic()
+        last = self._last_housekeeping
+        if not force and last is not None and tick - last < self.housekeeping_seconds:
+            return False
+        self._last_housekeeping = tick
+        moment = now if now is not None else datetime.now(UTC)
+        try:
+            purged = self.vault.purge_expired(moment)
+        except Exception as exc:  # a failed purge is retried next period
+            log.warning("vault.purge_failed", error=type(exc).__name__)
+        else:
+            log.info("vault.purged", entries=purged)
+            if self.metrics is not None and purged:
+                self.metrics.inc("carto_edge_vault_purged_total", purged)
+        if self.anchors is not None:
+            self.anchors.publish()
+        return True
 
     def close(self) -> None:
-        self.flush()
-        self.templates.close()
-        self.vault.close()
-        self.audit.close()
-        if self.secrets is not None:
-            self.secrets.close()
+        """Flush, publish the last audit anchor in gateway mode, then close the templates, the
+        vault, the audit file and the secret resolver. Every step runs even when an earlier one
+        raises (an error propagates once all steps ran, with any earlier one chained as its
+        context), so a failed flush never leaves the vault or the audit file open."""
+        with contextlib.ExitStack() as stack:  # callbacks run in reverse order of registration
+            if self.secrets is not None:
+                stack.callback(self.secrets.close)
+            stack.callback(self.audit.close)
+            stack.callback(self.vault.close)
+            stack.callback(self.templates.close)
+            if self.anchors is not None:  # the last anchor covers every row written before shutdown
+                stack.callback(self.anchors.publish)
+            stack.callback(self.flush)
 
 
 def ensure_local_keys(keys: KeyManager, settings: EdgeSettings) -> bool:
@@ -144,9 +203,13 @@ def build_runtime(
     clock: Callable[[], datetime] | None = None,
     detector: PiiDetector | None = None,
     init_local_keys: bool = False,
+    range_clock: Callable[[], datetime] | None = None,
 ) -> EdgeRuntime:
     """Build the stack described in the module docstring. Raises
-    :class:`~carto_edge.keys.KeyManagementError` when the keys are missing or unusable."""
+    :class:`~carto_edge.keys.KeyManagementError` when the keys are missing or unusable.
+
+    ``range_clock`` is the time the pipeline checks ``observed_at`` against (ADR 0036); it
+    defaults to ``clock``. The analyzer passes its ``--as-of`` time."""
     settings.state_dir.mkdir(parents=True, exist_ok=True)
     keys = KeyManager(settings, clock=clock)
     if init_local_keys:
@@ -190,7 +253,7 @@ def build_runtime(
         tokenizer=tokenizer,
         tenant_id=tenant_id,
         retention_days=settings.retention.events_days,
-        clock=clock,
+        clock=range_clock if range_clock is not None else clock,
         observe_on_process=not analyze,
         names=names,
     )
@@ -209,6 +272,7 @@ def build_runtime(
         classifier=classifier,
         pipeline=pipeline,
         audit=audit,
+        anchors=None if analyze else build_anchor_publisher(settings, audit),
     )
     log.info(
         "runtime.built",
@@ -221,6 +285,13 @@ def build_runtime(
         quarantine_samples=classify.quarantine_samples,
     )
     return runtime
+
+
+def build_anchor_publisher(settings: EdgeSettings, audit: EdgeAudit) -> AnchorPublisher:
+    """The gateway's audit anchor publisher, with the syslog target when one is configured."""
+    target = settings.audit.anchor_syslog
+    sender = SyslogAnchorSender(target) if target is not None else None
+    return AnchorPublisher(audit, sender=sender)
 
 
 def build_reveal_service(

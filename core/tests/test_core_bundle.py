@@ -1,10 +1,12 @@
-"""Bundle verification and loading (spec 8.1.1, ADR 0022, ADR 0015): a synthetic bundle built
-exactly as carto_schema.bundle describes verifies and streams; any tampering, extra file or
-bad line is refused without echoing content; loads are chunked, derived-id batches that are
-idempotent through the ledger; the CLI wraps both."""
+"""Bundle verification and loading (spec 8.1.1, ADR 0022, ADR 0034, ADR 0036): a synthetic
+bundle built exactly as carto_schema.bundle describes verifies and streams; any tampering,
+extra file or bad line is refused without echoing content; loads are chunked, derived-id
+batches that are idempotent through the ledger's claims and skip events outside the plausible
+range; the CLI wraps both."""
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 from collections.abc import Sequence
@@ -14,8 +16,10 @@ from pathlib import Path
 import pytest
 import zstandard
 
+import carto_core.bundle as bundle_module
 from carto_common.crypto import SigningKey, b64url_encode
 from carto_common.ids import derive_ulid
+from carto_common.settings import RetentionSettings
 from carto_core import cli
 from carto_core.bundle import (
     BundleError,
@@ -26,8 +30,8 @@ from carto_core.bundle import (
     load_bundle,
     verify_bundle,
 )
-from carto_core.db.clickhouse import WriteResult
-from carto_core.ingest.ledger import InMemoryBatchLedger, LedgerEntry
+from carto_core.db.clickhouse import WriterError, WriteResult
+from carto_core.ingest.ledger import ClaimState, InMemoryBatchLedger, LedgerEntry, LedgerError
 from carto_schema.bundle import (
     DATA_FILES,
     EVENTS_FILE,
@@ -48,6 +52,8 @@ from carto_schema.event import CanonicalEvent
 CREATED_AT = datetime(2026, 10, 8, 9, 30, 0, 250000, tzinfo=UTC)
 BUNDLE_ID = "01K71Y5B2XQ0M4N8P3R6S9T1VW"
 BASE_MS = 1_790_000_000_000
+LOAD_NOW = datetime(2026, 10, 8, 10, 0, tzinfo=UTC)
+"""The load clock: the events of BASE_MS (2026-09-21) are inside the plausible range."""
 
 
 class FakeWriter:
@@ -60,6 +66,11 @@ class FakeWriter:
 
     def ping(self) -> bool:
         return True
+
+
+@pytest.fixture(autouse=True)
+def _fixed_load_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(bundle_module, "_utcnow", lambda: LOAD_NOW)
 
 
 def _events(count: int, tenant_id: str = "default") -> list[CanonicalEvent]:
@@ -289,7 +300,7 @@ def test_blank_lines_and_crlf_are_tolerated(tmp_path: Path) -> None:
     assert list(iter_events(verify_bundle(path))) == events
 
 
-# --- loading (ADR 0015) ------------------------------------------------------------------------
+# --- loading (ADR 0034, 0036) ---------------------------------------------------------------
 
 
 def test_load_writes_chunks_with_derived_batch_ids(bundle: Path) -> None:
@@ -326,7 +337,7 @@ def test_an_interrupted_load_resumes_at_the_first_missing_chunk(bundle: Path) ->
     writer, ledger = FakeWriter(), InMemoryBatchLedger()
     created_at_ms = int(CREATED_AT.timestamp() * 1000)
     first = derive_ulid(created_at_ms, BUNDLE_ID, "0")
-    ledger.record(LedgerEntry("default", first, "bundle_x", 5, datetime.now(UTC)))
+    ledger.complete(LedgerEntry("default", first, "bundle_x", 5, LOAD_NOW), LOAD_NOW)
     result = load_bundle(verified, writer, ledger, chunk_size=5)
     assert result == LoadResult(events_written=7, chunks=3, duplicates=1)
     assert [len(batch) for batch in writer.batches] == [5, 2]
@@ -337,6 +348,62 @@ def test_default_chunk_size_is_the_ingest_batch_cap(bundle: Path) -> None:
     writer = FakeWriter()
     assert load_bundle(verified, writer, InMemoryBatchLedger()).chunks == 1
     assert len(writer.batches[0]) == 12
+
+
+def test_events_outside_the_plausible_range_are_skipped_and_counted(tmp_path: Path) -> None:
+    """ADR 0036: an event older than retention would be deleted on arrival, a future one is
+    refused by ingest-api; a bundle loads its recent part and reports the rest."""
+    events = _events(6)
+    old = LOAD_NOW - timedelta(days=40)
+    ahead = LOAD_NOW + timedelta(days=2)
+    events[1] = events[1].model_copy(update={"observed_at": old})
+    events[2] = events[2].model_copy(update={"observed_at": old})
+    events[4] = events[4].model_copy(update={"observed_at": ahead})
+    path = tmp_path / "ranged.carto"
+    _write_bundle(path, events)
+    writer, ledger = FakeWriter(), InMemoryBatchLedger()
+    result = load_bundle(verify_bundle(path), writer, ledger, chunk_size=4)
+    assert result == LoadResult(events_written=3, chunks=2, duplicates=0, too_old=2, future=1)
+    assert [[event.event_id for event in batch] for batch in writer.batches] == [
+        [events[0].event_id, events[3].event_id],
+        [events[5].event_id],
+    ]
+    assert [entry.event_count for entry in ledger.entries] == [4, 2], "chunks cut before"
+
+
+def test_the_load_range_follows_the_configured_retention(bundle: Path) -> None:
+    writer = FakeWriter()
+    result = load_bundle(
+        verify_bundle(bundle),
+        writer,
+        InMemoryBatchLedger(),
+        retention=RetentionSettings(events_days=7),
+    )
+    assert result.too_old == 12 and result.events_written == 0
+    assert writer.batches == [[]]
+
+
+def test_a_chunk_another_load_is_writing_stops_the_load(bundle: Path) -> None:
+    verified = verify_bundle(bundle)
+    ledger = InMemoryBatchLedger()
+    created_at_ms = int(CREATED_AT.timestamp() * 1000)
+    first = derive_ulid(created_at_ms, BUNDLE_ID, "0")
+    entry = LedgerEntry("default", first, "bundle_x", 5, LOAD_NOW - timedelta(seconds=10))
+    assert ledger.claim(entry, LOAD_NOW - timedelta(days=1)).state is ClaimState.CLAIMED
+    with pytest.raises(LedgerError, match="chunk 0 is being loaded by another run"):
+        load_bundle(verified, FakeWriter(), ledger, chunk_size=5)
+
+
+def test_a_failed_chunk_write_releases_its_claim(bundle: Path) -> None:
+    class Failing(FakeWriter):
+        def write_events(self, events: Sequence[CanonicalEvent]) -> WriteResult:
+            raise WriterError("ClickHouse insert failed: DatabaseError")
+
+    ledger = InMemoryBatchLedger()
+    with pytest.raises(WriterError):
+        load_bundle(verify_bundle(bundle), Failing(), ledger, chunk_size=5)
+    assert ledger.rows == ()
+    assert load_bundle(verify_bundle(bundle), FakeWriter(), ledger, chunk_size=5).chunks == 3
 
 
 @pytest.mark.parametrize("size", [0, -1, 5001])
@@ -363,7 +430,9 @@ def test_cli_load_bundle_is_idempotent(
     bundle: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     writer, ledger = FakeWriter(), InMemoryBatchLedger()
-    monkeypatch.setattr(cli, "_open_stores", lambda _settings: (writer, ledger))
+    monkeypatch.setattr(
+        cli, "_open_stores", lambda _settings: contextlib.nullcontext((writer, ledger))
+    )
     assert cli.main(["load-bundle", "--bundle", str(bundle), "--chunk-size", "5"]) == 0
     first = capsys.readouterr().out
     assert "12 events written" in first and "3 chunks" in first

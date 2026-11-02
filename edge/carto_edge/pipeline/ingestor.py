@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Protocol, runtime_checkable
 
-from carto_edge.pipeline.model import RawRecord
+from carto_edge.pipeline.model import ReadItem
 
 __all__ = ["BackpressureState", "IngestOutcome", "IngestorLike"]
 
@@ -52,8 +52,11 @@ class IngestOutcome:
 class IngestorLike(Protocol):
     """Records in, durably buffered batches out."""
 
-    def ingest(self, records: Iterable[RawRecord], *, durable: bool = False) -> IngestOutcome:
+    def ingest(self, records: Iterable[ReadItem], *, durable: bool = False) -> IngestOutcome:
         """Process records; full batches are appended to the buffer before this returns.
+
+        A :class:`~carto_edge.pipeline.model.CursorCheckpoint` among the records (ADR 0035) is
+        no record: it only offers its cursor, committed once every record before it is durable.
 
         With ``durable`` the partial batches of the sources these records belong to are sealed
         and appended too, and a batch the buffer refused is reported as ``buffer_full`` in the

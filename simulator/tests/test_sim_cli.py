@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pytest
 
-from carto_simulator import cli
+from carto_simulator import api, cli
 from carto_simulator.api import GenerationRequest
 from carto_simulator.scenarios import get_scenario, list_scenarios
 
@@ -107,3 +107,23 @@ def test_scenario_refuses_a_request_for_another_scenario(tmp_path: Path) -> None
     request = GenerationRequest(scenario="payer", days=1, daily_volume=1)
     with pytest.raises(ValueError, match="not 'shop'"):
         get_scenario("shop").generate(request, tmp_path)
+
+
+def test_as_of_is_the_start_of_the_day_after_the_run() -> None:
+    """ADR 0036: the time to analyze a fixed-date batch run as of."""
+    assert api.as_of_for(date(2026, 9, 23), 14) == datetime(2026, 10, 7, tzinfo=UTC)
+
+
+def test_as_of_reads_the_runs_manifest(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    out = tmp_path / "shop"
+    api.generate(GenerationRequest(days=2, daily_volume=5, seed=3), out)
+    assert api.run_as_of(out) == datetime(2026, 9, 25, tzinfo=UTC)
+    assert cli.main(["as-of", "--out", str(out)]) == 0
+    assert capsys.readouterr().out.strip() == "2026-09-25T00:00:00Z"
+
+
+def test_as_of_without_a_run_is_a_usage_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert cli.main(["as-of", "--out", str(tmp_path)]) == 2
+    assert "no readable run manifest" in capsys.readouterr().err

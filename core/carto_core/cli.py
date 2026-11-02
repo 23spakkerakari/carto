@@ -23,9 +23,12 @@ listener that requires mutual TLS. Exit 0 on a 2xx, 1 otherwise; the response bo
 from __future__ import annotations
 
 import argparse
+import contextlib
 import ssl
 import sys
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
+from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
@@ -45,11 +48,14 @@ from carto_core.migrations import (
     apply_clickhouse_migrations,
     apply_postgres_migrations,
     apply_retention,
+    migration_lock,
 )
 from carto_core.settings import CoreConfigError, CoreSettings
 from carto_schema.ingest import MAX_EVENTS_PER_BATCH
 
 if TYPE_CHECKING:
+    from clickhouse_connect.driver.client import Client
+
     from carto_core.db.clickhouse import EventWriter
     from carto_core.ingest.ledger import BatchLedger
 
@@ -129,28 +135,35 @@ def _settings() -> CoreSettings | int:
         return _usage(f"invalid settings: {_describe(exc)}")
 
 
+def _migrate_clickhouse(client: Client, settings: CoreSettings) -> None:
+    applied = apply_clickhouse_migrations(client, settings.retention)
+    for name in applied:
+        _emit(f"clickhouse: applied {name}")
+    changed = apply_retention(client, settings.retention)
+    for table in changed:
+        _emit(f"clickhouse: retention of {table} set to {settings.retention.events_days} days")
+    if not applied and not changed:
+        _emit("clickhouse: up to date")
+
+
 def _migrate(args: argparse.Namespace, settings: CoreSettings) -> int:
+    """Both stores under the PostgreSQL advisory lock (``--clickhouse-only`` too, since
+    ClickHouse has no lock of its own), so concurrent migrate runs never interleave."""
     configure_logging(PROG, settings.log_level, settings.log_json)
     try:
-        if not args.postgres_only:
-            client = create_client(settings.clickhouse)
-            applied = apply_clickhouse_migrations(client, settings.retention)
-            for name in applied:
-                _emit(f"clickhouse: applied {name}")
-            changed = apply_retention(client, settings.retention)
-            for table in changed:
-                _emit(
-                    f"clickhouse: retention of {table} set to {settings.retention.events_days} days"
-                )
-            if not applied and not changed:
-                _emit("clickhouse: up to date")
-        if not args.clickhouse_only:
+        with contextlib.ExitStack() as stack:
+            client = None
+            if not args.postgres_only:
+                client = create_client(settings.clickhouse)
+                stack.callback(client.close)
             engine = create_engine_from_settings(settings.postgres)
-            try:
-                apply_postgres_migrations(engine)
-            finally:
-                engine.dispose()
-            _emit("postgres: at head")
+            stack.callback(engine.dispose)
+            with migration_lock(engine):
+                if client is not None:
+                    _migrate_clickhouse(client, settings)
+                if not args.clickhouse_only:
+                    apply_postgres_migrations(engine)
+                    _emit("postgres: at head")
     except (WriterError, MigrationError, SQLAlchemyError, CommandError, CoreConfigError) as exc:
         return _fail(f"migration failed: {_describe(exc)}")
     return EXIT_OK
@@ -178,11 +191,19 @@ def _verify(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
-def _open_stores(settings: CoreSettings) -> tuple[EventWriter, BatchLedger]:
-    """The writer and ledger of the configured stores (tests substitute in-memory ones)."""
+@contextmanager
+def _open_stores(settings: CoreSettings) -> Iterator[tuple[EventWriter, BatchLedger]]:
+    """The writer and ledger of the configured stores, closed on exit (tests substitute
+    in-memory ones)."""
     client = create_client(settings.clickhouse)
-    engine = create_engine_from_settings(settings.postgres)
-    return ClickHouseWriter(client), PostgresBatchLedger(engine)
+    try:
+        engine = create_engine_from_settings(settings.postgres)
+        try:
+            yield ClickHouseWriter(client), PostgresBatchLedger(engine)
+        finally:
+            engine.dispose()
+    finally:
+        client.close()
 
 
 def _load(args: argparse.Namespace, settings: CoreSettings) -> int:
@@ -194,8 +215,15 @@ def _load(args: argparse.Namespace, settings: CoreSettings) -> int:
     except BundleError as exc:
         return _fail(f"bundle rejected: {exc}")
     try:
-        writer, ledger = _open_stores(settings)
-        result = load_bundle(verified, writer, ledger, chunk_size=args.chunk_size)
+        with _open_stores(settings) as (writer, ledger):
+            result = load_bundle(
+                verified,
+                writer,
+                ledger,
+                chunk_size=args.chunk_size,
+                retention=settings.retention,
+                claim_timeout=timedelta(seconds=settings.ingest.claim_timeout_seconds),
+            )
     except BundleError as exc:
         return _fail(f"bundle rejected while loading: {exc}")
     except (WriterError, LedgerError, SQLAlchemyError, CoreConfigError) as exc:
@@ -204,6 +232,11 @@ def _load(args: argparse.Namespace, settings: CoreSettings) -> int:
         f"bundle {verified.manifest.bundle_id} loaded: {result.events_written} events written "
         f"in {result.chunks} chunks, {result.duplicates} chunks already present"
     )
+    if result.too_old or result.future:
+        _emit(
+            f"skipped outside the plausible range (ADR 0036): {result.too_old} events older "
+            f"than retention, {result.future} in the future"
+        )
     return EXIT_OK
 
 

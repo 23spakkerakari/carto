@@ -52,7 +52,7 @@ from carto_edge.pipeline.batch import REASON_BUFFER_FULL, Ingestor
 from carto_edge.pipeline.buffer import DiskBuffer, decompress_batch
 from carto_edge.pipeline.forward import SourceHealth
 from carto_edge.pipeline.ingestor import BackpressureState, IngestOutcome
-from carto_edge.pipeline.model import RawRecord
+from carto_edge.pipeline.model import CursorCheckpoint, RawRecord, ReadItem
 from carto_edge.pipeline.pii import RegexDetector
 from carto_edge.runtime import EdgeRuntime, build_runtime
 from carto_edge.state import CursorStore
@@ -155,9 +155,9 @@ class SpyIngestor:
         self.locators: list[str] = []
         self.flushes = 0
 
-    def ingest(self, records: Iterable[RawRecord], *, durable: bool = False) -> IngestOutcome:
+    def ingest(self, records: Iterable[ReadItem], *, durable: bool = False) -> IngestOutcome:
         batch = list(records)
-        self.locators.extend(record.locator for record in batch)
+        self.locators.extend(record.locator for record in batch if isinstance(record, RawRecord))
         return self.inner.ingest(batch)
 
     def flush(self) -> int:
@@ -180,7 +180,7 @@ class FakeIngestor:
         self.flushes = 0
         self.pressure_calls = 0
 
-    def ingest(self, records: Iterable[RawRecord], *, durable: bool = False) -> IngestOutcome:
+    def ingest(self, records: Iterable[ReadItem], *, durable: bool = False) -> IngestOutcome:
         batch = list(records)
         self.chunks.append(len(batch))
         if self.outcomes:
@@ -679,3 +679,43 @@ def test_a_source_skipped_at_build_time_reports_an_error_in_health(
     assert skipped
     for source_id in skipped:
         assert health.status(source_id) is not SourceStatus.OK
+
+
+class CheckpointConnector(FakeConnector):
+    """Yields its records without cursors, then one cursor-only checkpoint (ADR 0035)."""
+
+    async def read(self, cursor: Cursor | None) -> AsyncIterator[ReadItem]:  # type: ignore[override]
+        self.reads.append(cursor)
+        for i in range(1, self.records + 1):
+            yield RawRecord(
+                source_id=self.source.id,
+                system_id=self.source.system,
+                kind=EventKind.LOG,
+                locator=f"fake:line:{i}",
+                received_at=NOW - timedelta(seconds=self.age),
+                text=web_line(i),
+            )
+        yield CursorCheckpoint(self.source.id, {"window_end": "2026-10-10T09:00:00+00:00"})
+
+
+async def test_a_checkpoint_is_committed_after_the_flush_and_not_counted(
+    runtime: EdgeRuntime, buffer: DiskBuffer, cursors: CursorStore
+) -> None:
+    def factory(source: SourceConfig, context: ConnectorContext) -> ReadConnector:
+        if source.id != "src_web":
+            raise InvalidConfigError("not built in these tests")
+        return CheckpointConnector(source, records=2)
+
+    inner = Ingestor(
+        runtime, buffer, cursors, link=CoreLinkSettings(batch_events=10), metrics=default_metrics()
+    )
+    spy = SpyIngestor(inner)
+    poll = scheduler(runtime, spy, cursors, connector_factory=factory)
+    try:
+        report = await poll.poll_once("src_web")
+        assert report.records == 2  # the checkpoint is not a record
+        assert spy.locators == ["fake:line:1", "fake:line:2"]
+        assert cursors.get("src_web") == {"window_end": "2026-10-10T09:00:00+00:00"}
+        assert buffer.pending_events() == 2
+    finally:
+        await poll.close()

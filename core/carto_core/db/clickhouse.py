@@ -8,19 +8,28 @@ column-oriented, which is what clickhouse-connect sends most cheaply. ``template
 column of ``events`` (spec 7.2) and is not written here; templates live in PostgreSQL (spec 7.3)
 from M2 on.
 
-A failed insert raises :class:`WriterError` naming the error class only, never the rows, so the
-caller can answer 503 and the edge retries the batch (ADR 0015).
+Both tables are partitioned by the day of ``observed_at``, and ClickHouse refuses an insert
+that touches more than 100 partitions. The writer therefore inserts the events of at most
+:data:`MAX_PARTITION_DAYS` days at a time (ADR 0036), each group's events before its
+identifiers. A failure part way leaves the earlier groups written; the batch is not marked done,
+its retry writes them again, and the ``ReplacingMergeTree`` tables merge the copies (ADR 0034).
+
+A failed insert raises :class:`WriterError` naming the error class and code only, never the
+rows. ``permanent`` is set when retrying cannot help, because ClickHouse refused the data
+itself (:data:`PERMANENT_ERROR_CODES`, or the client could not serialize a value): the caller
+answers 422 and the edge parks the batch. Anything else (the server unreachable, overloaded or
+not migrated yet) is transient: 503, and the edge retries.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, date, datetime
 from typing import TYPE_CHECKING, Any, Final, Protocol, runtime_checkable
 
 import clickhouse_connect
-from clickhouse_connect.driver.exceptions import ClickHouseError
+from clickhouse_connect.driver.exceptions import ClickHouseError, DataError
 
 if TYPE_CHECKING:
     from clickhouse_connect.driver.client import Client
@@ -33,6 +42,8 @@ __all__ = [
     "EVENT_COLUMNS",
     "EVENT_IDENTIFIERS_TABLE",
     "IDENTIFIER_COLUMNS",
+    "MAX_PARTITION_DAYS",
+    "PERMANENT_ERROR_CODES",
     "ClickHouseWriter",
     "EventRow",
     "EventWriter",
@@ -45,7 +56,39 @@ __all__ = [
     "event_row",
     "field_ref",
     "identifier_rows",
+    "is_permanent",
+    "partition_day_groups",
 ]
+
+MAX_PARTITION_DAYS: Final = 90
+"""Most partition days one insert touches; ClickHouse's ``max_partitions_per_insert_block``
+default is 100 (ADR 0036)."""
+
+PERMANENT_ERROR_CODES: Final[frozenset[int]] = frozenset(
+    {
+        6,  # CANNOT_PARSE_TEXT
+        9,  # SIZES_OF_COLUMNS_DOESNT_MATCH
+        25,  # CANNOT_PARSE_ESCAPE_SEQUENCE
+        26,  # CANNOT_PARSE_QUOTED_STRING
+        27,  # CANNOT_PARSE_INPUT_ASSERTION_FAILED
+        38,  # CANNOT_PARSE_DATE
+        41,  # CANNOT_PARSE_DATETIME
+        43,  # ILLEGAL_TYPE_OF_ARGUMENT
+        53,  # TYPE_MISMATCH
+        69,  # ARGUMENT_OUT_OF_BOUND
+        70,  # CANNOT_CONVERT_TYPE
+        72,  # CANNOT_PARSE_NUMBER
+        117,  # INCORRECT_DATA
+        131,  # TOO_LARGE_STRING_SIZE
+        321,  # VALUE_IS_OUT_OF_RANGE_OF_DATA_TYPE
+        349,  # CANNOT_INSERT_NULL_IN_ORDINARY_COLUMN
+        565,  # TOO_MANY_PARTITIONS
+    }
+)
+"""ClickHouse server error codes (``src/Common/ErrorCodes.cpp``) that refuse the data of an
+insert, so the same batch fails the same way every time. Code 252 (``TOO_MANY_PARTS``) is not
+here: ClickHouse 24.8 raises it both for "too many partitions for a single insert", which the
+day groups prevent, and for "merges are slower than inserts", which passes."""
 
 EVENTS_TABLE: Final = "events"
 EVENT_IDENTIFIERS_TABLE: Final = "event_identifiers"
@@ -101,7 +144,12 @@ type IdentifierRow = tuple[str, str, str, str, str, str, str, datetime]
 
 
 class WriterError(Exception):
-    """ClickHouse did not take the write. The message names the cause, never the rows."""
+    """ClickHouse did not take the write. The message names the cause, never the rows;
+    ``permanent`` is set when the same rows would fail again."""
+
+    def __init__(self, message: str, *, permanent: bool = False) -> None:
+        super().__init__(message)
+        self.permanent = permanent
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,6 +226,35 @@ def identifier_rows(event: CanonicalEvent) -> list[IdentifierRow]:
     ]
 
 
+def is_permanent(exc: BaseException) -> bool:
+    """True when ClickHouse refused the data itself (see :data:`PERMANENT_ERROR_CODES`)."""
+    if isinstance(exc, DataError):
+        return True
+    code = getattr(exc, "code", None)
+    return isinstance(code, int) and code in PERMANENT_ERROR_CODES
+
+
+def _partition_day(event: CanonicalEvent) -> date:
+    """``toYYYYMMDD(observed_at)`` of the DDL: the UTC day."""
+    return event.observed_at.astimezone(UTC).date()
+
+
+def partition_day_groups(
+    events: Sequence[CanonicalEvent], max_days: int = MAX_PARTITION_DAYS
+) -> Iterator[list[CanonicalEvent]]:
+    """The events in groups spanning at most ``max_days`` partition days, oldest days first;
+    within a day the batch order is kept."""
+    by_day: dict[date, list[CanonicalEvent]] = {}
+    for event in events:
+        by_day.setdefault(_partition_day(event), []).append(event)
+    days = sorted(by_day)
+    for start in range(0, len(days), max_days):
+        group: list[CanonicalEvent] = []
+        for day in days[start : start + max_days]:
+            group.extend(by_day[day])
+        yield group
+
+
 def columns_of(rows: Sequence[Sequence[Any]], width: int) -> list[list[Any]]:
     """Transpose rows into ``width`` column lists (clickhouse-connect ``column_oriented``)."""
     columns: list[list[Any]] = [[] for _ in range(width)]
@@ -196,9 +273,16 @@ class ClickHouseWriter:
         self._client = client
 
     def write_events(self, events: Sequence[CanonicalEvent]) -> WriteResult:
-        """Insert every event and its identifier forms. Raises :class:`WriterError` on failure."""
-        if not events:
-            return WriteResult(events=0, identifiers=0)
+        """Insert every event and its identifier forms, at most :data:`MAX_PARTITION_DAYS`
+        partition days per insert. Raises :class:`WriterError` on failure."""
+        events_written = identifiers_written = 0
+        for group in partition_day_groups(events):
+            result = self._write_group(group)
+            events_written += result.events
+            identifiers_written += result.identifiers
+        return WriteResult(events=events_written, identifiers=identifiers_written)
+
+    def _write_group(self, events: Sequence[CanonicalEvent]) -> WriteResult:
         rows = [event_row(event) for event in events]
         id_rows: list[IdentifierRow] = []
         for event in events:
@@ -218,8 +302,10 @@ class ClickHouseWriter:
                     column_oriented=True,
                 )
         except (ClickHouseError, OSError) as exc:
-            msg = f"ClickHouse insert failed: {type(exc).__name__}"
-            raise WriterError(msg) from exc
+            code = getattr(exc, "code", None)
+            suffix = f" (code {code})" if isinstance(code, int) else ""
+            msg = f"ClickHouse insert failed: {type(exc).__name__}{suffix}"
+            raise WriterError(msg, permanent=is_permanent(exc)) from exc
         return WriteResult(events=len(rows), identifiers=len(id_rows))
 
     def ping(self) -> bool:
@@ -233,6 +319,7 @@ class ClickHouseWriter:
 def create_client(settings: ClickHouseSettings) -> Client:
     """Connect with the configured user; the password comes from ``password_file`` (spec 14.4).
 
+    The client is sessionless because ``ingest-api`` shares it across concurrent requests.
     Raises :class:`WriterError` when the server cannot be reached or refuses the login; the
     message never includes the password.
     """
@@ -248,6 +335,9 @@ def create_client(settings: ClickHouseSettings) -> Client:
             ca_cert=str(settings.ca_file) if settings.ca_file is not None else None,
             connect_timeout=timeout,
             send_receive_timeout=timeout,
+            # One client serves every threadpool worker. With a session id each concurrent
+            # request would wait for, or fail with, SESSION_IS_LOCKED; nothing needs a session.
+            autogenerate_session_id=False,
         )
     except (ClickHouseError, OSError) as exc:
         msg = (

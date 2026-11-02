@@ -4,9 +4,12 @@ ingest-api command refuses to start without its TLS files before touching any da
 
 from __future__ import annotations
 
+import contextlib
 import os
 import sys
+from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -14,6 +17,8 @@ import pytest
 from carto_common.pki import create_ca, issue_certificate, write_pem
 from carto_core import cli
 from carto_core.cli import EXIT_FAILURE, EXIT_OK, EXIT_USAGE, build_parser, main
+from carto_core.db.clickhouse import ClickHouseWriter
+from carto_core.ingest.ledger import PostgresBatchLedger
 from carto_core.settings import CoreSettings
 
 
@@ -166,3 +171,75 @@ def test_healthcheck_against_nothing_listening_is_a_failure(
 
 def test_module_entry_point_matches_main() -> None:
     assert sys.modules["carto_core.cli"].main is main
+
+
+class _Closable:
+    def __init__(self) -> None:
+        self.closed = 0
+
+    def close(self) -> None:
+        self.closed += 1
+
+    def dispose(self) -> None:
+        self.closed += 1
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_open_stores_closes_the_client_and_disposes_the_engine(
+    monkeypatch: pytest.MonkeyPatch, fail: bool
+) -> None:
+    client, engine = _Closable(), _Closable()
+    monkeypatch.setattr(cli, "create_client", lambda _settings: client)
+    monkeypatch.setattr(cli, "create_engine_from_settings", lambda _settings: engine)
+    expected = pytest.raises(RuntimeError) if fail else contextlib.nullcontext()
+    with expected, cli._open_stores(CoreSettings()) as (writer, ledger):
+        assert isinstance(writer, ClickHouseWriter)
+        assert isinstance(ledger, PostgresBatchLedger)
+        if fail:
+            raise RuntimeError("load failed")
+    assert client.closed == 1
+    assert engine.closed == 1
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        (["migrate"], ["lock", "clickhouse", "retention", "postgres", "unlock"]),
+        (["migrate", "--clickhouse-only"], ["lock", "clickhouse", "retention", "unlock"]),
+        (["migrate", "--postgres-only"], ["lock", "postgres", "unlock"]),
+    ],
+)
+def test_migrate_runs_both_stores_under_the_advisory_lock(
+    monkeypatch: pytest.MonkeyPatch, argv: list[str], expected: list[str]
+) -> None:
+    """Two migrate jobs at once (a Compose restart, two pods) must not interleave: every
+    ClickHouse and PostgreSQL step runs while the PostgreSQL advisory lock is held."""
+    steps: list[str] = []
+    client, engine = _Closable(), _Closable()
+    monkeypatch.setattr(cli, "create_client", lambda _settings: client)
+    monkeypatch.setattr(cli, "create_engine_from_settings", lambda _settings: engine)
+
+    @contextlib.contextmanager
+    def fake_lock(locked_engine: object) -> Iterator[None]:
+        assert locked_engine is engine
+        steps.append("lock")
+        try:
+            yield
+        finally:
+            steps.append("unlock")
+
+    def step(name: str, result: list[str]) -> Any:
+        def run(*_args: object, **_kwargs: object) -> list[str]:
+            steps.append(name)
+            return result
+
+        return run
+
+    monkeypatch.setattr(cli, "migration_lock", fake_lock)
+    monkeypatch.setattr(cli, "apply_clickhouse_migrations", step("clickhouse", []))
+    monkeypatch.setattr(cli, "apply_retention", step("retention", []))
+    monkeypatch.setattr(cli, "apply_postgres_migrations", step("postgres", []))
+    assert main(argv) == EXIT_OK
+    assert steps == expected
+    assert engine.closed == 1
+    assert client.closed == (0 if "--postgres-only" in argv else 1)

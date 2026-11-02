@@ -242,6 +242,54 @@ async def test_breaker_call_wraps_an_operation() -> None:
     assert state(breaker) is CircuitState.CLOSED
 
 
+async def test_breaker_cancelled_half_open_probe_frees_the_probe_slot() -> None:
+    """A probe cancelled mid-flight (a poll stopped at shutdown or by a timeout) must not leave
+    the breaker half-open with a probe "in flight" forever; cancellation is not a failure."""
+    clock = Clock()
+    breaker = CircuitBreaker(failure_threshold=1, reset_seconds=10.0, clock=clock)
+
+    async def boom() -> None:
+        raise ConnectionError
+
+    with pytest.raises(ConnectionError):
+        await breaker.call(boom)
+    clock.now += 10.0
+    started = asyncio.Event()
+
+    async def slow() -> None:
+        started.set()
+        await asyncio.sleep(3600)
+
+    task = asyncio.create_task(breaker.call(slow))
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert breaker.failures == 1  # the cancelled probe was not counted
+    assert state(breaker) is CircuitState.HALF_OPEN
+
+    async def fine() -> str:
+        return "fine"
+
+    assert await breaker.call(fine) == "fine"
+    assert state(breaker) is CircuitState.CLOSED
+
+
+async def test_breaker_cancelled_call_while_closed_counts_nothing() -> None:
+    breaker = CircuitBreaker(failure_threshold=1, reset_seconds=10.0, clock=Clock())
+
+    async def slow() -> None:
+        await asyncio.sleep(3600)
+
+    task = asyncio.create_task(breaker.call(slow))
+    await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert state(breaker) is CircuitState.CLOSED
+    assert breaker.failures == 0
+
+
 def test_breaker_rejects_bad_parameters() -> None:
     with pytest.raises(ValueError, match="failure_threshold"):
         CircuitBreaker(failure_threshold=0, reset_seconds=1.0)

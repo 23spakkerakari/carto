@@ -8,6 +8,7 @@ schemas).
 from __future__ import annotations
 
 import os
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -15,6 +16,7 @@ from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
 
 from carto_common.settings import (
     MAX_SECRET_REF_LENGTH,
+    OBSERVED_AT_SLACK,
     SECRET_REF_SCHEMES,
     CartoBaseSettings,
     LlmSettings,
@@ -119,6 +121,15 @@ def test_retention_rejects_unknown_fields() -> None:
     with pytest.raises(ValidationError, match=r"extra_forbidden|Extra inputs"):
         unknown: dict[str, Any] = {"reveal_vault_days": 30}
         RetentionSettings(**unknown)
+
+
+def test_the_plausible_observed_at_range_is_retention_plus_a_day_back_and_a_day_ahead() -> None:
+    """ADR 0036: ``now - events_days - 1 day`` to ``now + 1 day``."""
+    now = datetime(2026, 10, 15, 12, 0, tzinfo=UTC)
+    lower, upper = RetentionSettings(events_days=45).observed_at_range(now)
+    assert lower == datetime(2026, 8, 30, 12, 0, tzinfo=UTC)
+    assert upper == datetime(2026, 10, 16, 12, 0, tzinfo=UTC)
+    assert timedelta(days=1) == OBSERVED_AT_SLACK
 
 
 # ---------------------------------------------------------------------------------------------

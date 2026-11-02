@@ -29,7 +29,13 @@ EDGE_SERIES: Final[tuple[tuple[str, Kind, str], ...]] = (
     ("carto_edge_records_total", "counter", "Raw records handed to the pipeline, by source."),
     ("carto_edge_events_total", "counter", "Canonical events produced, by source."),
     ("carto_edge_dropped_total", "counter", "Records dropped, by source and reason."),
+    (
+        "carto_edge_events_out_of_range_total",
+        "counter",
+        "Records whose time lay outside the plausible range, by source and reason (ADR 0036).",
+    ),
     ("carto_edge_vault_entries_total", "counter", "Reveal vault entries written."),
+    ("carto_edge_vault_purged_total", "counter", "Expired reveal vault entries purged."),
     ("carto_edge_batches_sealed_total", "counter", "Batches appended to the disk buffer."),
     ("carto_edge_batches_sent_total", "counter", "Batches acknowledged by ingest-api."),
     ("carto_edge_batches_parked_total", "counter", "Batches ingest-api refused for good."),

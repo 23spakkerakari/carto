@@ -3,7 +3,7 @@
 psycopg 3 through SQLAlchemy 2. The password is read from ``password_file`` at engine creation
 and lives only inside the :class:`sqlalchemy.engine.URL`, whose ``repr`` and ``str`` mask it, so
 a logged engine never shows it. ``sslmode`` is passed to libpq as configured (default
-``require``) together with ``sslrootcert`` when a CA file is set.
+``verify-full``) together with ``sslrootcert`` when a CA file is set.
 """
 
 from __future__ import annotations

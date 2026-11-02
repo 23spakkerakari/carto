@@ -59,6 +59,7 @@ from carto_edge.pipeline.parser import (
     REASON_TOO_LARGE,
     REASON_UNPARSEABLE,
 )
+from carto_edge.pipeline.pipeline import OUT_OF_RANGE_FUTURE, REASON_TOO_OLD
 from carto_edge.pipeline.templates import TemplateRecord
 from carto_schema.bundle import (
     BUNDLE_VERSION,
@@ -189,6 +190,7 @@ class BundleWriter:
         self._sources: dict[str, SourceTally] = {}
         self._templates: dict[str, _TemplateTally] = {}
         self._identifiers = 0
+        self._out_of_range: Counter[str] = Counter()
         self._first: datetime | None = None
         self._last: datetime | None = None
         self._finished = False
@@ -283,6 +285,8 @@ class BundleWriter:
             raise BundleWriteError(msg)
         tally = self.tally(source_id)
         tally.records_read += 1
+        if result.out_of_range is not None:
+            self._out_of_range[result.out_of_range] += 1
         if event is None:
             reason = result.dropped_reason or _UNKNOWN_REASON
             tally.records_dropped += 1
@@ -379,6 +383,8 @@ class BundleWriter:
             fields_kept=sum(1 for f in field_list if f.policy == "keep"),
             fields_tokenized=sum(1 for f in field_list if f.policy == "tokenize"),
             fields_dropped=sum(1 for f in field_list if f.policy == "drop"),
+            events_too_old=self._out_of_range[REASON_TOO_OLD],
+            events_future=self._out_of_range[OUT_OF_RANGE_FUTURE],
         )
         draft = BundleManifest(
             bundle_version=BUNDLE_VERSION,
@@ -423,7 +429,7 @@ class BundleWriter:
             sources=len(summaries),
             fields=len(field_list),
             templates=len(template_list),
-            signature_key_id=signature.key_id,
+            signing_key_id=signature.key_id,  # "signature" names a secret (ADR 0010)
         )
         return manifest
 
@@ -596,6 +602,8 @@ def render_manifest_md(
                 ("Events", _n(counts.events)),
                 ("Records dropped", _n(counts.records_dropped)),
                 ("Parse errors", _n(counts.parse_errors)),
+                ("Dropped as older than retention (ADR 0036)", _n(counts.events_too_old)),
+                ("Future times replaced by ingest time", _n(counts.events_future)),
                 ("Identifier tokens", _n(counts.identifiers)),
                 ("Fields kept / tokenized / dropped", _fields_line(counts)),
                 ("First observed", _ts(manifest.first_observed_at)),

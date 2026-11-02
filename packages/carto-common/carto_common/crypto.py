@@ -28,6 +28,7 @@ import base64
 import hashlib
 import hmac
 import json
+import os
 import secrets
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -64,11 +65,13 @@ __all__ = [
     "b64url_decode",
     "b64url_encode",
     "canonical_context",
+    "fsync_directory",
     "generate_key",
     "key_fingerprint",
     "sign_assertion",
     "token",
     "verify_assertion",
+    "write_private_file",
 ]
 
 KEY_BYTES: Final = 32
@@ -97,6 +100,11 @@ TokenDomain = Literal["id", "date", "amt", "ph"]
 depend on carto-schema."""
 
 KmsProvider = Literal["local", "vault"]
+
+PRIVATE_FILE_MODE: Final = 0o600
+_O_BINARY: Final = getattr(os, "O_BINARY", 0)
+"""Windows opens descriptors in text mode unless told otherwise; key bytes must not be
+translated."""
 
 
 class CryptoError(Exception):
@@ -289,6 +297,43 @@ class AesGcmBox:
 # ---------------------------------------------------------------------------------------------
 
 
+def fsync_directory(directory: Path) -> None:
+    """Make a create, rename or delete in ``directory`` durable. Windows has no directory
+    handle to sync; NTFS journals the rename itself."""
+    if os.name == "nt":
+        return
+    descriptor = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _create_private(path: Path, data: bytes) -> None:
+    """Create ``path`` (it must not exist) owner-only from the first instant, write and fsync."""
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_BINARY, PRIVATE_FILE_MODE)
+    with os.fdopen(descriptor, "wb") as handle:
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def write_private_file(path: Path, data: bytes) -> None:
+    """Replace ``path`` with ``data`` atomically and durably, owner-only (0600) from creation:
+    a temporary file is created exclusively with mode 0600, written and fsynced, renamed over
+    ``path``, and the directory is fsynced. A crash leaves the old file or the new one."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.unlink(missing_ok=True)  # left by a crash; never another writer's (one writer)
+    try:
+        _create_private(temporary, data)
+        temporary.replace(path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    fsync_directory(path.parent)
+
+
 class WrappedKey(BaseModel):
     """Key material at rest: the KMS ciphertext plus what is needed to unwrap it.
 
@@ -317,8 +362,8 @@ class WrappedKey(BaseModel):
         return value.astimezone(UTC)
 
     def write(self, path: Path) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(self.model_dump_json(indent=2) + "\n", encoding="utf-8", newline="\n")
+        """Atomically, durably and owner-only (:func:`write_private_file`)."""
+        write_private_file(path, (self.model_dump_json(indent=2) + "\n").encode("utf-8"))
 
     @classmethod
     def read(cls, path: Path) -> Self:
@@ -391,15 +436,17 @@ class LocalKms:
 
     @classmethod
     def create(cls, path: Path) -> Self:
-        """Create a new master key file; refuses to overwrite an existing one."""
-        if path.exists():
-            msg = f"refusing to overwrite existing key file {path}"
-            raise CryptoError(msg)
+        """Create a new master key file; refuses to overwrite an existing one. The file is
+        created exclusively with mode 0600 (never readable by others, not even for an instant)
+        and fsynced with its directory."""
         path.parent.mkdir(parents=True, exist_ok=True)
         material = generate_key()
-        with path.open("xb") as handle:
-            handle.write(material)
-        path.chmod(0o600)
+        try:
+            _create_private(path, material)
+        except FileExistsError as exc:
+            msg = f"refusing to overwrite existing key file {path}"
+            raise CryptoError(msg) from exc
+        fsync_directory(path.parent)
         return cls(material)
 
     @classmethod

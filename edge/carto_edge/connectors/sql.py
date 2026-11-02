@@ -1,37 +1,44 @@
 """SQL polling connector for PostgreSQL, MySQL and SQL Server (spec 8.1.4).
 
 Admin-written query templates (Appendix A) are checked by ``sqlglot`` at construction
-(:func:`carto_edge.connectors.sql_dialects.check_statement`: one SELECT, ``:watermark`` and
-``:batch`` only), run through SQLAlchemy 2 core ``text()`` on synchronous engines driven with
-``asyncio.to_thread``, inside read-only sessions (PostgreSQL ``default_transaction_read_only``
-plus ``BEGIN READ ONLY``; MySQL ``START TRANSACTION READ ONLY``; SQL Server
-``ApplicationIntent=ReadOnly``). ``test()`` runs every query with ``batch=1`` and then inspects
-the login's privileges on every referenced table; a login that can INSERT, UPDATE, DELETE or
-alter anything makes the result ``WRITE_CAPABLE`` and the source cannot be enabled.
+(:func:`carto_edge.connectors.sql_dialects.check_statement`: one SELECT, ``:watermark``,
+``:batch`` and, for time-typed watermarks, ``:upper``), run through SQLAlchemy 2 core ``text()``
+on synchronous engines driven with ``asyncio.to_thread``, inside read-only sessions (PostgreSQL
+``default_transaction_read_only`` plus ``BEGIN READ ONLY``; MySQL ``START TRANSACTION READ
+ONLY``; SQL Server ``ApplicationIntent=ReadOnly``). ``test()`` runs every query with ``batch=1``
+and then inspects the login's privileges on every referenced table; a login that can INSERT,
+UPDATE, DELETE or alter anything makes the result ``WRITE_CAPABLE`` and the source cannot be
+enabled.
 
 Each poll opens a fresh DBAPI connection (``NullPool``) through a ``creator``, so credentials are
 resolved at use (spec 14.3) and the host is validated by the network policy at every connect
 (spec 14.7): PostgreSQL pins the address with ``hostaddr``; MySQL and SQL Server connect by
 name after validation (ADR 0018).
 
+Cursors (ADR 0035, :mod:`carto_edge.connectors.sql_watermarks`): each query has a typed
+watermark (``watermark_type``: ``datetime``, ``date``, ``int`` or ``decimal``). A time-typed
+query reads the closed range ``(:watermark, :upper]`` where ``:upper`` is the database's own
+clock, read at the start of the poll, minus ``settle_seconds`` (default 30); when the range is
+fully read the cursor moves to ``:upper``, even if it held no row. Integer and decimal queries
+advance on the rows found. On a full page the cursor stops below the page's largest value so a
+tie group is never split. The cursor ``{"watermarks": {name: {"t", "v"}}}`` travels in a
+:class:`~carto_edge.pipeline.model.CursorCheckpoint` after every page that moved it.
+
 Records: ``fields`` is the row as Python values (the parser stringifies), locator
 ``<query name>:row:<primary key>`` (ADR 0006), kind ``row_change``, template hint
-``row_change <query name>`` (ADR 0016); the last record of a page carries
-``commit_cursor={"watermarks": {name: value}}``. Rows that share the largest watermark value of
-a full page can be re-read on the next poll (at-least-once; core dedupes by ``event_id``).
+``row_change <query name>`` (ADR 0016).
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import re
 import time
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping
 from contextlib import contextmanager
-from datetime import UTC, date, datetime, timedelta
-from decimal import Decimal
+from datetime import UTC, datetime, timedelta
 from typing import Any, ClassVar, Final, Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import Field, field_validator, model_validator
 from sqlalchemy import Connection, Engine, create_engine, text
@@ -51,6 +58,7 @@ from carto_edge.connectors.base import (
 )
 from carto_edge.connectors.registry import register, validate_config_model
 from carto_edge.connectors.sql_dialects import (
+    CLOCK_SQL,
     CheckedStatement,
     Dialect,
     check_statement,
@@ -61,9 +69,21 @@ from carto_edge.connectors.sql_dialects import (
     privilege_queries,
     write_findings,
 )
+from carto_edge.connectors.sql_watermarks import (
+    TIME_TYPES,
+    Watermark,
+    WatermarkError,
+    WatermarkType,
+    coerce,
+    decode,
+    encode,
+    initial,
+    plan_page,
+    upper_bound,
+)
 from carto_edge.net.retry import CircuitBreaker
 from carto_edge.net.ssrf import SsrfError
-from carto_edge.pipeline.model import RawRecord
+from carto_edge.pipeline.model import CursorCheckpoint, RawRecord, ReadItem
 from carto_edge.secrets import Credentials, SecretError, parse_credentials
 from carto_schema.event import EventKind
 
@@ -77,11 +97,6 @@ DRIVERS: Final[dict[str, str]] = {
     "mysql": "mysql+pymysql",
     "mssql": "mssql+pyodbc",
 }
-EPOCH: Final = datetime(1970, 1, 1, tzinfo=UTC)
-_ISO_DATETIME: Final = re.compile(
-    r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})?$"
-)
-_ISO_DATE: Final = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 MAX_ERROR_CHARS: Final = 200
 
 SslMode = Literal["disable", "allow", "prefer", "require", "verify-ca", "verify-full"]
@@ -97,9 +112,37 @@ class SqlQueryConfig(ConnectorConfig):
     name: str = Field(pattern=r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
     sql: str = Field(min_length=1, max_length=16_384)
     watermark_column: str = Field(min_length=1, max_length=128)
+    watermark_type: WatermarkType = Field(
+        default="datetime",
+        description="datetime, date, int or decimal (ADR 0035); time types need :upper.",
+    )
+    watermark_timezone: str = Field(
+        default="UTC",
+        max_length=64,
+        description="IANA zone of naive watermark values; :upper is computed in it.",
+    )
     timestamp_column: str | None = Field(default=None, max_length=128)
     actor_column: str | None = Field(default=None, max_length=128)
     primary_key: str | None = Field(default=None, max_length=128)
+
+    @field_validator("watermark_timezone")
+    @classmethod
+    def _known_zone(cls, value: str) -> str:
+        try:
+            ZoneInfo(value)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            msg = "watermark_timezone must be an IANA time zone name"
+            raise ValueError(msg) from exc
+        return value
+
+    @property
+    def zone(self) -> ZoneInfo:
+        return ZoneInfo(self.watermark_timezone)
+
+    @property
+    def time_range(self) -> bool:
+        """Whether the template reads the closed range ``(:watermark, :upper]``."""
+        return self.watermark_type in TIME_TYPES
 
 
 class SqlConfig(ConnectorConfig):
@@ -118,6 +161,12 @@ class SqlConfig(ConnectorConfig):
     connect_timeout_seconds: int = Field(default=10, ge=1, le=300)
     batch: int = Field(default=1000, ge=1, le=100_000)
     max_pages_per_read: int = Field(default=100, ge=1, le=10_000)
+    settle_seconds: int = Field(
+        default=30,
+        ge=0,
+        le=86_400,
+        description=":upper is the database clock minus this (ADR 0035): late commits settle.",
+    )
     failure_threshold: int = Field(default=5, ge=1, le=100)
     breaker_reset_seconds: float = Field(default=60.0, gt=0, le=3600)
     queries: list[SqlQueryConfig] = Field(min_length=1, max_length=64)
@@ -137,55 +186,6 @@ class SqlConfig(ConnectorConfig):
             msg = "query names must be unique"
             raise ValueError(msg)
         return self
-
-
-def _encode_watermark(value: object) -> object:
-    if isinstance(value, datetime):
-        moment = value if value.tzinfo is None else value.astimezone(UTC).replace(tzinfo=None)
-        return moment.isoformat()
-    if isinstance(value, date):
-        return value.isoformat()
-    if isinstance(value, bool | int | float):
-        return value
-    if isinstance(value, Decimal):
-        return str(value)
-    return str(value)
-
-
-def _decode_watermark(value: object) -> object:
-    if isinstance(value, str):
-        if _ISO_DATETIME.match(value):
-            try:
-                moment = datetime.fromisoformat(value)
-            except ValueError:
-                return value
-            return moment.astimezone(UTC).replace(tzinfo=None) if moment.tzinfo else moment
-        if _ISO_DATE.match(value):
-            try:
-                return date.fromisoformat(value)
-            except ValueError:
-                return value
-    return value
-
-
-def _naive_utc(moment: datetime) -> datetime:
-    return moment.astimezone(UTC).replace(tzinfo=None) if moment.tzinfo else moment
-
-
-def _max_watermark(rows: list[dict[str, Any]], column: str, current: object) -> object:
-    best = current
-    for row in rows:
-        value = row.get(column)
-        if value is None:
-            continue
-        if isinstance(value, datetime):
-            value = _naive_utc(value)
-        try:
-            if best is None or value > best:  # type: ignore[operator]
-                best = value
-        except TypeError:
-            continue
-    return best
 
 
 def _dbapi_connect(dialect: str, plan: ConnectionPlan) -> Any:
@@ -247,7 +247,9 @@ class SqlConnector:
         self.statements: dict[str, CheckedStatement] = {}
         for query in self.config.queries:
             try:
-                self.statements[query.name] = check_statement(query.sql, self.config.dialect)
+                self.statements[query.name] = check_statement(
+                    query.sql, self.config.dialect, upper=query.time_range
+                )
             except InvalidConfigError as exc:
                 msg = f"source {source.id!r} query {query.name!r}: {exc}"
                 raise InvalidConfigError(msg) from exc
@@ -386,12 +388,29 @@ class SqlConnector:
     async def _run_async(self, sql: str, params: Mapping[str, Any]) -> list[dict[str, Any]]:
         return await self._breaker.call(lambda: asyncio.to_thread(self._run, sql, params))
 
+    async def _database_now(self) -> datetime:
+        """The database's own clock as an aware UTC datetime (ADR 0035 item 3), read through
+        the same read-only session as the queries."""
+        rows = await self._run_async(CLOCK_SQL[self.config.dialect], {})
+        value = next(iter(rows[0].values()), None) if rows else None
+        if not isinstance(value, datetime):
+            msg = f"source {self.source.id!r}: the database clock did not return a timestamp"
+            raise ConnectorError(msg)
+        return value.astimezone(UTC) if value.tzinfo else value.replace(tzinfo=UTC)
+
+    async def _settled_clock(self) -> datetime | None:
+        """Database clock minus ``settle_seconds``; ``None`` when no query reads a time range."""
+        if not any(query.time_range for query in self.config.queries):
+            return None
+        return await self._database_now() - timedelta(seconds=self.config.settle_seconds)
+
     # -- records --------------------------------------------------------------------------------
 
-    def _initial_watermark(self) -> object:
+    def _initial_watermark(self, query: SqlQueryConfig) -> Watermark:
+        since = None
         if self.source.backfill_days:
-            return _naive_utc(self._clock() - timedelta(days=self.source.backfill_days))
-        return _naive_utc(EPOCH)
+            since = self._clock() - timedelta(days=self.source.backfill_days)
+        return initial(query.watermark_type, since, query.zone)
 
     def _record(self, query: SqlQueryConfig, row: dict[str, Any], now: datetime) -> RawRecord:
         key_column = query.primary_key or next(iter(row), "")
@@ -416,65 +435,99 @@ class SqlConnector:
             actor_field=query.actor_column,
         )
 
-    @staticmethod
-    def _with_cursor(record: RawRecord, watermarks: Mapping[str, object]) -> RawRecord:
-        return RawRecord(
-            source_id=record.source_id,
-            system_id=record.system_id,
-            kind=record.kind,
-            locator=record.locator,
-            received_at=record.received_at,
-            fields=record.fields,
-            sequence=record.sequence,
-            commit_cursor={
-                "watermarks": {name: _encode_watermark(value) for name, value in watermarks.items()}
+    def _decode_cursor(self, cursor: Cursor | None) -> dict[str, Watermark]:
+        raw = cursor.get("watermarks") if cursor else None
+        if not isinstance(raw, Mapping):
+            return {}
+        watermarks: dict[str, Watermark] = {}
+        for query in self.config.queries:
+            if query.name not in raw:
+                continue
+            try:
+                watermarks[query.name] = decode(query.watermark_type, raw[query.name])
+            except WatermarkError as exc:
+                msg = f"source {self.source.id!r} query {query.name!r}: {exc}"
+                raise WatermarkError(msg) from exc
+        return watermarks
+
+    def _checkpoint(self, watermarks: Mapping[str, Watermark]) -> CursorCheckpoint:
+        kinds = {query.name: query.watermark_type for query in self.config.queries}
+        return CursorCheckpoint(
+            self.source.id,
+            {
+                "watermarks": {
+                    name: encode(kinds[name], value)
+                    for name, value in watermarks.items()
+                    if name in kinds
+                }
             },
-            size_bytes=record.size_bytes,
-            template_hint=record.template_hint,
-            timestamp_field=record.timestamp_field,
-            actor_field=record.actor_field,
         )
 
-    async def read(self, cursor: Cursor | None) -> AsyncIterator[RawRecord]:
+    async def _pages(
+        self,
+        query: SqlQueryConfig,
+        watermark: Watermark,
+        upper: Watermark | None,
+        now: datetime,
+    ) -> AsyncIterator[RawRecord | Watermark]:
+        """Records of one query from ``watermark`` (up to ``upper`` for a time range), each
+        page followed by the watermark it moved to (ADR 0035 items 3 and 4)."""
+        batch = self.config.batch
+        statement = self.statements[query.name]
+        for _page in range(self.config.max_pages_per_read):
+            params: dict[str, Any] = {"watermark": watermark, "batch": batch}
+            if upper is not None:
+                params["upper"] = upper
+            rows = await self._run_async(statement.sql, params)
+            try:
+                values = [
+                    coerce(query.watermark_type, row.get(query.watermark_column), query.zone)
+                    for row in rows
+                ]
+                plan = plan_page(
+                    query=query.name,
+                    column=query.watermark_column,
+                    values=values,
+                    batch=batch,
+                    configured_batch=self.config.batch,
+                    watermark=watermark,
+                    upper=upper,
+                )
+            except WatermarkError as exc:
+                msg = f"source {self.source.id!r} query {query.name!r}: {exc}"
+                raise WatermarkError(msg) from exc
+            if plan.retry_batch is not None:
+                batch = plan.retry_batch
+                continue
+            for row in rows[: plan.emit]:
+                yield self._record(query, row, now)
+            if plan.advance is not None and plan.advance > watermark:  # type: ignore[operator]
+                watermark = plan.advance
+                yield watermark
+            if plan.done:
+                return
+            batch = self.config.batch
+
+    async def read(self, cursor: Cursor | None) -> AsyncIterator[ReadItem]:
         now = self._clock()
-        raw = cursor.get("watermarks") if cursor else None
-        watermarks: dict[str, object] = (
-            {str(name): _decode_watermark(value) for name, value in raw.items()}
-            if isinstance(raw, Mapping)
-            else {}
-        )
+        watermarks = self._decode_cursor(cursor)
+        settled = await self._settled_clock()
         total = 0
         started = time.monotonic()
         for query in self.config.queries:
-            watermark = watermarks.get(query.name, self._initial_watermark())
-            for _page in range(self.config.max_pages_per_read):
-                rows = await self._run_async(
-                    self.statements[query.name].sql,
-                    {"watermark": watermark, "batch": self.config.batch},
-                )
-                if not rows:
-                    break
-                advanced = _max_watermark(rows, query.watermark_column, watermark)
-                progressed = advanced != watermark
-                if progressed:
-                    watermarks[query.name] = advanced
-                for index, row in enumerate(rows):
-                    record = self._record(query, row, now)
+            watermark = watermarks.get(query.name, self._initial_watermark(query))
+            upper: Watermark | None = None
+            if settled is not None and query.time_range:
+                upper = upper_bound(query.watermark_type, settled, query.zone)
+                if not upper > watermark:  # type: ignore[operator]
+                    continue  # nothing settled since the cursor; never move it backwards
+            async for item in self._pages(query, watermark, upper, now):
+                if isinstance(item, RawRecord):
                     total += 1
-                    yield (
-                        self._with_cursor(record, watermarks) if index == len(rows) - 1 else record
-                    )
-                if not progressed:
-                    logger.warning(
-                        "sql watermark did not advance source_id=%s query=%s rows=%d",
-                        self.source.id,
-                        query.name,
-                        len(rows),
-                    )
-                    break
-                watermark = advanced
-                if len(rows) < self.config.batch:
-                    break
+                    yield item
+                else:
+                    watermarks[query.name] = item
+                    yield self._checkpoint(watermarks)
         logger.info(
             "sql poll source_id=%s queries=%d records=%d seconds=%.1f",
             self.source.id,
@@ -484,28 +537,28 @@ class SqlConnector:
         )
 
     async def backfill(self, start: datetime, end: datetime) -> AsyncIterator[RawRecord]:
+        """Rows of the time-typed queries in ``[start, end]``; integer and decimal watermarks
+        carry no time, so their queries are skipped."""
         now = self._clock()
-        lower, upper = _naive_utc(start), _naive_utc(end)
         for query in self.config.queries:
-            watermark: object = lower
-            for _page in range(self.config.max_pages_per_read):
-                rows = await self._run_async(
-                    self.statements[query.name].sql,
-                    {"watermark": watermark, "batch": self.config.batch},
+            if not query.time_range:
+                logger.info(
+                    "sql backfill skips query source_id=%s query=%s watermark_type=%s",
+                    self.source.id,
+                    query.name,
+                    query.watermark_type,
                 )
-                if not rows:
-                    break
-                for row in rows:
-                    value = row.get(query.watermark_column)
-                    if isinstance(value, datetime) and _naive_utc(value) > upper:
-                        continue
-                    yield self._record(query, row, now)
-                advanced = _max_watermark(rows, query.watermark_column, watermark)
-                if advanced == watermark or (isinstance(advanced, datetime) and advanced >= upper):
-                    break
-                watermark = advanced
-                if len(rows) < self.config.batch:
-                    break
+                continue
+            lower: Watermark
+            if query.watermark_type == "date":
+                lower = start.astimezone(query.zone).date() - timedelta(days=1)
+                upper: Watermark = end.astimezone(query.zone).date()
+            else:
+                lower = start.astimezone(query.zone).replace(tzinfo=None)
+                upper = end.astimezone(query.zone).replace(tzinfo=None)
+            async for item in self._pages(query, lower, upper, now):
+                if isinstance(item, RawRecord):
+                    yield item
 
     async def close(self) -> None:
         engine, self._engine = self._engine, None
@@ -517,11 +570,20 @@ class SqlConnector:
     async def test(self) -> TestResult:
         checks: list[TestCheck] = []
         problems: list[str] = []
+        settled: datetime | None = None
+        try:
+            settled = await self._settled_clock()
+        except ConnectorError as exc:
+            checks.append(TestCheck("database clock", False, str(exc)))
+            problems.append(f"the database clock could not be read: {exc}")
         for query in self.config.queries:
+            params: dict[str, Any] = {"watermark": self._initial_watermark(query), "batch": 1}
+            if query.time_range:
+                if settled is None:
+                    continue
+                params["upper"] = upper_bound(query.watermark_type, settled, query.zone)
             try:
-                rows = await self._run_async(
-                    self.statements[query.name].sql, {"watermark": _naive_utc(EPOCH), "batch": 1}
-                )
+                rows = await self._run_async(self.statements[query.name].sql, params)
             except ConnectorError as exc:
                 checks.append(TestCheck(f"query {query.name}", False, str(exc)))
                 problems.append(f"query {query.name!r} failed: {exc}")

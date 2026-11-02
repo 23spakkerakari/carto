@@ -173,12 +173,21 @@ carto-edge analyze --config analyze.yaml --input ./exports --out bundle.carto
 | `--tenant-id ID` | `default` | Tenant key domain written into the bundle |
 | `--producer TEXT` | `carto-edge analyze <version>` | Free text recorded in the manifest |
 | `--locator-map` | off | Evaluation only; never on your data (below) |
+| `--as-of TIME` | the run time | Check event times against this ISO 8601 date or time with an offset, instead of now (below) |
 
 The run makes two passes (ADR 0017): the first reads everything to gather field statistics and
 templates, the second classifies every field with the statistics of the whole input and writes
 the events, so one bundle has one consistent decision per field. It prints counts and paths
 only, never a value. Exit codes: 0 the bundle was written, 1 the run failed (keys unusable, an
 input over the limits, a write failed), 2 a usage or configuration error.
+
+Event times must lie in a plausible range (ADR 0036): no older than event retention plus one
+day (`CARTO_RETENTION__EVENTS_DAYS`, default 30), no more than one day ahead. An older record is
+dropped with reason `too_old`, since core would delete it on arrival; a later one keeps its event
+with the time it was read, marked `observed_at_quality: ingest`, because a time in the future is
+almost always a misread date. The range is read against the run time. Exports analyzed long after
+they were taken lose their old part; to analyze them as of the day they were exported, pass
+`--as-of 2026-10-08` (the manifest notes it). `MANIFEST.md` and the summary give both counts.
 
 The analyzer also reads the `CARTO_` settings of the edge (`carto_edge.config.EdgeSettings`).
 Offline, the ones that matter are the classifier thresholds (`CARTO_CLASSIFY__DISTINCT_THRESHOLD`,
@@ -199,11 +208,14 @@ make analyze SCENARIO=shop
 
 ```sh
 uv run carto-edge analyze --config simulator/analyze.shop.yaml --input sim-out/shop \
-  --out sim-out/shop.carto --state-dir sim-out/shop.edge-state --locator-map
+  --out sim-out/shop.carto --state-dir sim-out/shop.edge-state --locator-map \
+  --as-of "$(uv run carto-sim as-of --out sim-out/shop)"
 ```
 
 It passes `--locator-map` because the simulator run is scored by the evaluation harness; a
-customer run never does.
+customer run never does. Simulator runs have fixed dates (from 2026-09-23 by default), so it
+passes `--as-of` with the start of the day after the run, which `carto-sim as-of` reads from the
+run's manifest. `make bench` and `make bench-gateway` do the same.
 
 ### From the container image
 

@@ -6,13 +6,16 @@ edge gateway can reach it. TLS 1.2 is the floor (spec 14.4 "TLS 1.2 minimum, 1.3
 the context factory hook pins ``minimum_version`` because uvicorn's own options stop at the
 protocol constant. uvicorn's logging configuration is switched off so its records flow through
 the root logger that :func:`carto_common.logging.configure_logging` installs, redaction included
-(spec 14.12). Access logs carry the request line and status, never a body.
+(spec 14.12). Access logs carry the request line and status, never a body. While it serves, a
+:class:`~carto_core.ingest.ledger.LedgerPruner` deletes ledger rows past retention every hour
+(ADR 0034).
 """
 
 from __future__ import annotations
 
 import ssl
 from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -24,7 +27,7 @@ from carto_core.db.clickhouse import ClickHouseWriter, create_client
 from carto_core.db.postgres import create_engine_from_settings
 from carto_core.ingest.app import create_app
 from carto_core.ingest.health import PostgresSourceHealthStore
-from carto_core.ingest.ledger import PostgresBatchLedger
+from carto_core.ingest.ledger import LedgerPruner, PostgresBatchLedger
 from carto_core.settings import CoreConfigError
 
 if TYPE_CHECKING:
@@ -101,9 +104,8 @@ def run_ingest_api(settings: CoreSettings) -> int:
     """Connect to both stores, build the app and serve until the process is signalled."""
     configure_logging("ingest-api", settings.log_level, settings.log_json)
     check_listener_files(settings.ingest)  # refuse before any store connection is attempted
-    config = build_uvicorn_config(
-        _build_app(settings), settings.ingest, log_level=settings.log_level
-    )
+    app, ledger = _build_app(settings)
+    config = build_uvicorn_config(app, settings.ingest, log_level=settings.log_level)
     if not settings.ingest.require_client_cert:
         log.warning("client certificates are not required; this is not a production setting")
     log.info(
@@ -112,16 +114,18 @@ def run_ingest_api(settings: CoreSettings) -> int:
         port=settings.ingest.port,
         tenant_id=settings.tenant_id,
     )
-    uvicorn.Server(config).run()
+    pruner = LedgerPruner(ledger, settings.retention.events_days, lambda: datetime.now(UTC))
+    pruner.start()
+    try:
+        uvicorn.Server(config).run()
+    finally:
+        pruner.stop()
     return 0
 
 
-def _build_app(settings: CoreSettings) -> ASGIApp:
+def _build_app(settings: CoreSettings) -> tuple[ASGIApp, PostgresBatchLedger]:
     client = create_client(settings.clickhouse)
     engine = create_engine_from_settings(settings.postgres)
-    return create_app(
-        settings,
-        ClickHouseWriter(client),
-        PostgresBatchLedger(engine),
-        PostgresSourceHealthStore(engine),
-    )
+    ledger = PostgresBatchLedger(engine)
+    app = create_app(settings, ClickHouseWriter(client), ledger, PostgresSourceHealthStore(engine))
+    return app, ledger
