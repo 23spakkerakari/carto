@@ -256,6 +256,44 @@ async def test_rows_need_a_header_with_the_primary_key(tmp_path: Path) -> None:
         )
 
 
+def rows_source(path: Path) -> UploadConnector:
+    return make({"paths": [str(path)], "kind": "rows", "table": "t", "primary_key": "id"})
+
+
+async def test_csv_cells_past_the_csv_modules_default_field_limit_are_read(
+    tmp_path: Path,
+) -> None:
+    """The csv module stops at 128 KiB per cell unless told otherwise; an exported JSON blob
+    column is routinely larger."""
+    blob = "x" * 300_000
+    path = tmp_path / "t.csv"
+    path.write_text(f"id,blob\n1,{blob}\n2,small\n", encoding="utf-8")
+    records = await collect(rows_source(path))
+    assert [record.locator for record in records] == ["t:row:1", "t:row:2"]
+    assert records[0].fields is not None and len(records[0].fields["blob"]) == 300_000
+
+
+async def test_a_csv_row_the_reader_cannot_parse_is_skipped_not_fatal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """One bad row (here a cell past the field limit) is skipped and counted; the rows after
+    it are still read and the cursor still counts the skipped row."""
+    monkeypatch.setattr(upload_module, "MAX_CSV_FIELD_BYTES", 64)
+    path = tmp_path / "t.csv"
+    path.write_text("id,blob\n1,ok\n2," + "y" * 200 + "\n3,ok\n", encoding="utf-8")
+    try:
+        with caplog.at_level("WARNING"):
+            records = await collect(rows_source(path))
+    finally:
+        import csv  # noqa: PLC0415
+
+        csv.field_size_limit(16 * 1024 * 1024)
+    assert [record.locator for record in records] == ["t:row:1", "t:row:3"]
+    assert records[-1].commit_cursor == {"file": str(path), "line": 3}
+    assert any("skipped=1" in message for message in caplog.messages)
+    assert all("y" * 10 not in message for message in caplog.messages)
+
+
 # ---------------------------------------------------------------------------------------------
 # records of the files kind
 # ---------------------------------------------------------------------------------------------
@@ -411,6 +449,67 @@ async def test_symlinks_are_never_followed(tmp_path: Path, logs: Path) -> None:
     result = await make({"paths": [str(link)]}).test()
     assert not result.ok
     assert any("symlink" in problem for problem in result.problems)
+
+
+def linked_tree(tmp_path: Path, link: str) -> tuple[Path, Path]:
+    """``tree/a.log`` plus ``tree/jump`` -> ``outside/`` (holding ``secret.log``) as a symlink
+    or a junction; returns the tree and the link."""
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    (tree / "a.log").write_bytes(b"inside\n")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.log").write_bytes(b"outside\n")
+    jump = tree / "jump"
+    if link == "junction":
+        if os.name != "nt":
+            pytest.skip("junctions exist on Windows only")
+        import _winapi  # noqa: PLC0415
+
+        _winapi.CreateJunction(str(outside), str(jump))
+    else:
+        try:
+            jump.symlink_to(outside, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks need privileges on this platform")
+    return tree, jump
+
+
+@pytest.mark.parametrize("link", ["symlink", "junction"])
+async def test_links_inside_a_tree_are_not_followed(tmp_path: Path, link: str) -> None:
+    """A walk skips the linked directory; a glob that reaches through it loses the file to the
+    real-path check and test() reports the count; the link itself is refused as a path."""
+    tree, jump = linked_tree(tmp_path, link)
+    records = await collect(make({"paths": [str(tree)]}))
+    assert [record.locator for record in records] == ["a.log:line:1"]
+    through_glob = make({"paths": [str(tree / "**" / "*.log")]})
+    assert [r.locator for r in await collect(through_glob)] == ["a.log:line:1"]
+    result = await through_glob.test()
+    assert result.visible == ("a.log",)
+    assert any("1 file(s) resolve outside" in problem for problem in result.problems)
+    result = await make({"paths": [str(jump)]}).test()
+    assert any(link in problem and "not followed" in problem for problem in result.problems)
+    assert result.visible == ()
+
+
+async def test_base_dir_confines_every_path(tmp_path: Path, logs: Path) -> None:
+    """The offline analyzer sets base_dir to --input: nothing outside it is read, however the
+    path is spelled."""
+    base = tmp_path / "input"
+    base.mkdir()
+    (base / "a.log").write_bytes(b"inside\n")
+    connector = make(
+        {
+            "paths": ["a.log", str(logs), "../orders/*.log", "../*.log", "sub/../a.log"],
+            "base_dir": str(base),
+        }
+    )
+    result = await connector.test()
+    assert result.visible == ("a.log",)
+    outside = [problem for problem in result.problems if "outside the base directory" in problem]
+    assert len(outside) == 3
+    assert all(str(logs) not in record.locator for record in await collect(connector))
+    assert [record.locator for record in await collect(connector)] == ["a.log:line:1"]
 
 
 async def test_test_reports_files_and_problems(logs: Path, tmp_path: Path) -> None:

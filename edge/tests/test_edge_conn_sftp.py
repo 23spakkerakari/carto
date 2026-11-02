@@ -333,6 +333,31 @@ async def test_wrong_password_is_refused(host: SftpHost) -> None:
         await collect(make(host, secret=f"{USERNAME}:nope"))
 
 
+async def test_the_users_ssh_configuration_is_ignored(
+    host: SftpHost, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``~/.ssh/config`` on the edge host could route the session through a ProxyCommand or
+    add identities; the connector connects with the source config and its secret only."""
+    home = tmp_path / "home"
+    (home / ".ssh").mkdir(parents=True)
+    (home / ".ssh" / "config").write_text(
+        "Host *\n  ProxyCommand carto-must-never-run-this %h %p\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    # The file is one asyncssh understands: given it, the session would go through the proxy.
+    options = asyncssh.SSHClientConnectionOptions(
+        host="sftp.internal.example", config=[str(home / ".ssh" / "config")]
+    )
+    assert options.proxy_command and options.proxy_command[0] == "carto-must-never-run-this"
+    records = await collect(make(host))
+    assert [record.locator for record in records] == [
+        "file:SHIP_20261006_2112.csv",
+        "file:SHIP_20261007_2115.csv",
+    ]
+
+
 async def test_private_key_authentication(host: SftpHost) -> None:
     pem = CLIENT_KEY.export_private_key().decode()
     records = await collect(make(host, secret=pem))

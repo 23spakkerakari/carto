@@ -32,6 +32,7 @@ LIMIT :batch
 """
 RO_PASSWORD = "ro-pw-0123456789"  # noqa: S105
 RW_PASSWORD = "rw-pw-0123456789"  # noqa: S105
+ROLE_PASSWORD = "role-pw-0123456789"  # noqa: S105
 ROOT_PASSWORD = "root-pw-0123456789"  # noqa: S105
 
 
@@ -110,6 +111,13 @@ def mysql() -> Iterator[dict[str, Any]]:
                 cursor.execute("GRANT SELECT ON wms.purchase_orders TO 'carto_ro'@'%'")
                 cursor.execute(f"CREATE USER 'carto_rw'@'%' IDENTIFIED BY '{RW_PASSWORD}'")
                 cursor.execute("GRANT SELECT, INSERT ON wms.purchase_orders TO 'carto_rw'@'%'")
+                # ADR 0037 item 3: INSERT reaches this login only through a role it holds but
+                # has not activated; SHOW GRANTS alone lists the role, not the privilege.
+                cursor.execute("CREATE ROLE 'wms_writer'")
+                cursor.execute("GRANT INSERT ON wms.* TO 'wms_writer'")
+                cursor.execute(f"CREATE USER 'carto_role'@'%' IDENTIFIED BY '{ROLE_PASSWORD}'")
+                cursor.execute("GRANT SELECT ON wms.purchase_orders TO 'carto_role'@'%'")
+                cursor.execute("GRANT 'wms_writer' TO 'carto_role'@'%'")
         finally:
             root.close()
         # caching_sha2_password (the MySQL 8.4 default) needs one full authentication per login
@@ -119,7 +127,11 @@ def mysql() -> Iterator[dict[str, Any]]:
         tls = ssl.create_default_context()
         tls.check_hostname = False
         tls.verify_mode = ssl.CERT_NONE
-        for user, secret in (("carto_ro", RO_PASSWORD), ("carto_rw", RW_PASSWORD)):
+        for user, secret in (
+            ("carto_ro", RO_PASSWORD),
+            ("carto_rw", RW_PASSWORD),
+            ("carto_role", ROLE_PASSWORD),
+        ):
             pymysql.connect(
                 host=host, port=port, user=user, password=secret, database="wms", ssl=tls
             ).close()
@@ -217,6 +229,24 @@ async def test_insert_grant_is_refused(mysql: dict[str, Any]) -> None:
     assert result.read_only is ReadOnlyStatus.WRITE_CAPABLE
     assert not result.can_enable
     assert "INSERT on `wms`.`purchase_orders`" in result.problems[-1]
+
+
+async def test_an_insert_grant_held_through_a_role_is_refused(mysql: dict[str, Any]) -> None:
+    """ADR 0037 item 3: SHOW GRANTS FOR CURRENT_USER() USING the login's roles."""
+    connector, _network = make(mysql, "carto_role", ROLE_PASSWORD)
+    try:
+        result = await connector.test()
+    finally:
+        await connector.close()
+    assert not result.ok
+    assert result.read_only is ReadOnlyStatus.WRITE_CAPABLE
+    assert "INSERT on `wms`.*" in result.problems[-1]
+    names = [check.name for check in result.checks]
+    assert names[-3:] == [
+        "privileges roles",
+        "privileges grants",
+        "privileges grants through roles",
+    ]
 
 
 async def test_polling_by_watermark(mysql: dict[str, Any]) -> None:

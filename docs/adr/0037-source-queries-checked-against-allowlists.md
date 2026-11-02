@@ -43,3 +43,9 @@ noticing.
 - Some legitimate searches and queries are refused until their command or function is added.
   The error names the refused item, so the fix is one line in code.
 - SQL Server remains tested against a fake connection until the payer partner install (ADR 0019).
+- Items 4 and 5 were built with package C (`splunk_spl.py`); items 1 to 3 on 2026-10-17
+  (`sql_dialects.py`, ADR 0041 Consequences). Item 1 is keyed to sqlglot's node types
+  (`ALLOWED_FUNCTION_TYPES`) plus per-dialect names sqlglot leaves untyped
+  (`ALLOWED_FUNCTIONS`); every aggregate is allowed. A sqlglot upgrade that renames a node
+  fails at import, loudly, rather than widening the list. Item 2 also counts ALTER at database
+  scope. Item 3 treats `REVOKE` lines as narrowing and needs MySQL 8 (`CURRENT_ROLE()`).

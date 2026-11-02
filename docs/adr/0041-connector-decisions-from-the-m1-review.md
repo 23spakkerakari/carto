@@ -129,15 +129,38 @@ the cursor moved.
   `watermark_timezone`; the two agree only when the zone is UTC.
 - `sql_watermarks.py` has no unit tests of its own; date, int and decimal decoding, the zone,
   batch doubling, the 16-fold limit and the order check are untested.
-- Not built in package C, still open in the plan: ADR 0037 items 1 to 3 (the SQL statement
-  allowlist still uses `DENIED_FUNCTIONS`; no SQL Server `sys.servers` or database-scope write
-  check; MySQL grants through roles, and an unparsed grant line still counts as no finding);
-  MySQL connecting to the validated address; SFTP ignoring the user's SSH configuration; upload
-  confinement to its base directory, without following links or junctions; and the CSV field size
-  limit with per-row errors skipped.
+- Built on 2026-10-17 (branch `fix-c2`), closing most of what package C had left open:
+  - ADR 0037 items 1 to 3. `check_statement` keeps no denylist: a template may call aggregates
+    plus the typed scalar functions in `ALLOWED_FUNCTION_TYPES` and the per-dialect untyped names
+    in `ALLOWED_FUNCTIONS`; FROM items are base tables and CTEs (no table-valued functions,
+    `OPENQUERY`, `OPENROWSET`, `OPENDATASOURCE`, `dblink` or four-part names), no table or
+    optimizer hints, no `NEXT VALUE FOR`, and at least one table. User-defined functions are
+    refused until added in code. SQL Server `test()` adds `HAS_PERMS_BY_NAME(DB_NAME(),
+    'DATABASE', ...)` for INSERT, UPDATE, DELETE and ALTER and lists `sys.servers`; a visible
+    linked server is a finding. MySQL `test()` reads `CURRENT_ROLE()` and the role-grant lines,
+    then repeats `SHOW GRANTS FOR CURRENT_USER() USING` those roles; a grant line the parser
+    cannot read is a finding; `REVOKE` lines (partial revokes) are read as narrowing only.
+    MySQL 5.7 has no `CURRENT_ROLE()`, so its `test()` now fails the roles check; 5.7 left
+    support in 2023.
+  - SFTP passes `config=None` to asyncssh: `~/.ssh/config` never adds a `ProxyCommand`,
+    identity or alias to a connection.
+  - Upload confinement: symlinks and Windows junctions are never followed (configured path,
+    walked tree or glob; `os.walk` and `glob` both descend into junctions on Python 3.12); every
+    file is checked by real path, under `base_dir` when set (the analyzer's `--input`), else
+    under the directory its entry starts from. Files reached through a link are skipped and
+    counted in `test()`.
+  - CSV rows are read with a 16 MiB field limit; a row the reader cannot parse is skipped and
+    counted, never fatal.
+- Still open from package C: MySQL connecting to the validated address. PyMySQL verifies the
+  server certificate against the `host` it connects to, so connecting to the resolved address
+  would break `ssl_verify_identity` unless the name is carried separately; ADR 0018 chose
+  connect-by-name after validation for MySQL and SQL Server. Changing it needs the founder's
+  call on how the TLS name is pinned.
 
 ## Tests
 
 `edge/tests/test_edge_batch.py`, `test_edge_scheduler.py`, `test_edge_conn_splunk.py`,
 `test_edge_conn_splunk_spl.py`, `test_edge_net_retry.py`, `test_edge_conn_sql_check.py`,
-`test_edge_conn_sql_mssql.py`, `test_edge_conn_sql_pg.py` (Docker only).
+`test_edge_conn_sql_mssql.py`, `test_edge_conn_sql_pg.py` and `test_edge_conn_sql_mysql.py`
+(Docker only; the MySQL case adds a login whose INSERT arrives through a role),
+`test_edge_conn_sftp.py`, `test_edge_conn_upload.py`.
