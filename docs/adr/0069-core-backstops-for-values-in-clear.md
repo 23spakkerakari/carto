@@ -56,7 +56,7 @@ In the order they are tried; the words are what the error message says.
 | a carto token | `t<1-4 digits>.<22 base64url>` (`carto_schema.forms.TOKEN_PATTERN`, unanchored) |
 | an AWS access key id | `AKIA` or `ASIA` + 16 upper-case alphanumerics |
 | a URL with a password | `://user:password@`, the user name possibly empty (`redis://:pw@`); the password is the shape, and `://carto:<*>@` is already masked and passes |
-| a secret-named key with a value | a word of `carto_common.logging.SECRET_KEY_WORDS` or pair of `SECRET_KEY_PAIRS`, `=` or `:`, a value that is not `<*>`, a `[MASK]` or empty; a quoted or braced value runs to its closing character however long (the review of 2026-11-02 found a 512-character bound that let a longer quoted value through) |
+| a secret-named key with a value | a word of `carto_common.logging.SECRET_KEY_WORDS` or pair of `SECRET_KEY_PAIRS`, `=` or `:` (or a space before a quoted value), a value that is not `<*>`, a `[MASK]` or empty; a quoted or braced value of at most 512 characters to its closing character, else a bare run up to whitespace or a separator that may start on a quote or a brace, so a longer or unterminated quoted value is still a value (the review of 2026-11-02 first found the 512-character bound let a longer quoted value through, then that the unbounded form cost quadratic time on an unterminated opener: 15 s for 256 KiB of `password={ `, invariant 8) |
 | an email address | local part, `@`, domain with a dotted TLD (a DSN user name does not match) |
 | a UUID | 8-4-4-4-12 hex |
 | a run of 16 or more hex characters | `[0-9A-Fa-f]{16,}` |
@@ -87,10 +87,20 @@ whole task.
 `TOKEN_PATTERN` for the same reason), and adding `carto-common` to it would have changed the
 lock file under another package's edit. The shape patterns, the secret-key rule and the
 `secret_ref` rule are therefore mirrored from `carto_common.logging` and
-`carto_common.settings`, with the one difference the contract needs: a secret assignment whose
-value is the placeholder `<*>` is a template constant, not a value.
-`core/tests/test_core_llm_payload.py::test_the_schema_mirrors_agree_with_carto_common` holds
-the two sides together on a corpus of samples, keys and references.
+`carto_common.settings`. The JWT, carto token, AWS key, URL userinfo, secret assignment and
+e-mail patterns are one source text each, held under the same constant name in both modules
+(`_JWT_SOURCE` to `_EMAIL_SOURCE`), and
+`core/tests/test_core_llm_payload.py::test_the_mirrored_pattern_sources_are_the_same_text`
+fails by name when a side lacks one or the texts differ (the review of 2026-11-02 found the two
+hand-kept copies had drifted: carto_common masked an unterminated quoted value the schema
+passed). The one difference the contract once needed, that a secret assignment whose value is
+the placeholder `<*>` is a template constant, is now in the shared source: a placeholder in a
+log line is not a secret either, and the HTTP auth scheme word (`Basic`, `Bearer`) stays in
+clear on both sides. The PEM block (a string search in carto_common), the hex run (16 characters
+here, 8 shaped in a log line) and the digit run (6 here, 4 in a log line) differ by design: a
+shape refused at the contract against a shape masked in a log line.
+`test_the_schema_mirrors_agree_with_carto_common` holds the two sides together on a corpus of
+samples, keys and references as well.
 
 ## Evidence
 
