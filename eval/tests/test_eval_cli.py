@@ -57,7 +57,7 @@ def test_run_with_empty_predictions_is_na_or_zero(
     assert report["predictions_present"] is False
     assert report["regressions"] == []
     assert report["counts"] == {
-        "events": 4633,  # ADR 0068: secret noise lines shift the generator draws
+        "events": 4604,  # ADR 0068: secret noise lines shift the generator draws
         "transactions": 60,
         "links": 15,
         "entities": 3,

@@ -143,8 +143,7 @@ thrice-repeated probe message of its own, and runs the small end-to-end run over
   moved: shop tokenized fields 103 to 73, engine links 25 to 19, pass-1-only fields 59 to 0;
   people_ops tokenized fields 73 to 41. The before and after corpora differ because the
   simulator changed in the same commit (shop 114,326 against 114,515 events), so the deltas mix
-  the engine change with the corpus change. Old engine on the new corpus: (filled in by the
-  integration run).
+  the engine change with the corpus change. Old engine on the new corpus (the `m3-trace-spec` engine run from the main tree over the corpus this branch's simulator generated, `secret_values` stripped from the markers so the old loader accepts it): the spec 18.4 table and the scored predictions are identical to the new engine's (shop 17 scored, 13 usable for families, 1 composite; people_ops 11 scored, 8 usable, 3 composite), so the engine change moves only unscored internals: shop 274 fields with 178 tokenized and 118 in pass-1-only templates become 196, 73 and 0; people_ops 200, 136 and 92 become 129, 41 and 0; shop stores 19 links instead of 25 because the 6 missing ones were template duplicates and same-field pairs that were never scored..
 - Not built: a per-template console hint that a template is all-parameters because its message
   never varied (readability item for M3), and a `secret_values` scan in `carto-eval` (the eval
   does not read `markers.json`, so the new category changes nothing there).
