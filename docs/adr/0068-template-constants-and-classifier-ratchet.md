@@ -1,7 +1,9 @@
 # ADR 0068: Template constants need distinct messages; the classifier ratchets
 
 Status: accepted, 2026-11-02 (plan `docs/plans/security-fixes-2026-11.md`, package E; spec 2.3
-invariants 2, 3 and 7, 8.2 item 6, 8.3 rules 5 and 6, 18.3)
+invariants 2, 3 and 7, 8.2 item 6, 8.3 rules 5 and 6, 18.3); amended the same day after the
+review of the package (item 1: hits only are persisted, chunked constants, the judging log line;
+the engine counts; the accepted residual)
 
 The security review of 2026-11-01 found three ways a value could leave the edge in clear
 without any rule being broken on paper, and a gap in what the leak test could see. This ADR
@@ -45,10 +47,22 @@ card, IBAN, medical licence, every class the classifier treats as PII) at or abo
 `pii.score_threshold` (0.5 when the detector carries no settings, the classifier's rule). On a
 hit the cluster is marked `pii` and stays all parameters for good; a filter that raises is a
 hit (the store fails closed and logs the cluster id, never the words); without a hit the
-template is used as before. The verdict is taken once, at the cluster's first promotion (or at
-the first use of a cluster a version 2 file promoted), never per message, and is persisted with
-the cluster (`"p"`, state version 3). A bare `TemplateStore()` without a filter allows every
-template, which keeps the unit tests and the behaviour before this rule.
+template is used as before. The verdict is taken once per process, at the cluster's first
+promotion (or at the first use of a cluster an older file promoted), never per message. A hit
+is persisted with the cluster (`"p": true`, state version 3) and survives any restart. An
+allowed verdict is held in memory only and taken again in the next process: the detector that
+allowed the words may have been the regex fallback, which knows no names, because
+`PresidioDetector.load` degrades to it silently when the spaCy model fails to load and
+`pii.enabled=false` selects it outright, and a cluster promoted in that window would otherwise
+have kept a name as a constant after the model was repaired and the process restarted (review
+of 2026-11-02). A `"p": false` in a file written before that review reads as not judged. The
+judging log line (`template_constants_judged`) carries the cluster id, the verdict and the
+detector backend (`presidio`, `regex`), never the words, so an operator can see which detector
+judged a cluster. The constants reach the detector in chunks of at most `MAX_TEXT_BYTES`
+(4096) of UTF-8, the detectors' input cap, since a template runs to `MAX_TEMPLATE_TEXT_LEN`
+(4096) characters and a name past the cap would otherwise never have been judged. A bare
+`TemplateStore()` without a filter allows every template, which keeps the unit tests and the
+behaviour before this rule.
 
 Two shapes join the secrets that `mask_tokens` never turns into parameters, because the
 classifier could not tell them apart from an ordinary value once they were a field: every
@@ -64,9 +78,10 @@ and the like) and nothing on lines that vary. The detector is the control for a 
 otherwise constant line: a retry loop whose only change is a counter promotes the line, and
 only the detector's PERSON or LOCATION hit keeps the name out of the constants. With
 `pii.enabled=false` the regex detector of ADR 0020 knows no names, so such a loop can still
-promote a name (an e-mail address, a phone number or a card number in the same position is
-still caught); pure identical repeats never promote anything, whatever the detector. The eval of
-both scenarios records the effect (plan, package E; "Engine counts" below).
+promote a name until a process with the Presidio detector judges the cluster again (an e-mail
+address, a phone number or a card number in the same position is still caught); pure identical
+repeats never promote anything, whatever the detector. The eval of both scenarios records the
+effect (plan, package E; "Engine counts" below).
 
 ## 2. Cardinality and detector hits ratchet
 
@@ -110,9 +125,22 @@ transaction, so nothing before phase D changes) and planted verbatim into 5% of 
 of every log source of both scenarios; the payments XML source of `shop` carries its line as a
 `<note>` element of the heartbeat document, the others in their message field. The same line
 repeats, as a retry loop would log it, which is also item 1's case. The leak test scans the new
-category like the others, plants a
-thrice-repeated probe message of its own, and runs the small end-to-end run over `shop` and
-`people_ops` (two days each) instead of `shop` alone.
+category like the others, plants a thrice-repeated probe message of its own, and runs the small
+end-to-end run over `shop` and `people_ops` (two days each) instead of `shop` alone.
+
+## Accepted residual (founder's call)
+
+With the real `en_core_web_sm` model the constant filter's gate passes lowercase single-token
+names (`alice`), usernames (`asmith`, `alice.smith`), CJK names and organisation names, since
+spaCy's NER does not label them PERSON or LOCATION (ORG is ignored by design, ADR 0020), so
+invariant 2 for those shapes rests on NER recall when they sit inside an otherwise constant
+line that varies only in masked tokens. The alternative is a structural rule that needs no
+detector: a cluster earns its constants only when it is shared by messages that also differ in
+an unmasked token, so that a word which never varies next to a word that does is a constant
+and a line that varies only in its masked tokens never promotes. That rule costs the commonest
+log lines their templates (the warehouse export lines above vary only in masked tokens) and
+was measured to break the map and error-spike detection. The founder decides between the two;
+until then the detector gate stands and the threat model (row 2) records the residual.
 
 ## Consequences
 
@@ -123,27 +151,60 @@ thrice-repeated probe message of its own, and runs the small end-to-end run over
   messages by a word. The rest of the file passes unchanged under the constant filter.
 - Template state files written before this change load: version 1 with constants to be earned
   again, version 2 with its digests and every promoted cluster judged by the filter at its next
-  use. Field statistics snapshots of version 1 load with both flags false.
-- A persisted template state grows by at most eight 12-character digests and one boolean per
-  cluster.
-- The constant filter costs one detector call per cluster promotion (Presidio loads its model
-  at the first call, as it does for the classifier), nothing per message. The gateway's state
-  file keeps a `pii` cluster's Drain3 tokens as before (the state is edge-local and always held
-  the words of every cluster); only what leaves the edge changed.
-- Measured on 2026-11-02 (`make eval-engine`, memory engine, seed 1): every spec 18.4 metric
-  is unchanged on both scenarios (shop all targets; people_ops exact and bridge recall 0.80 as
-  before). The bundles show item 1's trade-off: shop 28 kept, 103 tokenized, 21 dropped fields
-  before against 99 kept, 73 tokenized, 24 dropped after; people_ops 16/73/6 against 76/41/12.
-  The new kept fields are the words of static noise lines (`health check ok`), which travelled
-  as template constants before and as kept low-cardinality attributes now; the fields that
-  existed only in pass 1 templates (59 and 29) are gone.
+  use, version 3 with its refused clusters kept refused and every other promoted cluster judged
+  again at its next use in each process (a `"p": false` from before the review reads as not
+  judged). Field statistics snapshots of version 1 load with both flags false.
+- A persisted template state grows by at most eight 12-character digests per cluster and one
+  boolean per refused cluster.
+- The constant filter costs one detector call per cluster promotion per process (a few for a
+  template whose constants exceed 4096 bytes of UTF-8), nothing per message. Presidio loads its
+  model at the first call, as it does for the classifier. The store serves a blocked cluster's
+  messages and identical repeats of a message whose cluster is not yet promoted from its caches
+  without a Drain3 tree walk (review of 2026-11-02); a distinct variant always walks the tree
+  and counts. The gateway's state file keeps a `pii` cluster's Drain3 tokens as before (the
+  state is edge-local and always held the words of every cluster); only what leaves the edge
+  changed.
+- Measured on 2026-11-02 (`make eval-engine`, memory engine, seed 1; an earlier run of the day,
+  before the final corpus of the tables below): every spec 18.4 metric is unchanged on both
+  scenarios (shop all targets; people_ops exact and bridge recall 0.80 as before). The bundles
+  show item 1's trade-off: shop 28 kept, 103 tokenized, 21 dropped fields before against 99
+  kept, 73 tokenized, 24 dropped after; people_ops 16/73/6 against 76/41/12. The new kept fields
+  are the words of static noise lines (`health check ok`), which travelled as template constants
+  before and as kept low-cardinality attributes now; the fields that existed only in pass 1
+  templates (59 and 29) are gone.
 - `simulator/README.md` lists `secret_values` next to the other `markers.json` categories (the
   same commit).
-- Engine counts. The spec 18.4 table is unchanged on both scenarios while the engine internals
-  moved: shop tokenized fields 103 to 73, engine links 25 to 19, pass-1-only fields 59 to 0;
-  people_ops tokenized fields 73 to 41. The before and after corpora differ because the
-  simulator changed in the same commit (shop 114,326 against 114,515 events), so the deltas mix
-  the engine change with the corpus change. Old engine on the new corpus (the `m3-trace-spec` engine run from the main tree over the corpus this branch's simulator generated, `secret_values` stripped from the markers so the old loader accepts it): the spec 18.4 table and the scored predictions are identical to the new engine's (shop 17 scored, 13 usable for families, 1 composite; people_ops 11 scored, 8 usable, 3 composite), so the engine change moves only unscored internals: shop 274 fields with 178 tokenized and 118 in pass-1-only templates become 196, 73 and 0; people_ops 200, 136 and 92 become 129, 41 and 0; shop stores 19 links instead of 25 because the 6 missing ones were template duplicates and same-field pairs that were never scored..
 - Not built: a per-template console hint that a template is all-parameters because its message
   never varied (readability item for M3), and a `secret_values` scan in `carto-eval` (the eval
   does not read `markers.json`, so the new category changes nothing there).
+
+### Engine counts on the final corpus
+
+Both engines on the final corpus of 2026-11-02 (seed 1, memory engine; `shop` 14 days, 114,468
+events; `people_ops` 28 days, 28,036 events). The new engine's rows are the "engine fields in
+the bundle" and "engine links" lines of `eval/reports-final/shop.md` and
+`eval/reports-final/people_ops.md`. The old engine's rows are the `m3-trace-spec` engine at
+c7dfc1e, run from the main checkout over a copy of `sim-out-final` with `secret_values`
+stripped from `markers.json` (the old loader refuses the key); that output sits in the session
+scratchpad (`reports-old-engine-final`), not in the tree. Fields are the engine fields in the
+bundle; "Pass-1 only" are fields that existed only in templates without events; "Usable" are
+the scored links usable for families. The spec 18.4 table is identical for both engines on
+both scenarios: `shop` passes every target; `people_ops` fails exact and bridge recall at 0.80
+and passes composite recall (0.75) and entity family purity (1.0). The engine change moves only
+unscored internals: the pass-1-only fields are gone, and `shop` stores 19 links instead of 25
+because the 6 missing ones were template duplicates and same-field pairs that were never
+scored.
+
+`shop` (14 days):
+
+| Engine | Fields | Tokenized | Pass-1 only | Links stored | Scored | Usable | Composite |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Old (`m3-trace-spec`, c7dfc1e) | 276 | 179 | 126 | 25 | 17 | 13 | 1 |
+| New (this branch) | 196 | 59 | 0 | 19 | 17 | 13 | 1 |
+
+`people_ops` (28 days):
+
+| Engine | Fields | Tokenized | Pass-1 only | Links stored | Scored | Usable | Composite |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Old (`m3-trace-spec`, c7dfc1e) | 200 | 136 | 92 | 12 | 11 | 8 | 3 |
+| New (this branch) | 129 | 41 | 0 | 12 | 11 | 8 | 3 |
