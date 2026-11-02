@@ -68,44 +68,55 @@ _DIGIT_RUN: Final = re.compile(r"[0-9]{%d,}" % MAX_TEMPLATE_DIGIT_RUN)  # noqa: 
 _HEX_RUN: Final = re.compile(r"[0-9A-Fa-f]{%d,}" % MIN_HEX_RUN)  # noqa: UP031
 
 # The value shapes mirror ``carto_common.logging`` (this package depends on pydantic only, for
-# the reason ``carto_common.crypto`` repeats ``TOKEN_PATTERN``; a core test holds the two sides
-# together). Every quantifier is bounded or stops at a fixed character, so each scan stays linear
-# on attacker-written text (spec 2.3 invariant 8).
+# the reason ``carto_common.crypto`` repeats ``TOKEN_PATTERN``). Each mirrored pattern source
+# below is held under the same name in ``carto_common.logging`` as the same text, and
+# ``core/tests/test_core_llm_payload.py`` asserts the texts are equal; a change to one side is a
+# change to both. Every quantifier is bounded or stops at a fixed character, so each scan stays
+# linear on attacker-written text (spec 2.3 invariant 8).
 _PEM_HEADER: Final = "-----BEGIN"
 _PEM_BLOCK: Final = re.compile(r"-----BEGIN(?:(?!-----END).)*(?:-----END[^-]*-----|\Z)", re.DOTALL)
 # The look-behind keeps the scan linear: a run of base64url characters is tried once.
-_JWT: Final = re.compile(r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*")
-_CARTO_TOKEN: Final = re.compile(TOKEN_PATTERN.pattern.removeprefix("^").removesuffix("$"))
-_AWS_KEY: Final = re.compile(r"(?:AKIA|ASIA)[0-9A-Z]{16}")
+_JWT_SOURCE: Final = r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*"
+_CARTO_TOKEN_SOURCE: Final = TOKEN_PATTERN.pattern.removeprefix("^").removesuffix("$")
+_AWS_KEY_SOURCE: Final = r"(?:AKIA|ASIA)[0-9A-Z]{16}"
 # scheme://user:password@host -> the password; the user name is configuration, not a secret,
 # and may be empty (redis://:password@host), and a placeholder or mask in the password slot
-# ("://carto:<*>@") is already masked.
-_URL_USERINFO: Final = re.compile(r"(?<=://)([^/\s@:]*):(?!<\*>@|\[[A-Z_]+\]@)([^/\s@]+)(?=@)")
+# ("://carto:<*>@", "://carto:[REDACTED]@") is already masked.
+_URL_USERINFO_SOURCE: Final = r"(?<=://)([^/\s@:]*):(?!<\*>@|\[[A-Z_]+\]@)([^/\s@]+)(?=@)"
 # The look-behind stops a DSN user name (postgres://carto@db.internal) from reading as a mailbox.
-_EMAIL: Final = re.compile(r"(?<![\w.%+/-])[\w.%+-]+@[\w.-]+\.[A-Za-z]{2,}(?![\w-])")
-_UUID: Final = re.compile(
-    r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}"
-)
-# password=..., api-key: ..., Authorization: Bearer ..., "token": "...": a secret-named key
-# (the words of carto_common.logging.SECRET_KEY_WORDS and SECRET_KEY_PAIRS) followed by a value.
-# Group 1 is the key, the separator and an HTTP auth scheme; group 2 the value (a whole quoted
-# or braced string, else up to whitespace or a separator). A value that is the placeholder, a
+_EMAIL_SOURCE: Final = r"(?<![\w.%+/-])[\w.%+-]+@[\w.-]+\.[A-Za-z]{2,}(?![\w-])"
+# password=..., api-key: ..., Authorization: Bearer ..., "token": "...", secret "...": a
+# secret-named key (the words of carto_common.logging.SECRET_KEY_WORDS and SECRET_KEY_PAIRS)
+# followed by a value. Group 1 is the key, the separator ("=" or ":", or a space before a quoted
+# value) and an HTTP auth scheme; group 2 the value. A value that is the placeholder, a
 # redaction mask or empty ("password=<*>", "token: [REDACTED]", 'pwd=""') is what the edge
 # writes for a template and passes; "token_count=3" and "secret_ref=vault://x" do not match
 # because "_" follows the word. The short words pwd, pass, auth and sig must start a word or a
-# camelCase hump ("dbPass=", not "bypass=" or "oauth="). A quoted or braced value runs to its
-# closing character, however long (a bound would let a longer value through, since the bare
-# alternative cannot start on a quote); the scan stays linear because each alternative stops at
-# a fixed character or the end of the line.
-_SECRET_ASSIGNMENT: Final = re.compile(
-    r"(?i)((?:(?:api|private|access)[ _.-]?key|client[ _.-]?secret|password|passwd|passphrase"
-    r"|secret|token|apikey|authorization|cookie|session|bearer|credentials?|signature"
+# camelCase hump ("dbPass=", not "bypass=" or "oauth="). The value is a quoted or braced string
+# of at most 512 characters to its closing character, else a bare run up to whitespace or a
+# separator that may start on a quote or a brace and end on one: a longer or unterminated
+# quoted value is read bare, so it is still a value. The bounds are what keep the scan linear:
+# an unbounded quoted alternative made an unterminated opener repeated over the text quadratic
+# (15 s for 256 KiB of 'password={ '; review of 2026-11-02, spec 2.3 invariant 8).
+_SECRET_ASSIGNMENT_SOURCE: Final = (
+    r"(?i)((?:(?:api|private|access)[ _.-]?key|client[ _.-]?secret|password|passwd|passphrase"  # noqa: S105
+    r"|secret|token|authorization|cookie|session|bearer|credentials?|signature"
     r"|(?<![A-Za-z])(?:pwd|pass|auth|sig)|(?-i:(?<=[a-z0-9])(?:P(?i:wd|ass)|A(?i:uth)|S(?i:ig))))"
-    r"""\\?["']?[ \t]{0,16}[=:][ \t]{0,16}(?:(?:basic|bearer|digest)[ \t]{1,16})?)"""
+    r"""(?:\\?["']?[ \t]{0,16}[=:][ \t]{0,16}|[ \t]{1,16}(?=\\?["']))"""
+    r"""(?:(?:basic|bearer|digest)[ \t]{1,16})?)"""
     r"""(?!\\?["']?(?:<\*>|\[[A-Z_]+\]|(?:basic|bearer|digest)(?:[ \t]|\\?["']|$)|[\s,;&]|$)"""
     r"""|\\?["']\\?["'])"""
-    r"""(\\"[^"\n]*\\"|"[^"\n]*"|'[^'\n]*'|\{[^}\n]*\}"""
-    r"""|(?:[^\s"',;&\\]|\\(?!["']))+)"""
+    r"""(\\"[^"\n]{0,512}\\"|"[^"\n]{0,512}"|'[^'\n]{0,512}'|\{[^}\n]{0,512}\}"""
+    r"""|(?:\\?["'{](?:[^\s"',;&\\]|\\(?!["']))*|(?:[^\s"',;&\\]|\\(?!["']))+)["'}]?)"""
+)
+_JWT: Final = re.compile(_JWT_SOURCE)
+_CARTO_TOKEN: Final = re.compile(_CARTO_TOKEN_SOURCE)
+_AWS_KEY: Final = re.compile(_AWS_KEY_SOURCE)
+_URL_USERINFO: Final = re.compile(_URL_USERINFO_SOURCE)
+_EMAIL: Final = re.compile(_EMAIL_SOURCE)
+_SECRET_ASSIGNMENT: Final = re.compile(_SECRET_ASSIGNMENT_SOURCE)
+_UUID: Final = re.compile(
+    r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}"
 )
 
 VALUE_SHAPES: Final[tuple[tuple[str, re.Pattern[str]], ...]] = (

@@ -39,8 +39,8 @@ Rules, in the order :func:`redact` applies them to every event (key names first,
    and other, and Shannon entropy of at least 3.5 bits per character) -> ``[HIGH_ENTROPY]``; a
    secret word followed by ``=`` or ``:`` and a value in free text (``password=hunter2``,
    ``Authorization: Basic ...``, ``?token=...&``, ``{"password": "..."}``, ``;PWD=...;``) -> the
-   value becomes ``[REDACTED]`` unless an
-   earlier rule already masked it (``token=[JWT]`` and ``secret=[HIGH_ENTROPY]`` stay); lower-case
+   value becomes ``[REDACTED]`` (the HTTP auth scheme word stays) unless an earlier rule
+   already masked it (``token=[JWT]`` and ``secret=[HIGH_ENTROPY]`` stay); lower-case
    hex runs of eight or more characters holding both a letter and a digit (UUIDs, content hashes,
    the simulator's ``mk<8 hex>`` leak markers of spec 18.3) -> their shape; and
    identifier-shaped whitespace-delimited tokens -> their shape, digits to ``9`` and letters to
@@ -307,33 +307,52 @@ _KEY_SEPARATORS: Final = re.compile(r"[._\s-]+")
 _PEM_BEGIN: Final = "-----BEGIN"
 _PEM_END: Final = "-----END"
 _DASHES: Final = "-----"
+# The pattern sources below are mirrored in ``carto_schema.event`` under the same names as the
+# same text (that package depends on pydantic only, ADR 0069); a core test asserts the texts are
+# equal, so a change to one side is a change to both. Every quantifier is bounded or stops at a
+# fixed character, so each scan stays linear on attacker-written text (spec 2.3 invariant 8).
 # The look-behind keeps the scan linear: a run of base64url characters is tried once, not once
-# per "eyJ" inside it (an attacker-written log line is untrusted input, spec 2.3 invariant 8).
-_JWT: Final = re.compile(r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*")
-_CARTO_TOKEN: Final = re.compile(r"t[0-9]{1,4}\.[A-Za-z0-9_-]{22}")
-_AWS_KEY: Final = re.compile(r"(?:AKIA|ASIA)[0-9A-Z]{16}")
+# per "eyJ" inside it (an attacker-written log line is untrusted input).
+_JWT_SOURCE: Final = r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*"
+# carto_schema.forms.TOKEN_PATTERN without its anchors (key versions start at 1).
+_CARTO_TOKEN_SOURCE: Final = r"t[1-9][0-9]{0,3}\.[A-Za-z0-9_-]{22}"  # noqa: S105 - a pattern, not a credential
+_AWS_KEY_SOURCE: Final = r"(?:AKIA|ASIA)[0-9A-Z]{16}"
 # scheme://user:password@host -> the password only; the user name helps the operator and may
-# be empty (redis://:password@host).
-_URL_USERINFO: Final = re.compile(r"(?<=://)([^/\s@:]*):([^/\s@]+)(?=@)")
+# be empty (redis://:password@host); a mask or the template placeholder in the password slot
+# ("://carto:[REDACTED]@", "://carto:<*>@") is already masked.
+_URL_USERINFO_SOURCE: Final = r"(?<=://)([^/\s@:]*):(?!<\*>@|\[[A-Z_]+\]@)([^/\s@]+)(?=@)"
+# The look-behind stops a DSN user name (postgres://carto@db.internal) from reading as a mailbox.
+_EMAIL_SOURCE: Final = r"(?<![\w.%+/-])[\w.%+-]+@[\w.-]+\.[A-Za-z]{2,}(?![\w-])"
 # password=..., api-key: ..., Authorization: Basic ..., ?token=...&, {"password": "..."},
-# ;PWD={...};: the value after the secret word, up to whitespace or a separator (or a whole
-# quoted or braced string). The word may be closed by a quote, escaped or not, before the
-# separator, so JSON objects and Python reprs match. "token_count=3" and "secret_ref=vault://x"
-# do not match because "_" follows the word, not "=" or ":". The short words pwd, pass, auth and
-# sig must start a word or a camelCase hump ("dbPass=", not "bypass=" or "oauth="). A value that
-# an earlier rule already turned into a mask ("token=[JWT]") keeps the more specific mask. Every
-# quantifier is either bounded or stops at a fixed character, so the scan stays linear on
-# attacker-written text (spec 2.3 invariant 8).
-_SECRET_ASSIGNMENT: Final = re.compile(
-    r"(?i)((?:api|private|access)[\s_.-]?key|client[\s_.-]?secret|password|passwd|passphrase"
+# ;PWD={...};, secret "...": group 1 is the secret word, the separator ("=" or ":", or a space
+# before a quoted value) and an HTTP auth scheme, group 2 the value. The word may be closed by a
+# quote, escaped or not, before the separator, so JSON objects and Python reprs match.
+# "token_count=3" and "secret_ref=vault://x" do not match because "_" follows the word, not "="
+# or ":". The short words pwd, pass, auth and sig must start a word or a camelCase hump
+# ("dbPass=", not "bypass=" or "oauth="). A value that an earlier rule already turned into a
+# mask ("token=[JWT]"), the template placeholder or an empty quoted string is left alone. The
+# value is a quoted or braced string of at most 512 characters to its closing character, else a
+# bare run up to whitespace or a separator that may start on a quote or a brace and end on one:
+# a longer or unterminated quoted value is read bare, so it is still masked. The bounds are what
+# keep the scan linear: an unbounded quoted alternative made an unterminated opener repeated
+# over the text quadratic (15 s for 256 KiB of 'password={ '; review of 2026-11-02).
+_SECRET_ASSIGNMENT_SOURCE: Final = (
+    r"(?i)((?:(?:api|private|access)[ _.-]?key|client[ _.-]?secret|password|passwd|passphrase"  # noqa: S105
     r"|secret|token|authorization|cookie|session|bearer|credentials?|signature"
     r"|(?<![A-Za-z])(?:pwd|pass|auth|sig)|(?-i:(?<=[a-z0-9])(?:P(?i:wd|ass)|A(?i:uth)|S(?i:ig))))"
-    r"""(\\?["']?[ \t]{0,16}[=:][ \t]{0,16}|[ \t]{1,16}(?=\\?["']))(?!\\?["']?\[[A-Z_]+\])"""
-    r"""(?:(?:basic|bearer|digest)[ \t]{1,16})?"""
-    r"""(?:\\"[^"\n]*\\"|"[^"\n]*"|'[^'\n]*'|\{[^}\n]*\}|[^\s,;&]+)"""
+    r"""(?:\\?["']?[ \t]{0,16}[=:][ \t]{0,16}|[ \t]{1,16}(?=\\?["']))"""
+    r"""(?:(?:basic|bearer|digest)[ \t]{1,16})?)"""
+    r"""(?!\\?["']?(?:<\*>|\[[A-Z_]+\]|(?:basic|bearer|digest)(?:[ \t]|\\?["']|$)|[\s,;&]|$)"""
+    r"""|\\?["']\\?["'])"""
+    r"""(\\"[^"\n]{0,512}\\"|"[^"\n]{0,512}"|'[^'\n]{0,512}'|\{[^}\n]{0,512}\}"""
+    r"""|(?:\\?["'{](?:[^\s"',;&\\]|\\(?!["']))*|(?:[^\s"',;&\\]|\\(?!["']))+)["'}]?)"""
 )
-# The look-behind stops a DSN user name (postgres://carto@db.internal) from reading as a mailbox.
-_EMAIL: Final = re.compile(r"(?<![\w.%+/-])[\w.%+-]+@[\w.-]+\.[A-Za-z]{2,}(?![\w-])")
+_JWT: Final = re.compile(_JWT_SOURCE)
+_CARTO_TOKEN: Final = re.compile(_CARTO_TOKEN_SOURCE)
+_AWS_KEY: Final = re.compile(_AWS_KEY_SOURCE)
+_URL_USERINFO: Final = re.compile(_URL_USERINFO_SOURCE)
+_EMAIL: Final = re.compile(_EMAIL_SOURCE)
+_SECRET_ASSIGNMENT: Final = re.compile(_SECRET_ASSIGNMENT_SOURCE)
 _ENTROPY_CANDIDATE: Final = re.compile(r"[A-Za-z0-9+/_-]+=*")
 _ENTROPY_OTHER: Final = frozenset("+/=_-")
 _HEX_RUN: Final = re.compile(rf"[0-9a-f]{{{HEX_RUN_MIN_LENGTH},}}")
@@ -486,7 +505,7 @@ def mask_string(value: str) -> str:
     value = _URL_USERINFO.sub(rf"\1:{REDACTED}", value)
     value = _EMAIL.sub(EMAIL_MASK, value)
     value = _ENTROPY_CANDIDATE.sub(_entropy_replacement, value)
-    value = _SECRET_ASSIGNMENT.sub(rf"\1\2{REDACTED}", value)
+    value = _SECRET_ASSIGNMENT.sub(rf"\1{REDACTED}", value)
     value = _HEX_RUN.sub(_hex_replacement, value)
     return "".join(_shape_if_identifier(piece) for piece in _WHITESPACE.split(value))
 

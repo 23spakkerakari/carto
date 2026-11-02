@@ -398,8 +398,10 @@ def test_urls_without_userinfo_survive(value: str) -> None:
         (f"api_key={PLANTED}, retry", f"api_key={REDACTED}, retry"),
         (f"x-api-key: {PLANTED}", f"x-api-key: {REDACTED}"),
         (f"client secret = {PLANTED}", f"client secret = {REDACTED}"),
-        ("Authorization: Basic dXNlcjpwYXNz", f"Authorization: {REDACTED}"),
-        (f"Authorization: Bearer {JWT}", f"Authorization: {REDACTED}"),
+        # the HTTP auth scheme is not the secret and stays, as in carto_schema's mirror
+        ("Authorization: Basic dXNlcjpwYXNz", f"Authorization: Basic {REDACTED}"),
+        (f"Authorization: Bearer {JWT}", f"Authorization: Bearer {JWT_MASK}"),
+        (f"Authorization: Bearer {PLANTED}", f"Authorization: Bearer {REDACTED}"),
         (f"GET /cb?token={PLANTED}&next=/home", f"GET /cb?token={REDACTED}&next=/home"),
         (f"password='{PLANTED} two words'; done", f"password={REDACTED}; done"),
         (f'passwd="{PLANTED}"', f"passwd={REDACTED}"),
@@ -436,13 +438,34 @@ def test_urls_without_userinfo_survive(value: str) -> None:
             f"login failed for jsmith with secret {REDACTED}",
         ),
         (f"Password '{PLANTED} x' rejected", f"Password {REDACTED} rejected"),
-        # a quoted value longer than any bound a quoted alternative may be given
+        # a quoted value longer than the 512-character bound of the quoted alternative is read
+        # bare up to whitespace, quotes included
         (f'password="{PLANTED}{"x" * 600}"', f"password={REDACTED}"),
         (f"{{'token': '{PLANTED}{'x' * 600}'}}", f"{{'token': {REDACTED}}}"),
+        # an unterminated quoted or braced value is read bare too
+        (f'password="{PLANTED}', f"password={REDACTED}"),
+        (f"token='{PLANTED}", f"token={REDACTED}"),
+        (f"secret={{{PLANTED}", f"secret={REDACTED}"),
     ],
 )
 def test_secret_assignments_in_free_text_are_masked(value: str, expected: str) -> None:
     assert mask_string(value) == expected
+
+
+HOSTILE_UNITS = ["password={ ", 'password="a', "token='"]
+HOSTILE_BYTES = 256 * 1024
+
+
+@pytest.mark.parametrize("unit", HOSTILE_UNITS)
+def test_an_unterminated_opener_costs_linear_time_at_256_kib(unit: str) -> None:
+    """Spec 2.3 invariant 8: 256 KiB of a repeated unterminated opener is masked in well under
+    a second (review of 2026-11-02: an unbounded quoted alternative took 15 s on the braced
+    one)."""
+    value = (unit * (HOSTILE_BYTES // len(unit) + 1))[:HOSTILE_BYTES]
+    start = perf_counter()
+    masked = mask_string(value)
+    assert perf_counter() - start < 1.0
+    assert REDACTED in masked
 
 
 @pytest.mark.parametrize(
