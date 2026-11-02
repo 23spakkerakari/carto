@@ -368,6 +368,9 @@ def test_strings_that_are_not_aws_keys_survive(value: str) -> None:
             f"dsn postgres://carto:{REDACTED}@db/carto failed",
         ),
         (f"postgres://carto:{PLANTED}@db:5432/carto", f"AAAAAAAA://AAAAA:{REDACTED}@AA:9999/AAAAA"),
+        # a password with no user name (redis, memcached): the user slot is empty
+        (f"redis://:{PLANTED}@cache/0", f"redis://:{REDACTED}@cache/0"),
+        (f"redis://:{PLANTED}@cache:6379", f"AAAAA://:{REDACTED}@AAAAA:9999"),
     ],
 )
 def test_url_userinfo_passwords_are_masked(value: str, expected: str) -> None:
@@ -433,6 +436,9 @@ def test_urls_without_userinfo_survive(value: str) -> None:
             f"login failed for jsmith with secret {REDACTED}",
         ),
         (f"Password '{PLANTED} x' rejected", f"Password {REDACTED} rejected"),
+        # a quoted value longer than any bound a quoted alternative may be given
+        (f'password="{PLANTED}{"x" * 600}"', f"password={REDACTED}"),
+        (f"{{'token': '{PLANTED}{'x' * 600}'}}", f"{{'token': {REDACTED}}}"),
     ],
 )
 def test_secret_assignments_in_free_text_are_masked(value: str, expected: str) -> None:

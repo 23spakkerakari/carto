@@ -49,6 +49,17 @@ Alice Smith by manager`` three times is one message, not three, and the name sta
 parameter. The store keeps up to :data:`MAX_DISTINCT_DIGESTS` short digests of the distinct
 messages per cluster, persisted with the cluster; a message's words are never in the state.
 
+**The constant filter** (ADR 0068). Three messages that differ only in a masked token
+(``Refund approved for Alice Smith attempt 1``, ``... attempt 2``, ``... attempt 3``) are three
+distinct messages whose shared words would become constants, the name among them. When a
+cluster first reaches :data:`MIN_CLUSTER_SIZE` distinct messages the store hands the template's
+constant words, joined, to the ``constant_filter`` it was built with
+(:func:`pii_constant_filter` wraps the edge's PII detector: a PERSON, LOCATION or any other
+entity hit at the configured score, and a filter that raises, is a hit). On a hit the cluster is
+marked ``pii`` and stays all parameters for good; without one the template is used as before.
+The verdict is taken once per cluster and persisted with it (``"p"``); without a filter (a bare
+``TemplateStore()``) every template is allowed, which is the behaviour before this rule.
+
 **Frozen replay.** The offline analyzer reads its input twice (ADR 0017). Mining the second
 pass would count every message again, so a message seen twice would reach
 :data:`MIN_CLUSTER_SIZE` and travel with its words as constants. After
@@ -69,7 +80,7 @@ import hashlib
 import json
 import re
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -82,7 +93,7 @@ from drain3.template_miner_config import TemplateMinerConfig
 
 from carto_common.logging import get_logger
 from carto_edge.pipeline.classify import is_secret_name
-from carto_edge.pipeline.pii import looks_like_secret
+from carto_edge.pipeline.pii import PiiDetector, looks_like_secret
 from carto_schema.event import (
     MAX_TEMPLATE_TEXT_LEN,
     SOURCE_ID_PATTERN,
@@ -90,17 +101,20 @@ from carto_schema.event import (
 )
 
 __all__ = [
+    "DEFAULT_SCORE_THRESHOLD",
     "MASK",
     "MAX_DISTINCT_DIGESTS",
     "MAX_MESSAGE_TOKENS",
     "MAX_STATE_BYTES",
     "MIN_CLUSTER_SIZE",
     "STATE_VERSION",
+    "ConstantFilter",
     "TemplateRecord",
     "TemplateStore",
     "compute_template_id",
     "generalize_name",
     "mask_tokens",
+    "pii_constant_filter",
 ]
 
 MASK: Final = "<*>"
@@ -108,15 +122,23 @@ MASK: Final = "<*>"
 MAX_MESSAGE_TOKENS: Final = 512
 """Tokens of one message fed to Drain3; the rest is cut (bounded work per record)."""
 MAX_STATE_BYTES: Final = 64 * 1024 * 1024
-STATE_VERSION: Final = 2
+STATE_VERSION: Final = 3
 """Version written. Version 1 files (no digests) load with every cluster's digests empty, so
-their templates earn their constants again from distinct messages (ADR 0068)."""
-_READABLE_VERSIONS: Final = frozenset({1, STATE_VERSION})
+their templates earn their constants again from distinct messages; version 2 files load with
+their digests (the same meaning) and without constant-filter verdicts, which are taken again
+at the next use of each promoted cluster (ADR 0068)."""
+_READABLE_VERSIONS: Final = frozenset({1, 2, STATE_VERSION})
+_VERSIONS_WITH_DIGESTS: Final = frozenset({2, STATE_VERSION})
 MIN_CLUSTER_SIZE: Final = 3
 """Distinct messages a Drain3 cluster needs before its common words count as constants."""
 MAX_DISTINCT_DIGESTS: Final = 8
 """Digests of distinct messages kept per cluster; counting stops there (bounded state)."""
 _DIGEST_BYTES: Final = 6
+DEFAULT_SCORE_THRESHOLD: Final = 0.5
+"""Detector score a hit needs for :func:`pii_constant_filter` when the detector carries no
+settings (the spec default, the same as the classifier's)."""
+ConstantFilter = Callable[[Sequence[str]], bool]
+"""Given a template's constant tokens, whether they may travel as constants (ADR 0068)."""
 _PEM_BEGIN: Final = "-----BEGIN"
 _PEM_END: Final = "-----END"
 _URL_USERINFO: Final = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^/\s@]+@")
@@ -302,6 +324,9 @@ class _SystemState:
     registry: dict[str, _Entry]
     distinct: dict[int, list[str]] = field(default_factory=dict)
     """Cluster id -> digests of up to ``MAX_DISTINCT_DIGESTS`` distinct messages (ADR 0068)."""
+    pii: dict[int, bool] = field(default_factory=dict)
+    """Cluster id -> the constant filter's verdict once taken: ``True`` when its constants hit
+    (the cluster stays all parameters for good), ``False`` when they passed (ADR 0068)."""
     dirty: bool = False
 
 
@@ -366,13 +391,16 @@ def _node_from_json(data: Any, depth: int) -> Node:
     return node
 
 
-def _drain_to_json(drain: Drain, distinct: dict[int, list[str]]) -> dict[str, Any]:
+def _drain_to_json(
+    drain: Drain, distinct: dict[int, list[str]], pii: dict[int, bool]
+) -> dict[str, Any]:
     clusters = [
         {
             "id": cluster.cluster_id,
             "tokens": list(cluster.log_template_tokens),
             "size": cluster.size,
             "d": distinct.get(cluster.cluster_id, []),
+            **({"p": pii[cluster.cluster_id]} if cluster.cluster_id in pii else {}),
         }
         for cluster in drain.id_to_cluster.values()
     ]
@@ -397,8 +425,11 @@ def _digests_from_json(data: Any) -> list[str]:
     return list(dict.fromkeys(data))
 
 
-def _drain_from_json(drain: Drain, data: dict[str, Any]) -> dict[int, list[str]]:
-    """Restore the tree and the clusters into ``drain``; returns the distinct digests."""
+def _drain_from_json(
+    drain: Drain, data: dict[str, Any], *, with_digests: bool
+) -> tuple[dict[int, list[str]], dict[int, bool]]:
+    """Restore the tree and the clusters into ``drain``; returns the distinct digests (empty
+    for every cluster unless ``with_digests``) and the constant-filter verdicts (``"p"``)."""
     clusters = data.get("clusters")
     counter = data.get("counter")
     if not isinstance(clusters, list) or not isinstance(counter, int) or counter < 0:
@@ -407,6 +438,7 @@ def _drain_from_json(drain: Drain, data: dict[str, Any]) -> dict[int, list[str]]
     root = _node_from_json(data.get("tree"), 0)
     restored: list[LogCluster] = []
     distinct: dict[int, list[str]] = {}
+    pii: dict[int, bool] = {}
     for item in clusters:
         if not isinstance(item, dict):
             msg = "invalid cluster"
@@ -429,14 +461,20 @@ def _drain_from_json(drain: Drain, data: dict[str, Any]) -> dict[int, list[str]]
         cluster = LogCluster(tokens, cluster_id)
         cluster.size = size
         restored.append(cluster)
-        digests = _digests_from_json(item.get("d"))
+        digests = _digests_from_json(item.get("d")) if with_digests else []
         if digests:
             distinct[cluster_id] = digests
+        verdict = item.get("p")
+        if verdict is not None:
+            if not isinstance(verdict, bool):
+                msg = "invalid cluster verdict"
+                raise ValueError(msg)
+            pii[cluster_id] = verdict
     for cluster in restored:
         drain.id_to_cluster[cluster.cluster_id] = cluster
     drain.clusters_counter = counter
     drain.root_node = root
-    return distinct
+    return distinct, pii
 
 
 def _registry_to_json(registry: dict[str, _Entry]) -> list[dict[str, Any]]:
@@ -500,7 +538,9 @@ class TemplateStore:
     """Drain3 miners, template ids and the template registry, per system (spec 8.2 item 6).
 
     ``directory`` is ``EdgeSettings.templates_dir``; ``None`` keeps everything in memory (tests,
-    one-shot runs). Not thread-safe: the gateway owns one store per pipeline worker.
+    one-shot runs). ``constant_filter`` is consulted once per cluster when it earns its
+    constants (module docstring, "The constant filter"); ``None`` allows every template. Not
+    thread-safe: the gateway owns one store per pipeline worker.
     """
 
     def __init__(
@@ -511,8 +551,10 @@ class TemplateStore:
         max_clusters: int = DEFAULT_MAX_CLUSTERS,
         cache_size: int = DEFAULT_CACHE_SIZE,
         min_cluster_size: int = MIN_CLUSTER_SIZE,
+        constant_filter: ConstantFilter | None = None,
     ) -> None:
         self._directory = directory
+        self._constant_filter = constant_filter
         self._min_cluster_size = max(1, min_cluster_size)
         self._flush_interval = max(0.0, flush_interval_seconds)
         self._max_clusters = max(1, max_clusters)
@@ -562,9 +604,10 @@ class TemplateStore:
             template = str(result["template_mined"])
             if result["change_type"] == _CHANGED or len(state.cache) >= self._cache_size:
                 state.cache.clear()
-            if self._note_distinct(state, int(result["cluster_id"]), tokens) >= (
+            cluster_id = int(result["cluster_id"])
+            if self._note_distinct(state, cluster_id, tokens) >= (
                 self._min_cluster_size
-            ):
+            ) and self._allows(state, cluster_id, template):
                 state.cache[masked] = template
             else:
                 template = " ".join(MASK for _ in tokens)  # not yet a constant: all parameters
@@ -586,6 +629,10 @@ class TemplateStore:
     def frozen(self) -> bool:
         return self._frozen
 
+    @property
+    def constant_filter(self) -> ConstantFilter | None:
+        return self._constant_filter
+
     def _note_distinct(self, state: _SystemState, cluster_id: int, tokens: Sequence[str]) -> int:
         """Count the message among the distinct messages of its cluster (bounded) and return
         how many the cluster holds. Identical repeats count once (ADR 0068)."""
@@ -595,6 +642,7 @@ class TemplateStore:
                 live = state.miner.drain.id_to_cluster
                 for stale in [cid for cid in state.distinct if cid not in live]:
                     del state.distinct[stale]
+                    state.pii.pop(stale, None)
             digests = state.distinct[cluster_id] = []
         if len(digests) < MAX_DISTINCT_DIGESTS:
             digest = _message_digest(" ".join(tokens))
@@ -602,16 +650,43 @@ class TemplateStore:
                 digests.append(digest)
         return len(digests)
 
+    def _allows(self, state: _SystemState, cluster_id: int, template: str) -> bool:
+        """Whether the cluster's constants may travel: the constant filter's verdict, taken at
+        the cluster's first promotion and kept with it (module docstring). A filter that
+        raises is a hit: the store fails closed and logs the cluster id, never the words."""
+        verdict = state.pii.get(cluster_id)
+        if verdict is None:
+            constants = [token.removesuffix(MASK) for token in template.split(" ") if token != MASK]
+            if self._constant_filter is None or not constants:
+                verdict = False
+            else:
+                try:
+                    verdict = not self._constant_filter(constants)
+                except Exception as exc:  # fail closed: the cluster stays all parameters
+                    _log().warning(
+                        "template_constant_filter_failed",
+                        cluster_id=cluster_id,
+                        error=type(exc).__name__,
+                    )
+                    verdict = True
+            state.pii[cluster_id] = verdict
+            state.dirty = True
+        return not verdict
+
     def _match(self, state: _SystemState, masked: str, token_count: int) -> str:
         """The template of the cluster ``masked`` belongs to, or all parameters when it has
-        none or fewer than ``min_cluster_size`` distinct messages."""
+        none, fewer than ``min_cluster_size`` distinct messages or constants the filter
+        refused."""
         cluster = state.miner.match(masked, full_search_strategy="fallback")
         if (
             cluster is None
             or len(state.distinct.get(cluster.cluster_id, ())) < self._min_cluster_size
         ):
             return " ".join(MASK for _ in range(token_count))
-        return str(cluster.get_template())
+        template = str(cluster.get_template())
+        if not self._allows(state, cluster.cluster_id, template):
+            return " ".join(MASK for _ in range(token_count))
+        return template
 
     def template_id(self, system_id: str, template_text: str) -> str:
         """:func:`compute_template_id`, memoised per (system, text)."""
@@ -712,7 +787,7 @@ class TemplateStore:
         payload = {
             "version": STATE_VERSION,
             "system_id": system_id,
-            **_drain_to_json(state.miner.drain, state.distinct),
+            **_drain_to_json(state.miner.drain, state.distinct, state.pii),
             "registry": _registry_to_json(state.registry),
         }
         temporary = path.with_name(path.name + ".tmp")
@@ -743,7 +818,9 @@ class TemplateStore:
                 msg = "unknown template state version"
                 raise ValueError(msg)
             registry = _registry_from_json(data.get("registry", []))
-            state.distinct = _drain_from_json(state.miner.drain, data)
+            state.distinct, state.pii = _drain_from_json(
+                state.miner.drain, data, with_digests=data["version"] in _VERSIONS_WITH_DIGESTS
+            )
             state.registry = registry
         except (OSError, ValueError, TypeError, KeyError, RecursionError) as exc:
             _log().warning(
@@ -755,6 +832,7 @@ class TemplateStore:
             state.miner = TemplateMiner(config=_miner_config(self._max_clusters))
             state.registry = {}
             state.distinct = {}
+            state.pii = {}
 
     def _state(self, system_id: str) -> _SystemState:
         state = self._states.get(system_id)
@@ -771,6 +849,26 @@ class TemplateStore:
                 self._load(system_id, state)
             self._states[system_id] = state
         return state
+
+
+def pii_constant_filter(detector: PiiDetector) -> ConstantFilter:
+    """A :data:`ConstantFilter` over the edge's PII detector (ADR 0068): the joined constants
+    may travel unless the detector reports any entity (PERSON, LOCATION, an e-mail address,
+    a phone number, a government id, a card number, an IBAN, a medical licence) at or above
+    the detector's configured score (``pii.score_threshold``, else
+    :data:`DEFAULT_SCORE_THRESHOLD`, the classifier's rule). The regex detector of
+    ``pii.enabled=false`` knows no names (ADR 0020)."""
+    settings = getattr(detector, "settings", None)
+    configured = getattr(settings, "score_threshold", None)
+    threshold = (
+        float(configured) if isinstance(configured, int | float) else DEFAULT_SCORE_THRESHOLD
+    )
+
+    def allows(constants: Sequence[str]) -> bool:
+        text = " ".join(constants)
+        return not any(hit.score >= threshold for hit in detector.detect(text))
+
+    return allows
 
 
 def _log() -> Any:

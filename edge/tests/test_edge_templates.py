@@ -14,6 +14,7 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
+from carto_edge.pipeline.pii import PiiHit
 from carto_edge.pipeline.templates import (
     MASK,
     MAX_DISTINCT_DIGESTS,
@@ -22,6 +23,7 @@ from carto_edge.pipeline.templates import (
     TemplateStore,
     compute_template_id,
     generalize_name,
+    pii_constant_filter,
 )
 from carto_schema.event import MAX_TEMPLATE_TEXT_LEN, TEMPLATE_ID_PATTERN, EventKind
 
@@ -323,6 +325,109 @@ def test_three_distinct_messages_sharing_constants_mine_the_template() -> None:
     assert store.mine("sys_web", lines[0]) == ("Refund approved for <*> by manager", ["MKALPHA"])
 
 
+ALICE_LINES = [f"Refund approved for Alice Smith attempt {n}" for n in range(1, 4)]
+ALL_PARAMS_7 = " ".join([MASK] * 7)
+
+
+def _flags_alice(constants: list[str]) -> bool:
+    """A constant filter standing in for the detector: a PERSON hit on the name."""
+    return "Alice" not in constants
+
+
+def test_the_constant_filter_keeps_a_name_out_of_the_constants(tmp_path: Path) -> None:
+    """The review's second case: three retries that differ only in a counter are three distinct
+    messages whose shared words, the name among them, would become constants. The constant
+    filter (the detector, in the runtime) refuses them and the cluster stays all parameters for
+    good; the verdict is persisted with the cluster (ADR 0068)."""
+    with TemplateStore(tmp_path, constant_filter=_flags_alice) as store:
+        for line in ALICE_LINES:
+            template, params = store.mine("sys_web", line)
+            assert template == ALL_PARAMS_7
+            assert params == line.split()
+        # Later variants never promote it either, and the name is only ever a parameter.
+        template, params = store.mine("sys_web", "Refund approved for Alice Smith attempt 44")
+        assert template == ALL_PARAMS_7
+        assert "Alice" in params
+        # Ordinary lines, constants plus masked parameters, mine their template as before.
+        for n, size in enumerate((23891, 118, 7730), start=1):
+            template, params = store.mine(
+                "sys_web", f"SFTP upload complete: SHIP_2026092{n}_2112.csv ({size} bytes)"
+            )
+        assert template == "SFTP upload complete: <*> <*> bytes)"
+        assert params == ["SHIP_20260923_2112.csv", "(7730"]
+        for user in ("alice", "bob", "carol"):
+            template, params = store.mine("sys_web", f"session opened user={user} host:edge")
+        assert template == f"session opened user={MASK} host:{MASK}"
+        assert params == ["carol", "edge"]
+    # The verdict is persisted with the cluster (the Drain3 state is edge-local, as before).
+    state = json.loads((tmp_path / "sys_web.json").read_text(encoding="utf-8"))
+    verdicts = {" ".join(c["tokens"]): c.get("p") for c in state["clusters"]}
+    assert verdicts["Refund approved for Alice Smith attempt <*>"] is True
+    assert verdicts["SFTP upload complete: <*> <*> bytes)"] is False
+    # The verdict survives a restart, even one whose filter would now allow the words.
+    reloaded = TemplateStore(tmp_path, constant_filter=lambda _constants: True)
+    assert reloaded.mine("sys_web", ALICE_LINES[0])[0] == ALL_PARAMS_7
+    reloaded.freeze()
+    assert reloaded.mine("sys_web", ALICE_LINES[1])[0] == ALL_PARAMS_7
+    assert reloaded.mine("sys_web", "SFTP upload complete: SHIP_x.csv (9 bytes)")[0] == (
+        "SFTP upload complete: <*> <*> bytes)"
+    )
+
+
+def test_the_constant_filter_runs_once_per_cluster_and_fails_closed() -> None:
+    seen: list[list[str]] = []
+
+    def record(constants: list[str]) -> bool:
+        seen.append(list(constants))
+        return True
+
+    store = TemplateStore(constant_filter=record)
+    for n in range(1, 6):
+        store.mine("sys_web", f"Refund approved for Alice Smith attempt {n}")
+    assert seen == [["Refund", "approved", "for", "Alice", "Smith", "attempt"]]
+    for user in ("alice", "bob", "carol"):
+        store.mine("sys_web", f"session opened user={user} host:edge")
+    assert seen[1] == ["session", "opened", "user=", "host:"]
+    assert len(seen) == 2
+
+    def broken(_constants: list[str]) -> bool:
+        msg = "detector unavailable"
+        raise RuntimeError(msg)
+
+    failing = TemplateStore(constant_filter=broken)
+    for line in ALICE_LINES:
+        assert failing.mine("sys_web", line)[0] == ALL_PARAMS_7
+    assert failing.mine("sys_web", "Refund approved for Alice Smith attempt 9")[0] == ALL_PARAMS_7
+
+
+class _FakeDetector:
+    """Reports a PERSON on ``Alice`` at the score it was built with."""
+
+    def __init__(self, score: float, threshold: float | None = None) -> None:
+        self.score = score
+        self.texts: list[str] = []
+        if threshold is not None:
+            self.settings = type("Settings", (), {"score_threshold": threshold})()
+
+    def detect(self, text: str) -> list[PiiHit]:
+        self.texts.append(text)
+        start = text.find("Alice")
+        return [] if start < 0 else [PiiHit("PERSON", start, start + 5, self.score)]
+
+
+def test_pii_constant_filter_asks_the_detector_at_its_threshold() -> None:
+    strong = _FakeDetector(0.85)
+    assert pii_constant_filter(strong)(["Refund", "approved", "for", "Alice"]) is False
+    assert strong.texts == ["Refund approved for Alice"]
+    assert pii_constant_filter(strong)(["Refund", "approved"]) is True
+    weak = _FakeDetector(0.4)  # below the 0.5 default: no hit
+    assert pii_constant_filter(weak)(["Alice"]) is True
+    assert pii_constant_filter(_FakeDetector(0.4, threshold=0.3))(["Alice"]) is False
+    store = TemplateStore(constant_filter=pii_constant_filter(strong))
+    for line in ALICE_LINES:
+        assert store.mine("sys_web", line)[0] == ALL_PARAMS_7
+
+
 def test_distinct_message_digests_are_persisted_and_bounded(tmp_path: Path) -> None:
     with TemplateStore(tmp_path) as store:
         store.mine("sys_web", "voucher MKALPHA redeemed by staff")
@@ -330,7 +435,7 @@ def test_distinct_message_digests_are_persisted_and_bounded(tmp_path: Path) -> N
         store.mine("sys_web", "voucher MKBRAVO redeemed by staff")
     raw = (tmp_path / "sys_web.json").read_text(encoding="utf-8")
     state = json.loads(raw)
-    assert state["version"] == STATE_VERSION == 2
+    assert state["version"] == STATE_VERSION == 3
     (cluster,) = state["clusters"]
     assert len(cluster["d"]) == 2  # two distinct messages, one repeat
     assert all(len(digest) == 12 for digest in cluster["d"])
@@ -372,6 +477,43 @@ def test_version_one_state_loads_with_constants_to_be_earned_again(tmp_path: Pat
     )
     reloaded.flush()
     assert json.loads(path.read_text(encoding="utf-8"))["version"] == STATE_VERSION
+
+
+def test_version_two_state_loads_with_its_digests_and_no_verdicts(tmp_path: Path) -> None:
+    """A version 2 file holds the same digests as version 3 and no constant-filter verdicts:
+    the digests are kept and a promoted cluster is judged at its next use (ADR 0068)."""
+    with TemplateStore(tmp_path) as store:
+        for line in ALICE_LINES:
+            store.mine("sys_web", line)
+        for name in ("MKALPHA", "MKBRAVO"):
+            store.mine("sys_web", f"voucher {name} redeemed by staff")
+    path = tmp_path / "sys_web.json"
+    state = json.loads(path.read_text(encoding="utf-8"))
+    assert [c.get("p") for c in state["clusters"]] == [False, None]  # judged, not yet promoted
+    state["version"] = 2
+    for cluster in state["clusters"]:
+        cluster.pop("p", None)
+    path.write_text(json.dumps(state), encoding="utf-8")
+    reloaded = TemplateStore(tmp_path, constant_filter=_flags_alice)
+    assert reloaded.mine("sys_web", ALICE_LINES[0])[0] == ALL_PARAMS_7  # judged again: a hit
+    assert reloaded.mine("sys_web", "voucher MKCHARLIE redeemed by staff")[0] == (
+        "voucher <*> redeemed by staff"  # the two digests were kept: the third promotes
+    )
+    reloaded.flush()
+    state = json.loads(path.read_text(encoding="utf-8"))
+    assert state["version"] == STATE_VERSION
+    assert [c.get("p") for c in state["clusters"]] == [True, False]
+    assert hashlib.blake2b(b"x", digest_size=6).hexdigest() not in str(state)  # sanity
+
+
+def test_an_invalid_verdict_makes_the_state_file_unreadable(tmp_path: Path) -> None:
+    with TemplateStore(tmp_path) as store:
+        store.mine("sys_web", "voucher MKALPHA redeemed by staff")
+    path = tmp_path / "sys_web.json"
+    state = json.loads(path.read_text(encoding="utf-8"))
+    state["clusters"][0]["p"] = "yes"
+    path.write_text(json.dumps(state), encoding="utf-8")
+    assert TemplateStore(tmp_path).cluster_count("sys_web") == 0
 
 
 def test_invalid_digests_make_the_state_file_unreadable(tmp_path: Path) -> None:

@@ -55,8 +55,8 @@ In the order they are tried; the words are what the error message says.
 | a JWT | `eyJ` + base64url, dot, base64url, dot, base64url |
 | a carto token | `t<1-4 digits>.<22 base64url>` (`carto_schema.forms.TOKEN_PATTERN`, unanchored) |
 | an AWS access key id | `AKIA` or `ASIA` + 16 upper-case alphanumerics |
-| a URL with a password | `://user:password@` (the password is the shape; `://carto:<*>@` is already masked and passes) |
-| a secret-named key with a value | a word of `carto_common.logging.SECRET_KEY_WORDS` or pair of `SECRET_KEY_PAIRS`, `=` or `:`, a value that is not `<*>`, a `[MASK]` or empty |
+| a URL with a password | `://user:password@`, the user name possibly empty (`redis://:pw@`); the password is the shape, and `://carto:<*>@` is already masked and passes |
+| a secret-named key with a value | a word of `carto_common.logging.SECRET_KEY_WORDS` or pair of `SECRET_KEY_PAIRS`, `=` or `:`, a value that is not `<*>`, a `[MASK]` or empty; a quoted or braced value runs to its closing character however long (the review of 2026-11-02 found a 512-character bound that let a longer quoted value through) |
 | an email address | local part, `@`, domain with a dotted TLD (a DSN user name does not match) |
 | a UUID | 8-4-4-4-12 hex |
 | a run of 16 or more hex characters | `[0-9A-Fa-f]{16,}` |
@@ -69,8 +69,13 @@ pass and are the positive tests.
 
 ## Why refuse at ingest rather than mask
 
-A masked value is silently lost and the edge that leaked it keeps leaking. A 422 parks the batch
-at the edge (spec 8.5, ADR 0036), the source's health shows it and the operator sees which
+A masked value is silently lost and the edge that leaked it keeps leaking. A refusal is seen.
+An edge of the same version validates every event against the same contract model before it
+forwards it (`carto_edge.pipeline.pipeline`, which drops the record with reason `contract` and
+logs `event_contract_violation` with the field locations, never the value), so a record that
+carries a shape never leaves such an edge and core's 422 is the version-skew case: an older
+edge whose contract model lacks the rule, or a non-Python edge. Then the 422 parks the batch at
+the edge (spec 8.5, ADR 0036), the source's health shows it and the operator sees which
 template or field the edge misclassified. The same holds for a hand-edited bundle and for an
 inventory. The only place that masks is the LLM payload, which cannot refuse: it is built from
 rows that were accepted already, and a provider call that fails over one text would stop the
@@ -102,11 +107,17 @@ and the edge forward and inventory tests pass against the stricter contract.
   shape named, never the value. Roll the edge before the core when a release tightens the list.
 
 - An edge that classifies a secret-looking constant as low-cardinality (`session: expired`,
-  `token: invalid` in a log template) is refused and parks the batch; the template builder is
-  the place to fix that, not the rule. The eval bundles carry no such template today.
+  `token: invalid` in a log template) drops the record at its own pipeline (reason `contract`,
+  counted and logged by location) when it runs this contract version, and is refused with a
+  parked batch when it runs an older one; the template builder is the place to fix that, not
+  the rule. The eval bundles carry no such template today.
 - A six-digit low-cardinality code (a compact date, a branch number) in an attribute is refused;
   the edge classifies those as `date` or tokenizes them, and none appears in the eval bundles.
 - The JSON Schemas do not express the rule; a non-Python edge must apply the same shapes.
+- `read_bundle_metadata` raises `BundleError` naming the file and never the text; the
+  `TypeAdapter(list[...])` instances it validates with carry `hide_input_in_errors` themselves
+  (`core/carto_core/bundle.py`, the same commit), so the chained `ValidationError` does not
+  render the refused text either.
 
 ## Not built
 
@@ -116,10 +127,5 @@ and the edge forward and inventory tests pass against the stricter contract.
 - Attribute keys are under the field-name rule (ADR 0027) but not under the secret-key rule;
   the edge drops `secret_like` fields and a key named `password` with a masked value carries
   nothing. The LLM payload does not drop such keys either.
-- `read_bundle_metadata` raises `BundleError` naming the file and never the text, but the
-  `ValidationError` chained as its cause comes from a `TypeAdapter(list[...])`, whose
-  rendering is not under the models' `hide_input_in_errors` and so carries the refused text;
-  `core/carto_core/bundle.py` is outside this package and the one-line fix (`from None`, or
-  the adapter's own config) is left to its owner.
 - The console renders stored values as before; it never had a masking step and the contract now
   guarantees it needs none. Rows written before this change are not rescanned.

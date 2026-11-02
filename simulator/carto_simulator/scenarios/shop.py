@@ -747,7 +747,7 @@ class _ShopRun:
 
     def emit_noise_line(self, source_id: str, at: datetime) -> None:
         rng = self.rng
-        secret = self.secret_message() if source_id != SRC_PAYMENTS else None
+        secret = self.secret_message()
         if source_id == SRC_WEBSTORE:
             fields: dict[str, object] = {"ts": self.webstore.timestamp(at), "level": "info"}
             if secret is not None:
@@ -770,12 +770,11 @@ class _ShopRun:
                 pairs.extend([("msg", "db pool stats"), ("active", 3), ("idle", 7)])
             self.orders.add(Truth(N_ORDERS_NOISE, at), logfmt_line(pairs))
         elif source_id == SRC_PAYMENTS:
-            self.payments.add(
-                Truth(N_PAYMENTS_NOISE, at),
-                xml_line(
-                    "heartbeat", [("timestamp", self.payments.timestamp(at)), ("status", "OK")]
-                ),
-            )
+            # The XML source carries its secret as a <note> element of the heartbeat document.
+            children = [("timestamp", self.payments.timestamp(at)), ("status", "OK")]
+            if secret is not None:
+                children.append(("note", secret))
+            self.payments.add(Truth(N_PAYMENTS_NOISE, at), xml_line("heartbeat", children))
         elif source_id == SRC_WMS_EXPORT:
             at = clock.floor_seconds(at)
             self.export_log.add(

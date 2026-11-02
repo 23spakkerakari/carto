@@ -49,7 +49,7 @@ from carto_edge.pipeline.parse.names import FieldNameStore
 from carto_edge.pipeline.pii import PiiDetector, detector_from_settings
 from carto_edge.pipeline.pipeline import EdgePipeline, pin_paths
 from carto_edge.pipeline.stats import FieldStatsStore
-from carto_edge.pipeline.templates import TemplateStore
+from carto_edge.pipeline.templates import TemplateStore, pii_constant_filter
 from carto_edge.pipeline.tokenize import Tokenizer
 from carto_edge.reveal import RevealService
 from carto_edge.secrets import EdgeSecretResolver
@@ -229,9 +229,12 @@ def build_runtime(
     # The gateway persists Drain3 state so templates survive restarts (spec 8.2). The analyzer
     # mines each run from scratch: a persisted store would let a second run see clusters the
     # first one grew and mine different templates from the same input (ADR 0025).
+    # The detector also guards template constants: a name three varying retries share never
+    # travels as a constant (ADR 0068).
     templates = TemplateStore(
         None if analyze else settings.templates_dir,
         flush_interval_seconds=settings.gateway.stats_flush_seconds,
+        constant_filter=pii_constant_filter(pii),
     )
     classifier = Classifier(
         classify, sources.field_policies, pii, stats, policy_version=sources.policy_version

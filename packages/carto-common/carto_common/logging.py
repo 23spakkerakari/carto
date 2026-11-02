@@ -312,8 +312,9 @@ _DASHES: Final = "-----"
 _JWT: Final = re.compile(r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*")
 _CARTO_TOKEN: Final = re.compile(r"t[0-9]{1,4}\.[A-Za-z0-9_-]{22}")
 _AWS_KEY: Final = re.compile(r"(?:AKIA|ASIA)[0-9A-Z]{16}")
-# scheme://user:password@host -> the password only; the user name helps the operator.
-_URL_USERINFO: Final = re.compile(r"(?<=://)([^/\s@:]+):([^/\s@]+)(?=@)")
+# scheme://user:password@host -> the password only; the user name helps the operator and may
+# be empty (redis://:password@host).
+_URL_USERINFO: Final = re.compile(r"(?<=://)([^/\s@:]*):([^/\s@]+)(?=@)")
 # password=..., api-key: ..., Authorization: Basic ..., ?token=...&, {"password": "..."},
 # ;PWD={...};: the value after the secret word, up to whitespace or a separator (or a whole
 # quoted or braced string). The word may be closed by a quote, escaped or not, before the

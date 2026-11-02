@@ -27,7 +27,7 @@ from carto_edge.pipeline.forward import (
     edge_id_for,
     strip_config,
 )
-from carto_schema.inventory import EdgeInventory
+from carto_schema.inventory import MAX_CONFIG_VALUE_LEN, EdgeInventory
 
 NOW = datetime(2026, 10, 18, 10, 0, tzinfo=UTC)
 PLANTED = "PLANTED-SECRET-77a1"
@@ -369,3 +369,18 @@ def test_strip_config_masks_value_shapes_in_strings_and_lists() -> None:
     assert "@splunk.internal" in stripped["url"]
     assert stripped["paths"][1] == "/plain/path"
     assert stripped["host"] == "db"
+
+
+def test_strip_config_masks_a_long_value_before_it_cuts_it() -> None:
+    """A value is masked whole and cut afterwards: a password whose ``@`` sits past the cut
+    would otherwise leave in clear up to the cut."""
+    user = "a" * (MAX_CONFIG_VALUE_LEN - 20)
+    url = f"https://{user}:{PLANTED}@splunk.internal/" + "x" * 60
+    assert len(url) > MAX_CONFIG_VALUE_LEN
+    assert url.index("@") > MAX_CONFIG_VALUE_LEN
+    stripped = strip_config({"url": url, "paths": [url]})
+    text = json.dumps(stripped)
+    assert "PLANTED" not in text
+    assert stripped["url"].startswith(f"https://{user}:[REDACTED]@")
+    assert len(stripped["url"]) <= MAX_CONFIG_VALUE_LEN
+    assert stripped["paths"] == [stripped["url"]]

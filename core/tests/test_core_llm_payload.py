@@ -222,6 +222,12 @@ SHAPED = {
     "hex": "0123456789abcdef",
     "digits": "order 000447 shipped",
 }
+MIRRORED = (
+    "redis://:hunter2@cache:6379",
+    'password="' + "hunter2" * 100 + '"',
+)
+"""Shapes both sides must see: a userinfo password with no user name and a quoted secret
+value longer than 512 characters."""
 SECRET_PARTS = (
     "hunter2",
     "jane",
@@ -312,6 +318,10 @@ def test_the_schema_mirrors_agree_with_carto_common() -> None:
     the secret_ref rule of carto_common; this holds the two sides together."""
     for text in SHAPED.values():
         assert mask_string(text) != text, text
+    for text in MIRRORED:
+        assert value_shape(text) is not None, text
+        assert "hunter2" not in mask_string(text), text
+        assert "hunter2" not in clean_text(text, 1000), text
     assert SECRET_REF_SCHEMES == COMMON_SCHEMES
     for ref in ["vault://db/orders", "local:///run/secrets/x", "hunter2", "http://x/y", "vault://"]:
         outcomes = []
