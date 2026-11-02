@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import pytest
 
+import carto_common.logging as common_logging
+import carto_schema.event as schema_event
 from carto_common.logging import is_secret_key, mask_string
 from carto_common.settings import SECRET_REF_SCHEMES as COMMON_SCHEMES
 from carto_common.settings import validate_secret_ref as common_secret_ref
@@ -223,11 +225,28 @@ SHAPED = {
     "digits": "order 000447 shipped",
 }
 MIRRORED = (
-    "redis://:hunter2@cache:6379",
-    'password="' + "hunter2" * 100 + '"',
+    ("redis://:hunter2@cache:6379", "hunter2", "a URL with a password"),
+    ('password="' + "hunter2" * 100 + '"', "hunter2", "a secret-named key with a value"),
+    ('password="aaaa', "aaaa", "a secret-named key with a value"),
+    ("token='x", "x", "a secret-named key with a value"),
+    ("secret={abc", "abc", "a secret-named key with a value"),
 )
-"""Shapes both sides must see: a userinfo password with no user name and a quoted secret
-value longer than 512 characters."""
+"""Text, the secret in it and the shape ``value_shape`` must name: shapes both sides must see,
+a userinfo password with no user name, a quoted secret value longer than 512 characters and an
+unterminated quoted or braced value (the review of 2026-11-02 found carto_common masked it
+while the schema passed it)."""
+MIRRORED_SOURCES = (
+    "_JWT_SOURCE",
+    "_CARTO_TOKEN_SOURCE",
+    "_AWS_KEY_SOURCE",
+    "_URL_USERINFO_SOURCE",
+    "_SECRET_ASSIGNMENT_SOURCE",
+    "_EMAIL_SOURCE",
+)
+"""The pattern sources ``carto_schema.event`` and ``carto_common.logging`` must hold as the
+same text (the PEM block is a string search in carto_common, and the hex and digit runs have
+their own thresholds on each side by design: a shape refused at the contract against a shape
+masked in a log line)."""
 SECRET_PARTS = (
     "hunter2",
     "jane",
@@ -318,10 +337,10 @@ def test_the_schema_mirrors_agree_with_carto_common() -> None:
     the secret_ref rule of carto_common; this holds the two sides together."""
     for text in SHAPED.values():
         assert mask_string(text) != text, text
-    for text in MIRRORED:
-        assert value_shape(text) is not None, text
-        assert "hunter2" not in mask_string(text), text
-        assert "hunter2" not in clean_text(text, 1000), text
+    for text, secret, shape in MIRRORED:
+        assert value_shape(text) == shape, text
+        assert secret not in mask_string(text), text
+        assert secret not in clean_text(text, 1000), text
     assert SECRET_REF_SCHEMES == COMMON_SCHEMES
     for ref in ["vault://db/orders", "local:///run/secrets/x", "hunter2", "http://x/y", "vault://"]:
         outcomes = []
@@ -357,3 +376,19 @@ def test_the_schema_mirrors_agree_with_carto_common() -> None:
     ]
     for key in keys:
         assert config_key_is_secret(key) == is_secret_key(key), key
+
+
+def test_the_mirrored_pattern_sources_are_the_same_text() -> None:
+    """Every mirrored shape is one pattern source held under the same name in both modules
+    (ADR 0069): a shape one side has and the other lacks, or a source that drifted, fails by
+    name, so the behavioural corpus above cannot be the only thing holding them together."""
+    for name in MIRRORED_SOURCES:
+        assert hasattr(schema_event, name), f"carto_schema.event lacks {name}"
+        assert hasattr(common_logging, name), f"carto_common.logging lacks {name}"
+        schema_source = getattr(schema_event, name)
+        common_source = getattr(common_logging, name)
+        assert isinstance(schema_source, str) and isinstance(common_source, str), name
+        assert schema_source == common_source, name
+        compiled = name.removesuffix("_SOURCE")
+        assert getattr(schema_event, compiled).pattern == schema_source, compiled
+        assert getattr(common_logging, compiled).pattern == common_source, compiled

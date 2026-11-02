@@ -12,10 +12,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+import structlog
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-from carto_edge.pipeline.pii import PiiHit
+from carto_edge.pipeline.pii import MAX_TEXT_BYTES, PiiHit, truncate_text
 from carto_edge.pipeline.templates import (
     MASK,
     MAX_DISTINCT_DIGESTS,
@@ -360,11 +361,13 @@ def test_the_constant_filter_keeps_a_name_out_of_the_constants(tmp_path: Path) -
             template, params = store.mine("sys_web", f"session opened user={user} host:edge")
         assert template == f"session opened user={MASK} host:{MASK}"
         assert params == ["carol", "edge"]
-    # The verdict is persisted with the cluster (the Drain3 state is edge-local, as before).
+    # A hit is persisted with the cluster (the Drain3 state is edge-local, as before); an
+    # allowed verdict is not: the cluster is judged again once per process (ADR 0068).
     state = json.loads((tmp_path / "sys_web.json").read_text(encoding="utf-8"))
     verdicts = {" ".join(c["tokens"]): c.get("p") for c in state["clusters"]}
     assert verdicts["Refund approved for Alice Smith attempt <*>"] is True
-    assert verdicts["SFTP upload complete: <*> <*> bytes)"] is False
+    assert verdicts["SFTP upload complete: <*> <*> bytes)"] is None
+    assert "false" not in (tmp_path / "sys_web.json").read_text(encoding="utf-8")
     # The verdict survives a restart, even one whose filter would now allow the words.
     reloaded = TemplateStore(tmp_path, constant_filter=lambda _constants: True)
     assert reloaded.mine("sys_web", ALICE_LINES[0])[0] == ALL_PARAMS_7
@@ -490,7 +493,8 @@ def test_version_two_state_loads_with_its_digests_and_no_verdicts(tmp_path: Path
             store.mine("sys_web", f"voucher {name} redeemed by staff")
     path = tmp_path / "sys_web.json"
     state = json.loads(path.read_text(encoding="utf-8"))
-    assert [c.get("p") for c in state["clusters"]] == [False, None]  # judged, not yet promoted
+    # Allowed without a filter and not yet promoted: neither cluster carries a verdict.
+    assert [c.get("p") for c in state["clusters"]] == [None, None]
     state["version"] = 2
     for cluster in state["clusters"]:
         cluster.pop("p", None)
@@ -503,7 +507,44 @@ def test_version_two_state_loads_with_its_digests_and_no_verdicts(tmp_path: Path
     reloaded.flush()
     state = json.loads(path.read_text(encoding="utf-8"))
     assert state["version"] == STATE_VERSION
-    assert [c.get("p") for c in state["clusters"]] == [True, False]
+    assert [c.get("p") for c in state["clusters"]] == [True, None]
+
+
+def test_an_allowed_verdict_is_judged_again_after_a_restart(tmp_path: Path) -> None:
+    """The degraded-then-repaired case (review of 2026-11-02): the detector that judged the
+    cluster knew no names (the regex fallback of a failed model load, or ``pii.enabled=false``)
+    and allowed them; the model is repaired and the process restarted. The allowed verdict was
+    never persisted, so the repaired detector judges the cluster again at its next use and the
+    name goes back to being a parameter. A persisted ``"p": false`` from an older state file
+    reads as not judged either."""
+    with TemplateStore(tmp_path, constant_filter=lambda _constants: True) as store:
+        for line in ALICE_LINES:
+            store.mine("sys_web", line)
+        assert store.mine("sys_web", "Refund approved for Alice Smith attempt 44") == (
+            "Refund approved for Alice Smith attempt <*>",
+            ["44"],
+        )
+    path = tmp_path / "sys_web.json"
+    state = json.loads(path.read_text(encoding="utf-8"))
+    assert [c.get("p") for c in state["clusters"]] == [None]
+    reloaded = TemplateStore(tmp_path, constant_filter=_flags_alice)
+    assert reloaded.mine("sys_web", "Refund approved for Alice Smith attempt 45") == (
+        ALL_PARAMS_7,
+        ["Refund", "approved", "for", "Alice", "Smith", "attempt", "45"],
+    )
+    reloaded.flush()
+    assert [c.get("p") for c in json.loads(path.read_text(encoding="utf-8"))["clusters"]] == [True]
+    state["clusters"][0]["p"] = False
+    path.write_text(json.dumps(state), encoding="utf-8")
+    judged: list[list[str]] = []
+
+    def record(constants: Sequence[str]) -> bool:
+        judged.append(list(constants))
+        return "Alice" not in constants
+
+    again = TemplateStore(tmp_path, constant_filter=record)
+    assert again.mine("sys_web", "Refund approved for Alice Smith attempt 46")[0] == ALL_PARAMS_7
+    assert judged == [["Refund", "approved", "for", "Alice", "Smith", "attempt"]]
     assert hashlib.blake2b(b"x", digest_size=6).hexdigest() not in str(state)  # sanity
 
 
@@ -612,3 +653,101 @@ def test_a_frozen_store_uses_the_templates_pass_one_learned() -> None:
         ],
     )
     assert store.cluster_count("sys_web") == 1
+
+
+class _TruncatingDetector(_FakeDetector):
+    """The fake with the real detectors' input cap: ``MAX_TEXT_BYTES`` of UTF-8 per call."""
+
+    backend = "regex"
+
+    def detect(self, text: str) -> list[PiiHit]:
+        return super().detect(truncate_text(text))
+
+
+def test_pii_constant_filter_judges_the_constants_in_chunks_the_detector_can_see() -> None:
+    """A template's constants may run to 4096 characters while a detector sees 4096 UTF-8
+    bytes: a name past the byte cap must still be judged (review of 2026-11-02)."""
+    detector = _TruncatingDetector(0.85)
+    constants = ["ü" * 16] * 128 + ["Alice"]  # 2181 characters, 4229 bytes joined
+    assert len(" ".join(constants)) <= MAX_TEMPLATE_TEXT_LEN
+    assert len(" ".join(constants).encode("utf-8")) > MAX_TEXT_BYTES
+    assert pii_constant_filter(detector)(constants) is False
+    assert len(detector.texts) >= 2
+    assert all(len(text.encode("utf-8")) <= MAX_TEXT_BYTES for text in detector.texts)
+    assert "Alice" in detector.texts[-1]
+    # One constant longer than the cap is cut into pieces the detector can see whole.
+    detector = _TruncatingDetector(0.85)
+    assert pii_constant_filter(detector)(["x" * (MAX_TEXT_BYTES + 100) + "Alice"]) is False
+    assert all(len(text.encode("utf-8")) <= MAX_TEXT_BYTES for text in detector.texts)
+    # Constants that fit go in one call, as before.
+    detector = _TruncatingDetector(0.85)
+    assert pii_constant_filter(detector)(["Refund", "approved"]) is True
+    assert detector.texts == ["Refund approved"]
+
+
+def test_pii_constant_filter_names_the_detector_backend_in_the_judging_log_line() -> None:
+    detector = _TruncatingDetector(0.85)
+    constant_filter = pii_constant_filter(detector)
+    assert constant_filter.backend == "regex"
+    store = TemplateStore(constant_filter=constant_filter)
+    with structlog.testing.capture_logs() as logs:
+        for line in ALICE_LINES:
+            store.mine("sys_web", line)
+        for name in ("MKALPHA", "MKBRAVO", "MKCHARLIE"):
+            store.mine("sys_web", f"voucher {name} redeemed by staff")
+    judged = [entry for entry in logs if entry["event"] == "template_constants_judged"]
+    assert [(entry["hit"], entry["backend"]) for entry in judged] == [
+        (True, "regex"),
+        (False, "regex"),
+    ]
+    assert all("Alice" not in json.dumps(entry) for entry in judged)
+    assert all(isinstance(entry["cluster_id"], int) for entry in judged)
+
+
+def _counting_miner(store: TemplateStore, system_id: str) -> list[str]:
+    """Wrap the system's miner so every tree walk is recorded; returns the record."""
+    calls: list[str] = []
+    state = store._states[system_id]
+    original = state.miner.add_log_message
+
+    def counted(message: str) -> dict[str, object]:
+        calls.append(message)
+        return original(message)
+
+    state.miner.add_log_message = counted  # type: ignore[method-assign]
+    return calls
+
+
+def test_a_blocked_cluster_is_cached_like_a_promoted_one() -> None:
+    store = TemplateStore(constant_filter=_flags_alice)
+    for line in ALICE_LINES:
+        store.mine("sys_web", line)
+    calls = _counting_miner(store, "sys_web")
+    for n in (44, 45, 44):
+        assert store.mine("sys_web", f"Refund approved for Alice Smith attempt {n}")[0] == (
+            ALL_PARAMS_7
+        )
+    assert len(calls) <= 1  # the first variant may walk the tree; the cache serves the rest
+    state = store._states["sys_web"]
+    assert state.cache["Refund approved for Alice Smith attempt <*>"] == ALL_PARAMS_7
+
+
+def test_an_identical_repeat_of_a_sub_threshold_message_does_not_walk_the_tree() -> None:
+    store = TemplateStore()
+    message = "health check ok for MKPINE"
+    assert store.mine("sys_web", message)[0] == "<*> <*> <*> <*> <*>"
+    calls = _counting_miner(store, "sys_web")
+    for _ in range(3):
+        assert store.mine("sys_web", message) == (
+            "<*> <*> <*> <*> <*>",
+            ["health", "check", "ok", "for", "MKPINE"],
+        )
+    assert calls == []
+    # A distinct variant is not a repeat: it walks the tree and counts toward promotion.
+    assert store.mine("sys_web", "health check ok for MKOAK")[0] == "<*> <*> <*> <*> <*>"
+    assert len(calls) == 1
+    template, params = store.mine("sys_web", "health check ok for MKELM")
+    assert template == "health check ok for <*>"
+    assert params == ["MKELM"]
+    # Once promoted, the earlier repeat gets the template too (the repeat cache is gone).
+    assert store.mine("sys_web", message) == ("health check ok for <*>", ["MKPINE"])

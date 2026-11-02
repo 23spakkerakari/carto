@@ -47,9 +47,19 @@ MORE_SHAPED: list[tuple[str, str, str]] = [
     ("a secret-named key with a value", f"token: '{LONG_QUOTED_VALUE}' x", "token: '<*>' x"),
     ("a URL with a password", "redis://:hunter2@cache:6379", "redis://:<*>@cache:6379"),
     ("a URL with a password", "dsn redis://:hunter2@cache/0 ok", "dsn redis://:<*>@cache/0 ok"),
+    ("a secret-named key with a value", 'password="aaaa', "password=<*>"),
+    ("a secret-named key with a value", "token='x", "token=<*>"),
+    ("a secret-named key with a value", "secret={abc", "secret=<*>"),
+    ("a secret-named key with a value", 'login with secret "hunter2"', 'login with secret "<*>"'),
 ]
-"""Variants of a shape with the masked text: a quoted value longer than any bound a quoted
-alternative once had, and a URL whose userinfo has a password but no user name."""
+"""Variants of a shape with the masked text: a quoted value longer than the 512-character bound
+of the quoted alternative (read bare up to whitespace, quotes kept), a URL whose userinfo has a
+password but no user name, an unterminated quoted or braced value (read bare, so it is still a
+value) and a quoted value right after the word with no separator."""
+HOSTILE_UNITS = ["password={ ", 'password="a', "token='"]
+"""Unterminated openers; repeated to 256 KiB each scan must stay linear (review of 2026-11-02:
+an unbounded quoted alternative made the braced opener quadratic, 15 s at this size)."""
+HOSTILE_BYTES = 256 * 1024
 
 CONSTANTS = [
     "approved",
@@ -182,6 +192,20 @@ def test_scans_stay_linear_on_hostile_text(text: str) -> None:
         value_shape(text)
         mask_value_shapes(text)
     assert time.perf_counter() - started < 2.0
+
+
+@pytest.mark.parametrize("unit", HOSTILE_UNITS)
+def test_an_unterminated_opener_costs_linear_time_at_256_kib(unit: str) -> None:
+    """Spec 2.3 invariant 8: 256 KiB of a repeated unterminated opener is masked in well under
+    a second (the quadratic form took 15 s)."""
+    text = (unit * (HOSTILE_BYTES // len(unit) + 1))[:HOSTILE_BYTES]
+    started = time.perf_counter()
+    value_shape(text)
+    assert time.perf_counter() - started < 1.0
+    started = time.perf_counter()
+    masked = mask_value_shapes(text)
+    assert time.perf_counter() - started < 1.0
+    assert PLACEHOLDER in masked
 
 
 # -- the contract --------------------------------------------------------------------------------
