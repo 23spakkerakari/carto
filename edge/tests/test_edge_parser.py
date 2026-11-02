@@ -482,7 +482,7 @@ class _FlagDetector:
 
 def gated(system: str = "sys_test", *names: str, **parse: Any) -> RecordParser:
     """A parser with the name gate (ADR 0030, 0038), as the pipeline builds it."""
-    store = FieldNameStore(_FlagDetector(names))  # type: ignore[arg-type]
+    store = FieldNameStore(_FlagDetector(names))
     return RecordParser(source(system, **parse), TemplateStore(min_cluster_size=1), store)
 
 

@@ -164,10 +164,11 @@ def test_the_key_is_written_before_the_certificate(
 ) -> None:
     """A failure while the certificate is written leaves no half pair: the key written first
     is withdrawn and the error names the certificate."""
+    import carto_common.crypto as crypto_module  # noqa: PLC0415
     import carto_common.pki as pki_module  # noqa: PLC0415
 
     created: list[str] = []
-    real_public = pki_module.create_public
+    real_public = crypto_module.create_public
 
     def failing_public(path: Path, data: bytes) -> None:
         created.append(path.name)
