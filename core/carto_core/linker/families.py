@@ -8,19 +8,21 @@ ends, so a rejected pair is never inside one family through its own link (the pr
 ``test_core_linker_families.py``); it can still share a family through other accepted links,
 which is what transitivity through bridges means.
 
-Entity ids are content-addressed: ``ent_`` plus the first 16 hex digits of the SHA-256 of the
-sorted member list, so a family that did not change keeps its id and the reviewer's name. When
-a family grows (its members are a superset of a previous entity's), the previous entity's
-confirmed name and description carry over; the previous entities are matched by member
-overlap, largest first, each used once. A family with no inherited name gets a heuristic
-suggestion (:mod:`carto_core.linker.naming`) that the reviewer confirms.
+Entity ids are stable (ADR 0064): a family's provisional id is content-addressed, ``ent_``
+plus the first 16 hex digits of the SHA-256 of the sorted member list, and that is the id of
+its first appearance. When a family grows (its members are a superset of a previous entity's),
+it inherits the previous entity's id along with its confirmed name and description, so
+``transactions.entity_id`` and the entity's ``max_span_days`` survive link passes; the
+previous entities are matched by member overlap, largest first, each used once. A family with
+no inherited name gets a heuristic suggestion (:mod:`carto_core.linker.naming`) that the
+reviewer confirms. A family that shrank is a new family: a new id and no name.
 """
 
 from __future__ import annotations
 
 import hashlib
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import TYPE_CHECKING
 
@@ -39,6 +41,7 @@ __all__ = [
     "build_families",
     "entity_id_for",
     "inherit_names",
+    "keep_confirmed_names",
     "one_edge_per_field_pair",
 ]
 
@@ -49,6 +52,8 @@ EntityNamer = Callable[[Sequence["FieldForm"]], str | None]
 @dataclass(frozen=True, slots=True)
 class Family:
     entity_id: str
+    """The provisional, content-addressed id; :func:`inherit_names` may replace it with an
+    inherited one (ADR 0064)."""
     members: tuple[FieldForm, ...]
     """Sorted."""
     link_ids: tuple[str, ...]
@@ -149,9 +154,11 @@ def build_families(links: Sequence[KeyLink]) -> list[Family]:
 def inherit_names(
     families: Sequence[Family], previous: Sequence[Entity], namer: EntityNamer | None
 ) -> tuple[list[Entity], int, int]:
-    """Entities for ``families``: a previous entity's name carries over to the family whose
-    members contain all of its members (largest overlap first, each previous entity once);
-    other families get the namer's suggestion. Returns ``(entities, inherited, suggested)``."""
+    """Entities for ``families``, one per family in order: a previous entity's id, name and
+    description carry over to the family whose members contain all of its members (largest
+    overlap first, each previous entity once); a family that inherits an unnamed entity keeps
+    its id and gets the namer's suggestion, as does a new family. Returns
+    ``(entities, inherited, suggested)``; ``inherited`` counts the names carried over."""
     candidates: list[tuple[int, str, str]] = []
     member_sets = {family.entity_id: set(family.members) for family in families}
     for entity in previous:
@@ -177,12 +184,14 @@ def inherit_names(
             inherited += 1
             entities.append(
                 Entity(
-                    id=family.entity_id,
+                    id=source.id,
                     members=family.members,
                     name=source.name,
                     suggested_name=source.suggested_name,
                     name_confirmed=source.name_confirmed,
                     description=source.description,
+                    version=source.version,
+                    max_span_days=source.max_span_days,
                 )
             )
             continue
@@ -191,13 +200,38 @@ def inherit_names(
             suggested += 1
         entities.append(
             Entity(
-                id=family.entity_id,
+                id=source.id if source is not None else family.entity_id,
                 members=family.members,
                 suggested_name=suggestion,
                 description=source.description if source is not None else None,
+                version=source.version if source is not None else 1,
+                max_span_days=source.max_span_days if source is not None else None,
             )
         )
     return entities, inherited, suggested
+
+
+def keep_confirmed_names(entities: Sequence[Entity], latest: Sequence[Entity]) -> list[Entity]:
+    """ADR 0064: a confirmed name that landed while the namer ran (a reviewer's patch between
+    the builder's read and its write) wins over whatever the builder computed."""
+    by_id = {entity.id: entity for entity in latest if entity.name_confirmed}
+    out: list[Entity] = []
+    for entity in entities:
+        stored = by_id.get(entity.id)
+        if stored is None:
+            out.append(entity)
+            continue
+        out.append(
+            replace(
+                entity,
+                name=stored.name,
+                name_confirmed=True,
+                description=stored.description,
+                version=max(entity.version, stored.version),
+                max_span_days=stored.max_span_days,
+            )
+        )
+    return out
 
 
 class FamilyBuilder:
@@ -221,11 +255,13 @@ class FamilyBuilder:
         families = build_families(links)
         previous = self._entities.list_entities(tenant_id)
         entities, inherited, suggested = inherit_names(families, previous, self._namer)
+        if self._namer is not None and entities:
+            entities = keep_confirmed_names(entities, self._entities.list_entities(tenant_id))
         self._entities.replace_all(tenant_id, entities, now)
         assignments: dict[str, str | None] = {link.id: None for link in links}
-        for family in families:
+        for family, entity in zip(families, entities, strict=True):
             for link_id in family.link_ids:
-                assignments[link_id] = family.entity_id
+                assignments[link_id] = entity.id
         assigned = self._links.assign_entities(tenant_id, assignments, now)
         return FamilyReport(
             families=len(families),

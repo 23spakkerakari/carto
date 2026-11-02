@@ -549,7 +549,7 @@ def test_a_family_built_from_accepted_links_is_listed_and_renamed() -> None:
         (ORDER_REF.field_ref, "digits.0"),
     ]
     assert sorted(entity["link_ids"]) == sorted([EXACT_ID, BRIDGE_ID])
-    assert entity["etag"] == f'W/"{updated_at_version(built)}"'
+    assert entity["etag"] == 'W/"1"', "the version column, not updated_at (ADR 0064)"
     one = w.client.get(f"{API_PREFIX}/entities/{entity['id']}")
     assert one.status_code == 200 and one.headers["etag"] == entity["etag"]
     assert w.client.get(f"{API_PREFIX}/entities/ent_missing").status_code == 404
@@ -569,9 +569,10 @@ def test_a_family_built_from_accepted_links_is_listed_and_renamed() -> None:
     assert renamed.status_code == 200, renamed.text
     assert renamed.json()["name"] == "Customer order"
     assert renamed.json()["name_confirmed"] is True
-    assert renamed.json()["etag"] == f'W/"{updated_at_version(w.clock())}"' != entity["etag"]
+    assert renamed.json()["etag"] == 'W/"2"'
     stored = w.entities.get(TENANT, entity["id"])
     assert stored is not None and stored.name == "Customer order" and stored.name_confirmed
+    assert stored.version == 2
     assert [(e.action, e.target) for e in w.audit.entries(TENANT)][-1] == (
         "entity.patch",
         f"entity:{entity['id']}",

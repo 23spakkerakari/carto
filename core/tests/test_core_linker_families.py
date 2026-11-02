@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from hypothesis import given
 from hypothesis import settings as h_settings
@@ -18,6 +18,7 @@ from carto_core.linker.families import (
     build_families,
     entity_id_for,
     inherit_names,
+    keep_confirmed_names,
 )
 from carto_core.linker.model import (
     Direction,
@@ -135,12 +136,46 @@ def test_names_carry_over_to_a_family_that_grew() -> None:
     by_members = {entity.members: entity for entity in entities}
     grown = by_members[(A, B, C)]
     assert grown.name == "Order" and grown.name_confirmed
-    assert grown.id == entity_id_for([A, B, C])
+    assert grown.id == entity_id_for([A, B]), "the grown family keeps its id (ADR 0064)"
     same = by_members[(E, F)]
     assert same.suggested_name == "Shipment" and same.name is None
     fresh = by_members[(D, G)]
     assert fresh.name is None and fresh.suggested_name == "Thing"
     assert inherited == 2 and suggested == 1
+
+
+def test_an_unnamed_previous_entity_still_passes_its_id_on() -> None:
+    """ADR 0064: the id is inherited whether or not a name was; the namer still suggests."""
+    previous = [
+        Entity(id="ent_kept", members=(A, B), version=3, max_span_days=30),
+        Entity(id="ent_whole", members=(E, F), suggested_name="Ship", version=2),
+    ]
+    families = build_families([link(A, B), link(B, C), link(E, F)])
+    entities, inherited, suggested = inherit_names(families, previous, lambda _m: "Thing")
+    by_members = {entity.members: entity for entity in entities}
+    grown = by_members[(A, B, C)]
+    assert grown.id == "ent_kept" and grown.suggested_name == "Thing" and grown.name is None
+    assert grown.version == 3 and grown.max_span_days == 30
+    same = by_members[(E, F)]
+    assert same.id == "ent_whole" and same.suggested_name == "Ship" and same.version == 2
+    assert inherited == 1 and suggested == 1
+    assert len(entities) == len(families)
+    assert [entity.members for entity in entities] == [family.members for family in families]
+
+
+def test_keep_confirmed_names_prefers_a_name_that_landed_meanwhile() -> None:
+    computed = [
+        Entity(id="ent_1", members=(A, B), suggested_name="Thing", version=1),
+        Entity(id="ent_2", members=(C, D), suggested_name="Other", version=1),
+    ]
+    latest = [
+        Entity(id="ent_1", members=(A, B), name="Order", name_confirmed=True, version=2),
+        Entity(id="ent_2", members=(C, D), suggested_name="Stale", version=1),
+    ]
+    kept = keep_confirmed_names(computed, latest)
+    assert kept[0].name == "Order" and kept[0].name_confirmed and kept[0].version == 2
+    assert kept[0].suggested_name == "Thing"
+    assert kept[1] == computed[1]
 
 
 def test_largest_overlap_wins_and_each_previous_entity_is_used_once() -> None:
@@ -197,6 +232,36 @@ def test_rebuild_writes_entities_and_assigns_links() -> None:
     assert len(merged) == 1
     assert merged[0].name == "Order" and merged[0].description == "Web orders"
     assert merged[0].members == (A, B, C, D, E)
+    assert merged[0].id == entity_id_for([A, B, C]), "the named family's id survives (ADR 0064)"
+    assert merged[0].version == 2, "set_name bumped it; the rebuild left it"
+    by_id = {item.id: item for item in links.list_links("default")}
+    assert by_id["lnk_34"].entity_id == entity_id_for([A, B, C]), "assigned the inherited id"
+
+    # An unchanged rebuild touches nothing: same id, same version, same updated_at.
+    before = entities.list_entities("default")[0]
+    builder.rebuild("default", now=NOW + timedelta(hours=1))
+    after = entities.list_entities("default")[0]
+    assert after == before
+
+
+def test_rebuild_keeps_a_name_confirmed_while_the_namer_ran() -> None:
+    """ADR 0064: the builder re-reads after the namer returns, so a reviewer's confirmation
+    between its read and its write is not reverted."""
+    links = InMemoryLinkRepository()
+    entities = InMemoryEntityRepository()
+    links.upsert("default", link(A, B), NOW)
+    FamilyBuilder(links, entities, namer=lambda _m: None).rebuild("default", now=NOW)
+    entity_id = entities.list_entities("default")[0].id
+
+    def slow_namer(_members: Sequence[FieldForm]) -> str | None:
+        entities.set_name("default", entity_id, name="Order", description=None, now=NOW)
+        return "Thing again"
+
+    FamilyBuilder(links, entities, namer=slow_namer).rebuild(
+        "default", now=NOW + timedelta(minutes=1)
+    )
+    stored = entities.list_entities("default")[0]
+    assert stored.name == "Order" and stored.name_confirmed and stored.version == 2
 
 
 # -- property: a rejected pair never shares a family through its own link ----------------------

@@ -224,21 +224,39 @@ def exercise_entities(repository: EntityRepository, tenant: str) -> None:
     assert repository.get(tenant, "ent_2") == listed[1]
     assert repository.list_entities("other-tenant") == []
 
+    assert listed[0].version == 1 and listed[0].max_span_days is None
+
+    # An unchanged replace leaves the rows alone (ADR 0064).
+    repository.replace_all(tenant, [first, second], NOW + timedelta(minutes=1))
+    assert repository.list_entities(tenant) == listed
+
     later = NOW + timedelta(minutes=5)
     named = repository.set_name(tenant, "ent_1", name="Sales order", description=None, now=later)
     assert named.name == "Sales order" and named.name_confirmed
     assert named.suggested_name == "Order"
     assert named.updated_at == later
     assert named.display_name == "Sales order"
+    assert named.version == 2
     with pytest.raises(NotFoundError):
         repository.set_name(tenant, "ent_missing", name="x", description=None, now=later)
+    with pytest.raises(StaleVersionError):
+        repository.set_name(
+            tenant, "ent_1", name="y", description=None, now=later, expected_version=1
+        )
+    guarded = repository.set_name(
+        tenant, "ent_1", name="Sales order", description="d2", now=later, expected_version=2
+    )
+    assert guarded.version == 3 and guarded.description == "d2"
 
+    # A changed replace keeps the version; a grown family keeps its row.
     grown = Entity(id="ent_1", members=(A, B, C), name="Sales order", name_confirmed=True)
-    repository.replace_all(tenant, [grown], later)
+    much_later = later + timedelta(minutes=5)
+    repository.replace_all(tenant, [grown], much_later)
     remaining = repository.list_entities(tenant)
     assert [entity.id for entity in remaining] == ["ent_1"]
     assert remaining[0].members == (A, B, C)
-    assert remaining[0].name == "Sales order"
+    assert remaining[0].name == "Sales order" and remaining[0].version == 3
+    assert remaining[0].updated_at == much_later
     repository.replace_all(tenant, [], later)
     assert repository.list_entities(tenant) == []
     assert repository.ping()

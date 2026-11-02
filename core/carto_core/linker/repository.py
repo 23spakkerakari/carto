@@ -12,7 +12,10 @@ semantics) and a PostgreSQL one over SQLAlchemy Core text against migration 0004
   ``If-Match`` relies on. Every write returns the stored row with its new ``version`` and
   ``updated_at``.
 - :class:`EntityRepository`: entities with their member ends; the family builder replaces the
-  whole set per tenant in one transaction and the API renames one entity.
+  whole set per tenant in one transaction and the API renames one entity. ``replace_all``
+  leaves alone every row whose name fields and members did not change, and a changed row keeps
+  its ``version`` (bumped by reviewer patches only) and ``max_span_days`` (ADR 0064);
+  ``set_name`` bumps the version and refuses a stale ``expected_version``.
 
 ``evidence_json`` holds :meth:`PairFeatures.as_evidence` plus an ``extra`` object (the sentence
 and the shapes the review item shows). Nothing stored here is a token or a raw value; errors
@@ -119,6 +122,20 @@ class Entity:
     name_confirmed: bool = False
     description: str | None = None
     updated_at: datetime | None = None
+    version: int = 1
+    """Bumped by reviewer patches only; the console's ETag (ADR 0064)."""
+    max_span_days: int | None = None
+    """Spec 9.7 guardrail per entity; ``None`` means the assembler's default."""
+
+    def same_fields(self, other: Entity) -> bool:
+        """Whether a rebuild would change nothing a pass may write."""
+        return (
+            self.name == other.name
+            and self.suggested_name == other.suggested_name
+            and self.name_confirmed == other.name_confirmed
+            and self.description == other.description
+            and self.members == other.members
+        )
 
     @property
     def display_name(self) -> str | None:
@@ -183,8 +200,10 @@ class EntityRepository(Protocol):
         name: str,
         description: str | None,
         now: datetime,
+        expected_version: int | None = None,
     ) -> Entity:
-        """Confirm a name (spec 9.6). Raises :class:`NotFoundError`."""
+        """Confirm a name (spec 9.6) and bump the version. Raises :class:`NotFoundError` or,
+        when ``expected_version`` is given and stale, :class:`StaleVersionError`."""
         ...
 
     def ping(self) -> bool: ...
@@ -362,10 +381,23 @@ class InMemoryEntityRepository:
 
     def replace_all(self, tenant_id: str, entities: Sequence[Entity], now: datetime) -> None:
         with self._lock:
+            previous = {k[1]: e for k, e in self._entities.items() if k[0] == tenant_id}
             for key in [k for k in self._entities if k[0] == tenant_id]:
                 del self._entities[key]
             for entity in entities:
-                self._entities[(tenant_id, entity.id)] = replace(entity, updated_at=now)
+                current = previous.get(entity.id)
+                if current is not None and current.same_fields(entity):
+                    self._entities[(tenant_id, entity.id)] = current
+                    continue
+                stored = replace(
+                    entity,
+                    updated_at=now,
+                    version=current.version if current is not None else entity.version,
+                    max_span_days=(
+                        current.max_span_days if current is not None else entity.max_span_days
+                    ),
+                )
+                self._entities[(tenant_id, entity.id)] = stored
 
     def set_name(
         self,
@@ -375,14 +407,23 @@ class InMemoryEntityRepository:
         name: str,
         description: str | None,
         now: datetime,
+        expected_version: int | None = None,
     ) -> Entity:
         with self._lock:
             entity = self._entities.get((tenant_id, entity_id))
             if entity is None:
                 msg = "entity not found"
                 raise NotFoundError(msg)
+            if expected_version is not None and entity.version != expected_version:
+                msg = "entity version changed"
+                raise StaleVersionError(msg)
             stored = replace(
-                entity, name=name, name_confirmed=True, description=description, updated_at=now
+                entity,
+                name=name,
+                name_confirmed=True,
+                description=description,
+                updated_at=now,
+                version=entity.version + 1,
             )
             self._entities[(tenant_id, entity_id)] = stored
             return stored
@@ -460,28 +501,38 @@ _ASSIGN_ENTITY = sqlalchemy.text(
     "WHERE tenant_id = :tenant_id AND id = :id AND entity_id IS DISTINCT FROM :entity_id"
 )
 _SELECT_ENTITIES = sqlalchemy.text(
-    "SELECT id, name, suggested_name, name_confirmed, description, updated_at FROM entities "
-    "WHERE tenant_id = :tenant_id ORDER BY id"
+    "SELECT id, name, suggested_name, name_confirmed, description, updated_at, version, "
+    "max_span_days FROM entities WHERE tenant_id = :tenant_id ORDER BY id"
 )
 _SELECT_ENTITY = sqlalchemy.text(
-    "SELECT id, name, suggested_name, name_confirmed, description, updated_at FROM entities "
-    "WHERE tenant_id = :tenant_id AND id = :id"
+    "SELECT id, name, suggested_name, name_confirmed, description, updated_at, version, "
+    "max_span_days FROM entities WHERE tenant_id = :tenant_id AND id = :id"
 )
 _SELECT_MEMBERS = sqlalchemy.text(
     "SELECT entity_id, field_id, form FROM entity_fields WHERE tenant_id = :tenant_id "
     "ORDER BY entity_id, field_id, form"
 )
-_DELETE_MEMBERS = sqlalchemy.text("DELETE FROM entity_fields WHERE tenant_id = :tenant_id")
+_DELETE_MEMBERS_OF = sqlalchemy.text(
+    "DELETE FROM entity_fields WHERE tenant_id = :tenant_id AND entity_id = ANY(:ids)"
+)
 _DELETE_ENTITIES_EXCEPT = sqlalchemy.text(
     "DELETE FROM entities WHERE tenant_id = :tenant_id AND NOT (id = ANY(:keep))"
 )
+# ADR 0064: the update fires only when a name field differs, so an unchanged row keeps its
+# updated_at; version and max_span_days are never in the set list.
 _UPSERT_ENTITY = sqlalchemy.text(
     "INSERT INTO entities (tenant_id, id, name, suggested_name, name_confirmed, description, "
     "created_at, updated_at) VALUES (:tenant_id, :id, :name, :suggested_name, :name_confirmed, "
     ":description, :now, :now) "
     "ON CONFLICT (tenant_id, id) DO UPDATE SET name = EXCLUDED.name, "
     "suggested_name = EXCLUDED.suggested_name, name_confirmed = EXCLUDED.name_confirmed, "
-    "description = EXCLUDED.description, updated_at = EXCLUDED.updated_at"
+    "description = EXCLUDED.description, updated_at = EXCLUDED.updated_at "
+    "WHERE (entities.name, entities.suggested_name, entities.name_confirmed, "
+    "entities.description) IS DISTINCT FROM (EXCLUDED.name, EXCLUDED.suggested_name, "
+    "EXCLUDED.name_confirmed, EXCLUDED.description)"
+)
+_TOUCH_ENTITIES = sqlalchemy.text(
+    "UPDATE entities SET updated_at = :now WHERE tenant_id = :tenant_id AND id = ANY(:ids)"
 )
 _INSERT_MEMBER = sqlalchemy.text(
     "INSERT INTO entity_fields (tenant_id, entity_id, field_id, form, created_at, updated_at) "
@@ -489,7 +540,8 @@ _INSERT_MEMBER = sqlalchemy.text(
 )
 _SET_ENTITY_NAME = sqlalchemy.text(
     "UPDATE entities SET name = :name, name_confirmed = TRUE, description = :description, "
-    "updated_at = :now WHERE tenant_id = :tenant_id AND id = :id"
+    "updated_at = :now, version = version + 1 WHERE tenant_id = :tenant_id AND id = :id "
+    "AND (CAST(:expected_version AS INTEGER) IS NULL OR version = :expected_version)"
 )
 
 
@@ -715,6 +767,8 @@ def _entity_from_row(row: Any, members: Iterable[FieldForm]) -> Entity:
         name_confirmed=bool(row.name_confirmed),
         description=row.description,
         updated_at=row.updated_at,
+        version=int(row.version),
+        max_span_days=None if row.max_span_days is None else int(row.max_span_days),
     )
 
 
@@ -757,11 +811,19 @@ class PostgresEntityRepository:
     def replace_all(self, tenant_id: str, entities: Sequence[Entity], now: datetime) -> None:
         try:
             with self._engine.begin() as connection:
-                connection.execute(_DELETE_MEMBERS, {"tenant_id": tenant_id})
-                connection.execute(
-                    _DELETE_ENTITIES_EXCEPT,
-                    {"tenant_id": tenant_id, "keep": [entity.id for entity in entities]},
-                )
+                stored_members = self._members(connection, tenant_id)
+                keep = [entity.id for entity in entities]
+                changed_members = [
+                    entity.id
+                    for entity in entities
+                    if tuple(sorted(stored_members.get(entity.id, []))) != entity.members
+                ]
+                gone = [entity_id for entity_id in stored_members if entity_id not in set(keep)]
+                connection.execute(_DELETE_ENTITIES_EXCEPT, {"tenant_id": tenant_id, "keep": keep})
+                if gone or changed_members:
+                    connection.execute(
+                        _DELETE_MEMBERS_OF, {"tenant_id": tenant_id, "ids": gone + changed_members}
+                    )
                 for entity in entities:
                     connection.execute(
                         _UPSERT_ENTITY,
@@ -775,6 +837,8 @@ class PostgresEntityRepository:
                             "now": now,
                         },
                     )
+                    if entity.id not in changed_members:
+                        continue
                     for member in entity.members:
                         connection.execute(
                             _INSERT_MEMBER,
@@ -786,6 +850,11 @@ class PostgresEntityRepository:
                                 "now": now,
                             },
                         )
+                if changed_members:
+                    connection.execute(
+                        _TOUCH_ENTITIES,
+                        {"tenant_id": tenant_id, "ids": changed_members, "now": now},
+                    )
         except SQLAlchemyError as exc:
             raise _wrap("entity replace", exc) from exc
 
@@ -797,6 +866,7 @@ class PostgresEntityRepository:
         name: str,
         description: str | None,
         now: datetime,
+        expected_version: int | None = None,
     ) -> Entity:
         try:
             with self._engine.begin() as connection:
@@ -808,11 +878,18 @@ class PostgresEntityRepository:
                         "name": name,
                         "description": description,
                         "now": now,
+                        "expected_version": expected_version,
                     },
                 )
                 if int(result.rowcount) == 0:
-                    msg = "entity not found"
-                    raise NotFoundError(msg)
+                    exists = connection.execute(
+                        _SELECT_ENTITY, {"tenant_id": tenant_id, "id": entity_id}
+                    ).first()
+                    if exists is None:
+                        msg = "entity not found"
+                        raise NotFoundError(msg)
+                    msg = "entity version changed"
+                    raise StaleVersionError(msg)
         except SQLAlchemyError as exc:
             raise _wrap("entity rename", exc) from exc
         entity = self.get(tenant_id, entity_id)

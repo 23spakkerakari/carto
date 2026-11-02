@@ -21,9 +21,10 @@ identity stores of :mod:`carto_core.api.stores_postgres`:
 - :class:`SystemPortAdapter`, :class:`SourcePortAdapter`, :class:`FieldPortAdapter`: the inventory
   (ADR 0050) from the metadata store.
 
-``systems`` and ``entities`` have no version column, so their ETag version is
+``systems`` has no version column, so its ETag version is
 :func:`carto_core.metadata.updated_at_version` of ``updated_at`` (whole milliseconds since the
-epoch), derived the same way in list, get and patch. A link's version is the real column.
+epoch), derived the same way in list, get and patch. A link's version and an entity's version
+(migration 0005, ADR 0064) are real columns.
 
 A review item is built from the stored row only: the ends from the ``field_ref`` and the
 ``fields`` table (label, top shape), the sentence and shapes from the evidence's ``extra``
@@ -65,6 +66,7 @@ from carto_core.linker.repository import (
     NotFoundError,
     PostgresEntityRepository,
     PostgresLinkRepository,
+    StaleVersionError,
 )
 from carto_core.linker.review import DecisionError as ReviewDecisionError
 from carto_core.linker.review import DecisionKind, RequestContext, ReviewService
@@ -405,12 +407,12 @@ def _end(end: FieldForm, shape: object, lookup: _Lookup) -> LinkEndRecord:
 
 class EntityPortAdapter:
     """``EntityPort`` over ``EntityRepository``; ``link_ids`` from the links assigned to the
-    entity. The version is :func:`updated_at_version` of the row (module docstring).
+    entity. The version is the row's ``version`` column (ADR 0064).
 
     The repository offers one write, ``set_name``, which confirms the name it is given; a patch
     that carries only a description therefore confirms the current display name as well. The
-    route checks ``If-Match`` and the adapter checks the version again before writing, but the
-    write itself is not guarded by the version (``set_name`` takes none).
+    route checks ``If-Match`` and the repository checks ``expected_version`` inside its
+    ``UPDATE``, so a link pass or another reviewer between the GET and the PATCH is a 412.
     """
 
     __slots__ = ("_entities", "_links")
@@ -450,7 +452,7 @@ class EntityPortAdapter:
         current = self._entities.get(tenant_id, entity_id)
         if current is None:
             raise DecisionError("not_found")
-        if updated_at_version(current.updated_at) != expected_version:
+        if current.version != expected_version:
             raise DecisionError("stale_version")
         try:
             stored = self._entities.set_name(
@@ -459,9 +461,12 @@ class EntityPortAdapter:
                 name=name if name is not None else (current.display_name or ""),
                 description=description if description is not None else current.description,
                 now=at,
+                expected_version=expected_version,
             )
         except NotFoundError:
             raise DecisionError("not_found") from None
+        except StaleVersionError:
+            raise DecisionError("stale_version") from None
         return _entity_record(stored, self._assigned(tenant_id).get(entity_id, ()))
 
     def ping(self) -> bool:
@@ -490,7 +495,7 @@ def _entity_record(entity: Entity, link_ids: tuple[str, ...]) -> EntityRecord:
         fields=tuple(fields),
         link_ids=link_ids,
         system_count=len({row.system_id for row in fields}),
-        version=updated_at_version(entity.updated_at),
+        version=entity.version,
         updated_at=updated_at,
     )
 
