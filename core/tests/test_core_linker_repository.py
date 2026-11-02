@@ -42,6 +42,7 @@ TENANT = "default"
 A = FieldForm("sys_a/tpl_a/order_id", "raw")
 B = FieldForm("sys_b/tpl_b/order_ref", "digits.0")
 C = FieldForm("sys_c/tpl_c/ref", "alnum")
+D = FieldForm("sys_d/tpl_d/ref", "raw")
 FEATURES = PairFeatures(
     n_a=600,
     n_b=570,
@@ -247,6 +248,24 @@ def exercise_entities(repository: EntityRepository, tenant: str) -> None:
         tenant, "ent_1", name="Sales order", description="d2", now=later, expected_version=2
     )
     assert guarded.version == 3 and guarded.description == "d2"
+    # A description-only write leaves the name and its confirmation alone and still bumps
+    # (a suggestion is confirmed by naming it, never by describing it).
+    stored_one = repository.get(tenant, "ent_1")
+    assert stored_one is not None
+    third = Entity(id="ent_3", members=(D,), suggested_name="Maybe")
+    repository.replace_all(tenant, [stored_one, second, third], later)
+    described = repository.set_name(
+        tenant, "ent_2", name=None, description="only this", now=later, expected_version=1
+    )
+    assert described.version == 2 and described.description == "only this"
+    assert described.name == "Thing" and described.name_confirmed
+    maybe = repository.set_name(tenant, "ent_3", name=None, description="d", now=later)
+    assert maybe.name is None and not maybe.name_confirmed
+    assert maybe.suggested_name == "Maybe" and maybe.version == 2
+    with pytest.raises(StaleVersionError):
+        repository.set_name(
+            tenant, "ent_2", name=None, description="x", now=later, expected_version=1
+        )
 
     # A changed replace keeps the version; a grown family keeps its row.
     grown = Entity(id="ent_1", members=(A, B, C), name="Sales order", name_confirmed=True)

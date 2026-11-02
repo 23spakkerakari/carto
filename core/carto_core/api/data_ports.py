@@ -410,7 +410,8 @@ class EntityPortAdapter:
     entity. The version is the row's ``version`` column (ADR 0064).
 
     The repository offers one write, ``set_name``, which confirms the name it is given; a patch
-    that carries only a description therefore confirms the current display name as well. The
+    that carries only a description passes ``name=None`` and leaves the name and its
+    confirmation alone (a suggestion is confirmed by naming it, never by describing it). The
     route checks ``If-Match`` and the repository checks ``expected_version`` inside its
     ``UPDATE``, so a link pass or another reviewer between the GET and the PATCH is a 412.
     """
@@ -458,7 +459,7 @@ class EntityPortAdapter:
             stored = self._entities.set_name(
                 tenant_id,
                 entity_id,
-                name=name if name is not None else (current.display_name or ""),
+                name=name,
                 description=description if description is not None else current.description,
                 now=at,
                 expected_version=expected_version,

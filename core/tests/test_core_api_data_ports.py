@@ -593,6 +593,32 @@ def test_a_family_built_from_accepted_links_is_listed_and_renamed() -> None:
     assert described.json()["etag"] == 'W/"3"' and described.json()["description"] == "Web orders"
 
 
+def test_a_description_only_patch_never_confirms_the_suggested_name() -> None:
+    """Through the real adapter and repository (the in-memory port already said so): a
+    suggestion is confirmed by naming it, not by describing it."""
+    w = world()
+    for link_id in (EXACT_ID, BRIDGE_ID):
+        w.review.accept(TENANT, link_id, actor="alice", expected_version=1)
+    FamilyBuilder(w.links, w.entities, namer=lambda _members: "Order").rebuild(
+        TENANT, now=w.clock.tick(minutes=5)
+    )
+    headers = w.login(Role.INTEGRATION_ENGINEER)
+    entity = w.client.get(f"{API_PREFIX}/entities").json()["items"][0]
+    assert entity["name_confirmed"] is False and entity["etag"] == 'W/"1"'
+    described = w.client.patch(
+        f"{API_PREFIX}/entities/{entity['id']}",
+        json={"description": "One purchase from the shop to delivery"},
+        headers={**headers, "If-Match": 'W/"1"'},
+    )
+    assert described.status_code == 200, described.text
+    body = described.json()
+    assert body["name"] == "Order" and body["name_confirmed"] is False
+    assert body["etag"] == 'W/"2"' and body["description"].startswith("One purchase")
+    stored = w.entities.get(TENANT, entity["id"])
+    assert stored is not None and stored.name is None and stored.suggested_name == "Order"
+    assert stored.version == 2 and not stored.name_confirmed
+
+
 def test_readiness_asks_every_data_port() -> None:
     w = world()
     assert w.client.get("/readyz").status_code == 200

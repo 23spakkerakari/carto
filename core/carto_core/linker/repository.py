@@ -197,13 +197,15 @@ class EntityRepository(Protocol):
         tenant_id: str,
         entity_id: str,
         *,
-        name: str,
+        name: str | None,
         description: str | None,
         now: datetime,
         expected_version: int | None = None,
     ) -> Entity:
-        """Confirm a name (spec 9.6) and bump the version. Raises :class:`NotFoundError` or,
-        when ``expected_version`` is given and stale, :class:`StaleVersionError`."""
+        """Confirm a name (spec 9.6) and bump the version; with ``name`` ``None`` set the
+        description only and leave the name and its confirmation alone. Raises
+        :class:`NotFoundError` or, when ``expected_version`` is given and stale,
+        :class:`StaleVersionError`."""
         ...
 
     def ping(self) -> bool: ...
@@ -404,7 +406,7 @@ class InMemoryEntityRepository:
         tenant_id: str,
         entity_id: str,
         *,
-        name: str,
+        name: str | None,
         description: str | None,
         now: datetime,
         expected_version: int | None = None,
@@ -419,8 +421,8 @@ class InMemoryEntityRepository:
                 raise StaleVersionError(msg)
             stored = replace(
                 entity,
-                name=name,
-                name_confirmed=True,
+                name=name if name is not None else entity.name,
+                name_confirmed=entity.name_confirmed or name is not None,
                 description=description,
                 updated_at=now,
                 version=entity.version + 1,
@@ -541,6 +543,11 @@ _INSERT_MEMBER = sqlalchemy.text(
 _SET_ENTITY_NAME = sqlalchemy.text(
     "UPDATE entities SET name = :name, name_confirmed = TRUE, description = :description, "
     "updated_at = :now, version = version + 1 WHERE tenant_id = :tenant_id AND id = :id "
+    "AND (CAST(:expected_version AS INTEGER) IS NULL OR version = :expected_version)"
+)
+_SET_ENTITY_DESCRIPTION = sqlalchemy.text(
+    "UPDATE entities SET description = :description, updated_at = :now, version = version + 1 "
+    "WHERE tenant_id = :tenant_id AND id = :id "
     "AND (CAST(:expected_version AS INTEGER) IS NULL OR version = :expected_version)"
 )
 
@@ -863,24 +870,25 @@ class PostgresEntityRepository:
         tenant_id: str,
         entity_id: str,
         *,
-        name: str,
+        name: str | None,
         description: str | None,
         now: datetime,
         expected_version: int | None = None,
     ) -> Entity:
+        parameters: dict[str, Any] = {
+            "tenant_id": tenant_id,
+            "id": entity_id,
+            "description": description,
+            "now": now,
+            "expected_version": expected_version,
+        }
+        statement = _SET_ENTITY_DESCRIPTION
+        if name is not None:
+            statement = _SET_ENTITY_NAME
+            parameters["name"] = name
         try:
             with self._engine.begin() as connection:
-                result = connection.execute(
-                    _SET_ENTITY_NAME,
-                    {
-                        "tenant_id": tenant_id,
-                        "id": entity_id,
-                        "name": name,
-                        "description": description,
-                        "now": now,
-                        "expected_version": expected_version,
-                    },
-                )
+                result = connection.execute(statement, parameters)
                 if int(result.rowcount) == 0:
                     exists = connection.execute(
                         _SELECT_ENTITY, {"tenant_id": tenant_id, "id": entity_id}
