@@ -7,11 +7,14 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from carto_edge.pipeline.parse.access_log import (
+    HTTP_METHODS,
     AccessLogParser,
     generalize_path,
     looks_like_access_log,
+    normalize_method,
     status_class,
 )
+from carto_edge.pipeline.parse.common import TEMPLATE_MASK
 
 COMBINED = (
     '203.0.113.9 - alice [23/Sep/2026:13:04:06 +0000] "GET /orders/4471/items?x=1 HTTP/1.1" '
@@ -35,7 +38,8 @@ def test_access_log_combined_format_fields_and_template() -> None:
         "referer": "https://shop.example/cart",
         "user_agent": "Mozilla/5.0 (X11; Linux)",
     }
-    assert parsed.template == "GET /orders/*/items 2xx"
+    assert parsed.template == "GET /orders/<*>/items 2xx"
+    assert (parsed.method, parsed.route, parsed.status) == ("GET", "/orders/<*>/items", "2xx")
 
 
 def test_access_log_common_format_dashes_are_absent() -> None:
@@ -49,7 +53,7 @@ def test_access_log_common_format_dashes_are_absent() -> None:
         "protocol": "HTTP/1.1",
         "status": "503",
     }
-    assert parsed.template == "POST /api/v*/carts 5xx"
+    assert parsed.template == "POST /api/<*>/carts 5xx"
 
 
 def test_access_log_malformed_request_line_keeps_the_raw_request() -> None:
@@ -85,7 +89,7 @@ def test_access_log_custom_re2_pattern_with_named_groups() -> None:
         "status": "404",
         "duration_ms": "12",
     }
-    assert parsed.template == "GET /u/*/x 4xx"
+    assert parsed.template == "GET /u/<*>/x 4xx"
     assert parser.parse("nope") is None
 
 
@@ -111,15 +115,45 @@ def test_access_log_custom_pattern_is_linear_time() -> None:
 
 
 def test_generalize_path_rules() -> None:
-    assert generalize_path("/orders/4471/items") == "/orders/*/items"
-    assert generalize_path("/orders/4471?x=1&y=2") == "/orders/*"
-    assert generalize_path("/u/7f3a9c2e-1b4d-4f0a-9c3e-2a1b4c5d6e7f/x") == "/u/*/x"
-    assert generalize_path("/u/7F3A9C2E1B4D4F0A9C3E2A1B4C5D6E7F") == "/u/*"
-    assert generalize_path("/api/v2/carts") == "/api/v*/carts"
+    """A segment that looks like a value is masked whole as the template placeholder (ADR
+    0039 amendment of 2026-11-02): any digit, an ``@``, more than 64 characters, a UUID or a
+    long hex run. Words pass by shape; whether they travel is the parser's gate."""
+    assert generalize_path("/orders/4471/items") == "/orders/<*>/items"
+    assert generalize_path("/orders/4471?x=1&y=2") == "/orders/<*>"
+    assert generalize_path("/u/7f3a9c2e-1b4d-4f0a-9c3e-2a1b4c5d6e7f/x") == "/u/<*>/x"
+    assert generalize_path("/u/7F3A9C2E1B4D4F0A9C3E2A1B4C5D6E7F") == "/u/<*>"
+    assert generalize_path("/u/abcdefabcdefabcdef") == "/u/<*>"  # hex letters only, 16 or more
+    assert generalize_path("/api/v2/carts") == "/api/<*>/carts"
+    assert generalize_path("/customers/alice@example.com") == "/customers/<*>"
+    assert generalize_path("/customers/alice") == "/customers/alice"
+    assert generalize_path("/" + "x" * 65) == "/<*>"
     assert generalize_path("/static/app.js") == "/static/app.js"
     assert generalize_path("/") == "/"
     assert generalize_path("") == "-"
     assert generalize_path("/a/b#frag") == "/a/b"
+
+
+def test_access_log_method_is_a_constant_only_from_the_allowlist() -> None:
+    """The request method is attacker text; only a registered HTTP method (RFC 9110, PATCH,
+    the WebDAV and versioning set) is a template constant, anything else is ``<*>``, case
+    included. The field keeps the raw method for the classifier."""
+    template = '203.0.113.9 - - [23/Sep/2026:13:04:06 +0000] "{method} /x HTTP/1.1" 200 12'
+    for method in ("GET", "POST", "PATCH", "PROPFIND", "MKCALENDAR", "VERSION-CONTROL"):
+        parsed = AccessLogParser().parse(template.format(method=method))
+        assert parsed is not None
+        assert parsed.template == f"{method} /x 2xx", method
+    for method in ("get", "ALICE", "mkprobemethod", "GET4471", "G", "alice@example.com"):
+        parsed = AccessLogParser().parse(template.format(method=method))
+        assert parsed is not None
+        assert parsed.template == f"{TEMPLATE_MASK} /x 2xx", method
+        assert parsed.fields["method"] == method
+    assert {"GET", "HEAD", "POST", "PUT", "DELETE", "OPTIONS", "TRACE", "CONNECT"} <= HTTP_METHODS
+    assert all(method == method.upper() for method in HTTP_METHODS)
+    assert normalize_method(None) == "-"
+    assert normalize_method("") == "-"
+    assert normalize_method("GET") == "GET"
+    assert normalize_method("Get") == TEMPLATE_MASK
+    assert normalize_method("-") == TEMPLATE_MASK
 
 
 def test_generalize_path_is_bounded() -> None:

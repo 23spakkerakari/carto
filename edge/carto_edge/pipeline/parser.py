@@ -12,7 +12,11 @@ template of the message field (``message_field`` or the first of
 :data:`~carto_edge.config.DEFAULT_MESSAGE_FIELDS`; its parameters become ``msg.param_0..n``
 and the field itself is consumed), the root element name for XML, ``<METHOD> <route> <status
 class>`` for access logs, the mined template of an unstructured line (parameters
-``param_0..n``), else ``keys:<sorted top-level keys>``. The source timestamp comes from the
+``param_0..n``), else ``keys:<sorted top-level keys>``. The hint, the root name and the
+route are customer text that no miner masks, so each word of them gets what a mined template
+gets before it is a constant (:meth:`RecordParser._constants`, ADR 0039 amendment of
+2026-11-02): the miner's token masking, the value-shape rule of field names, and the name
+gate's trust rule. The source timestamp comes from the
 configured or default fields or the start of the line and is consumed; without one
 ``observed_at`` is the receive time with quality ``ingest``. Severity follows
 :mod:`carto_edge.pipeline.severity`; ``actor`` is the raw value of the actor field (the record's
@@ -44,11 +48,12 @@ from carto_edge.config import (
     SourceConfig,
 )
 from carto_edge.pipeline.model import FieldClass, ParsedRecord, RawRecord
-from carto_edge.pipeline.parse.access_log import AccessLogParser
+from carto_edge.pipeline.parse.access_log import AccessLogParser, AccessLogRecord
 from carto_edge.pipeline.parse.common import (
     SegmentPath,
     clean_text,
     flatten,
+    is_value_like,
     key_signature,
     safe_path,
     utf8_len,
@@ -57,7 +62,7 @@ from carto_edge.pipeline.parse.csv import CsvHeader, CsvParser, looks_like_csv_h
 from carto_edge.pipeline.parse.detect import FormatDetector
 from carto_edge.pipeline.parse.json import parse_json
 from carto_edge.pipeline.parse.logfmt import parse_logfmt
-from carto_edge.pipeline.parse.names import FieldNameStore
+from carto_edge.pipeline.parse.names import FieldNameStore, exempt_prefixes
 from carto_edge.pipeline.parse.text import parse_text
 from carto_edge.pipeline.parse.xml import parse_xml
 from carto_edge.pipeline.severity import (
@@ -67,7 +72,7 @@ from carto_edge.pipeline.severity import (
     detect_severity,
     map_level,
 )
-from carto_edge.pipeline.templates import TemplateStore
+from carto_edge.pipeline.templates import MASK, TemplateStore, mask_tokens
 from carto_edge.pipeline.timestamps import find_timestamp, resolve_zone
 from carto_schema.event import (
     MAX_FIELD_NAME_LEN,
@@ -87,6 +92,20 @@ REASON_INTERNAL: Final = "internal_error"
 FORMAT_FIELDS: Final = "fields"
 _LINE_MARKER: Final = ":line:"
 _MAX_TIMESTAMP_OVERRIDES: Final = 64
+_XML_CHANNEL: Final = "$xml"
+_ROUTE_CHANNEL: Final = "$route"
+_HINT_CHANNEL: Final = "$hint"
+"""Parents in the name register under which the three unmined template channels count their
+words (:meth:`RecordParser._constants`): never a field name's parent, so a route vocabulary
+and a record's keys never make each other a map."""
+_HINT_VERBS: Final = ("file_arrived", "file_removed", "row_change")
+"""The product's own first words of a connector's template hint: constants from the first
+record. What follows them is customer text."""
+_MAX_GATED_WORDS: Final = 32
+"""Words of one channel put through the register per record; later ones are masked."""
+_CHANNEL_TRUSTED: Final = exempt_prefixes(
+    (_XML_CHANNEL, _ROUTE_CHANNEL, *(f"{_HINT_CHANNEL}.{verb}" for verb in _HINT_VERBS))
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -204,7 +223,7 @@ class RecordParser:
         hint = clean_text(raw.template_hint.strip()) if raw.template_hint else ""
         draft = _Draft(
             fields=fields,
-            template_text=hint or None,
+            template_text=self._hint_template(raw, hint) if hint else None,
             top_keys=flat.top_keys,
             parse_format=FORMAT_FIELDS,
             notes=flat.notes,
@@ -268,7 +287,7 @@ class RecordParser:
                 return None
             return _Draft(
                 fields=xml.fields,
-                template_text=xml.root,
+                template_text=self._constants(raw, _XML_CHANNEL, (xml.template,))[0],
                 top_keys=(),
                 parse_format=fmt.value,
                 notes=xml.notes,
@@ -307,7 +326,7 @@ class RecordParser:
                 return None
             return _Draft(
                 fields=access.fields,
-                template_text=access.template,
+                template_text=self._route_template(raw, access),
                 top_keys=(),
                 parse_format=fmt.value,
                 kind=EventKind.HTTP_ACCESS,
@@ -327,6 +346,73 @@ class RecordParser:
                 param_prefix="",
             )
         return None
+
+    # -- template constants that no miner sees ------------------------------------------------
+
+    def _constants(self, raw: RawRecord, channel: str, words: Sequence[str]) -> list[str]:
+        """Each word of a template ``channel`` as it may travel: the word itself, or ``MASK``.
+
+        The XML root element name, the route segments of an access-log request line and the
+        tokens of a connector's ``template_hint`` put customer text into ``template_text``
+        without passing the template miner, so each gets what a mined template gets (ADR 0039
+        amendment of 2026-11-02): :func:`mask_tokens` (digits, ``@``, secrets by key, word and
+        shape), the value-shape rule of field names (:func:`is_value_like`), then the name
+        gate's trust rule (ADR 0038: a word is a constant once three distinct records carried
+        it under the same prefix and the detector does not flag it). The words are counted in
+        the system's name register as the path ``<channel>.<word 1>.<word 2>...``, one
+        prefix per word, under the channel's own parent, so ``alice`` under ``/customers`` is
+        a different name from ``alice`` under ``/users`` and neither ever meets a field
+        name. A word is in clear only when the register returns its prefix with the word
+        itself at the end (a masked label, a map entry or a dropped secret-named path all read
+        as masked). Without a name store (parser unit tests only; the pipeline always passes
+        one) the shape rules alone apply, as for field names (ADR 0027).
+        """
+        masked, _ = mask_tokens(words)
+        shaped = [MASK if token == MASK or is_value_like(token) else token for token in masked]
+        if self._names is None or not shaped:
+            return shaped
+        keys = [word.replace(".", "/") for word in shaped[:_MAX_GATED_WORDS]]
+        fields: dict[str, str] = {}
+        structure: dict[str, SegmentPath] = {}
+        for end in range(1, len(keys) + 1):
+            label = ".".join((channel, *keys[:end]))
+            fields[label] = str(end)
+            structure[label] = ((channel, False), *((key, False) for key in keys[:end]))
+        gated = self._names.apply(
+            raw.system_id,
+            fields,
+            (),
+            _CHANNEL_TRUSTED,
+            structure=structure,
+            record_id=f"{raw.source_id}:{raw.locator}",
+        )
+        clear: dict[str, str] = {}
+        for name, index in gated.fields.items():
+            clear.setdefault(index, name)
+        out: list[str] = []
+        for end, (word, key) in enumerate(zip(shaped[: len(keys)], keys, strict=True), start=1):
+            if word == MASK:
+                out.append(MASK)
+                continue
+            parts = clear.get(str(end), "").split(".")
+            out.append(word if len(parts) == end + 1 and parts[-1] == key else MASK)
+        out.extend(MASK for _ in shaped[len(keys) :])
+        return out
+
+    def _route_template(self, raw: RawRecord, access: AccessLogRecord) -> str:
+        """``<METHOD> <route> <status class>`` with every route segment through
+        :meth:`_constants` (``-`` for an absent path stays as it is)."""
+        route = access.route
+        if route != "-":
+            pieces = route.split("/")
+            constants = iter(self._constants(raw, _ROUTE_CHANNEL, [p for p in pieces if p]))
+            route = "/".join(next(constants) if piece else "" for piece in pieces)
+        return f"{access.method} {route} {access.status}"
+
+    def _hint_template(self, raw: RawRecord, hint: str) -> str:
+        """A connector's template hint with every whitespace token through :meth:`_constants`;
+        the verbs of :data:`_HINT_VERBS` are trusted from the first record."""
+        return " ".join(self._constants(raw, _HINT_CHANNEL, hint.split()))
 
     # -- common finishing ---------------------------------------------------------------------
 

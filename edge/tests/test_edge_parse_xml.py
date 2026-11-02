@@ -8,7 +8,12 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-from carto_edge.pipeline.parse.common import MAX_ARRAY_ITEMS, NOTE_ARRAY_LIMIT, NOTE_DEPTH_LIMIT
+from carto_edge.pipeline.parse.common import (
+    MAX_ARRAY_ITEMS,
+    NOTE_ARRAY_LIMIT,
+    NOTE_DEPTH_LIMIT,
+    TEMPLATE_MASK,
+)
 from carto_edge.pipeline.parse.xml import looks_like_xml, parse_xml
 
 SIM_DIR = Path(__file__).resolve().parents[2] / "sim-out" / "shop"
@@ -48,6 +53,33 @@ def test_parse_xml_heartbeat_has_its_own_root() -> None:
     assert parsed is not None
     assert parsed.root == "heartbeat"
     assert parsed.fields == {"timestamp": "2026-09-23T00:23:06.570-04:00", "status": "OK"}
+
+
+def test_parse_xml_root_name_is_a_template_word_only_when_it_is_not_value_like() -> None:
+    """The root element name travels as the template of XML records (ADR 0016), so it is
+    masked like any template word when it looks like a value (ADR 0039 amendment of
+    2026-11-02): a digit, an ``@`` or more than 64 characters make it ``<*>``. ``root`` stays
+    the raw local name for the parser; trust across records is the parser's gate."""
+    payment = parse_xml(PAYMENT)
+    assert payment is not None
+    assert payment.template == "paymentMessage"
+    order = parse_xml("<ORDER4471><status>OK</status></ORDER4471>")
+    assert order is not None
+    assert order.root == "ORDER4471"
+    assert order.template == TEMPLATE_MASK
+    assert order.fields == {"status": "OK"}
+    short = parse_xml("<a1/>")
+    assert short is not None
+    assert short.template == TEMPLATE_MASK
+    long_name = parse_xml(f"<{'x' * 65}/>")
+    assert long_name is not None
+    assert long_name.template == TEMPLATE_MASK
+    word = parse_xml("<customer_alice/>")
+    assert word is not None
+    assert word.template == "customer_alice"  # a word by shape; the parser's gate decides
+    namespaced = parse_xml('<p:order7 xmlns:p="urn:p"/>')
+    assert namespaced is not None
+    assert namespaced.template == TEMPLATE_MASK
 
 
 def test_parse_xml_attributes_repeats_nesting_and_text() -> None:

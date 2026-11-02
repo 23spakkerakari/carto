@@ -13,7 +13,9 @@ import pytest
 
 from carto_edge.config import ParseConfig, RecordFormat, SourceConfig, SourceType
 from carto_edge.pipeline.model import ParsedRecord, RawRecord
+from carto_edge.pipeline.parse.names import FieldNameStore
 from carto_edge.pipeline.parser import ParseFailure, RecordParser
+from carto_edge.pipeline.pii import PiiHit
 from carto_edge.pipeline.templates import MASK, TemplateStore, compute_template_id
 from carto_schema.event import EventKind, ObservedAtQuality, Severity
 
@@ -206,7 +208,7 @@ def test_parser_access_log_sets_kind_and_template() -> None:
     record = parsed(parser.parse(raw(line)))
     assert record.kind == EventKind.HTTP_ACCESS
     assert record.parse_format == "access_log"
-    assert record.template_text == "GET /orders/*/items 5xx"
+    assert record.template_text == f"GET /orders/{MASK}/items 5xx"
     assert record.severity == Severity.ERROR
     assert record.observed_at == datetime(2026, 9, 23, 13, 4, 6, tzinfo=UTC)
     assert "time" not in record.fields
@@ -228,7 +230,7 @@ def test_parser_access_log_custom_pattern() -> None:
     )
     record = parsed(parser.parse(raw("2026-09-23T13:04:06Z GET /u/42 404")))
     assert record.kind == EventKind.HTTP_ACCESS
-    assert record.template_text == "GET /u/* 4xx"
+    assert record.template_text == f"GET /u/{MASK} 4xx"
     assert record.severity == Severity.WARN
     assert record.observed_at == datetime(2026, 9, 23, 13, 4, 6, tzinfo=UTC)
     assert isinstance(parser.parse(raw("garbage")), ParseFailure)
@@ -462,6 +464,209 @@ def test_parser_notes_record_limits_hit() -> None:
     parser = RecordParser(source(), TemplateStore(min_cluster_size=1))
     record = parsed(parser.parse(raw(json.dumps({"msg": "x", "items": list(range(40))}))))
     assert "array_limit" in record.parse_notes
+
+
+class _FlagDetector:
+    """Flags a text that contains one of ``names`` as a person (score 0.9); nothing else."""
+
+    def __init__(self, names: tuple[str, ...] = ()) -> None:
+        self.names = names
+
+    def detect(self, text: str) -> list[PiiHit]:
+        for name in self.names:
+            start = text.find(name)
+            if start >= 0:
+                return [PiiHit("PERSON", start, start + len(name), 0.9)]
+        return []
+
+
+def gated(system: str = "sys_test", *names: str, **parse: Any) -> RecordParser:
+    """A parser with the name gate (ADR 0030, 0038), as the pipeline builds it."""
+    store = FieldNameStore(_FlagDetector(names))  # type: ignore[arg-type]
+    return RecordParser(source(system, **parse), TemplateStore(min_cluster_size=1), store)
+
+
+def access_line(request: str, second: int = 6, status: int = 200) -> str:
+    return (
+        f'203.0.113.9 - - [23/Sep/2026:13:04:{second:02d} +0000] "{request} HTTP/1.1" {status} 12'
+    )
+
+
+def test_parser_xml_root_is_a_constant_only_once_three_records_carry_it() -> None:
+    """The root element name is a template constant under the name gate's trust rule (ADR
+    0038: three distinct records, counted once per record id), like a field name; a root
+    that looks like a value never is (ADR 0039 amendment of 2026-11-02)."""
+    parser = gated("sys_payments")
+    doc = (
+        "<customer_alice><timestamp>2026-09-28T10:20:19Z</timestamp><status>OK</status>"
+        "</customer_alice>"
+    )
+    first = parsed(parser.parse(raw(doc, locator="m.xml:line:1")))
+    assert first.template_text == MASK
+    assert first.template_id == compute_template_id("sys_test", MASK)
+    assert first.parse_format == "xml"
+    again = parsed(parser.parse(raw(doc, locator="m.xml:line:1")))  # delivered again
+    assert again.template_text == MASK
+    second = parsed(parser.parse(raw(doc, locator="m.xml:line:2")))
+    assert second.template_text == MASK
+    third = parsed(parser.parse(raw(doc, locator="m.xml:line:3")))
+    assert third.template_text == "customer_alice"
+    assert third.template_id == compute_template_id("sys_test", "customer_alice")
+    for n in range(4):
+        order = "<ORDER4471><status>OK</status></ORDER4471>"
+        record = parsed(parser.parse(raw(order, locator=f"m.xml:line:{10 + n}")))
+        assert record.template_text == MASK
+
+
+def test_parser_xml_root_the_detector_flags_never_becomes_a_constant() -> None:
+    parser = gated("sys_payments", "alice")
+    doc = "<customer_alice><status>OK</status></customer_alice>"
+    for n in range(5):
+        record = parsed(parser.parse(raw(doc, locator=f"m.xml:line:{n}")))
+        assert record.template_text == MASK
+    assert record.fields == {"status": "OK"}  # the field name itself is trusted as before
+
+
+def test_parser_access_log_method_and_route_segments_are_gated() -> None:
+    """Route segments are constants only once the name gate trusts them, under their prefix
+    (``alice`` under ``/customers`` is counted apart from ``alice`` under ``/users``); the
+    method only from the HTTP allowlist; digits, ``@`` and secrets never."""
+    parser = gated()
+    records = [
+        parsed(parser.parse(raw(access_line("GET /customers/alice", n), locator=f"a.log:line:{n}")))
+        for n in range(3)
+    ]
+    assert [r.template_text for r in records] == [
+        f"GET /{MASK}/{MASK} 2xx",
+        f"GET /{MASK}/{MASK} 2xx",
+        "GET /customers/alice 2xx",
+    ]
+    assert records[0].kind == EventKind.HTTP_ACCESS
+    bob = parsed(parser.parse(raw(access_line("GET /customers/bob", 5), locator="a.log:line:5")))
+    assert bob.template_text == f"GET /customers/{MASK} 2xx"
+    assert bob.fields["path"] == "/customers/bob"
+    hack = parsed(
+        parser.parse(raw(access_line("HACK /customers/alice", 6), locator="a.log:line:6"))
+    )
+    assert hack.template_text == f"{MASK} /customers/alice 2xx"
+    assert hack.fields["method"] == "HACK"
+    ids = parsed(
+        parser.parse(raw(access_line("GET /orders/4471/items", 7), locator="a.log:line:7"))
+    )
+    assert ids.template_text == f"GET /{MASK}/{MASK}/{MASK} 2xx"
+    for n in range(8, 11):
+        secret = parsed(
+            parser.parse(
+                raw(access_line("POST /reset/password/hunterx", n), locator=f"a.log:line:{n}")
+            )
+        )
+    assert secret.template_text == f"POST /reset/password/{MASK} 2xx"
+    for n in range(11, 14):
+        other = parsed(
+            parser.parse(raw(access_line("GET /users/alice", n), locator=f"a.log:line:{n}"))
+        )
+    assert other.template_text == "GET /users/alice 2xx"
+    assert (
+        parsed(
+            parser.parse(raw(access_line("GET /users/alice", 14), locator="a.log:line:11"))
+        ).template_text
+        == "GET /users/alice 2xx"
+    )
+
+
+def test_parser_access_log_route_segments_the_detector_flags_stay_parameters() -> None:
+    parser = gated("sys_test", "alice")
+    for n in range(4):
+        record = parsed(
+            parser.parse(raw(access_line("GET /customers/alice", n), locator=f"a.log:line:{n}"))
+        )
+    assert record.template_text == f"GET /customers/{MASK} 2xx"
+
+
+def test_parser_template_hint_words_are_gated_like_a_mined_template() -> None:
+    """A connector's template hint carries customer text (a generalized file name, a table
+    name, a webhook event type): every token goes through ``mask_tokens`` and the name gate;
+    the product's own verbs are constants from the first record."""
+    parser = gated("sys_warehouse")
+
+    def file_event(name: str, hint: str) -> RawRecord:
+        return raw(
+            fields={"name": name, "size": 1},
+            kind=EventKind.FILE_ARRIVED,
+            locator=f"file:{name}",
+            template_hint=hint,
+        )
+
+    events = [
+        parsed(parser.parse(file_event(f"SHIP_2026092{n}_2112.csv", "file_arrived SHIP_*_*.csv")))
+        for n in range(3)
+    ]
+    assert [e.template_text for e in events] == [
+        f"file_arrived {MASK}",
+        f"file_arrived {MASK}",
+        "file_arrived SHIP_*_*.csv",
+    ]
+    assert events[0].template_id == compute_template_id("sys_test", f"file_arrived {MASK}")
+    odd = parsed(parser.parse(file_event("customer_alice.csv", "file_arrived customer_alice.csv")))
+    assert odd.template_text == f"file_arrived {MASK}"
+    for n in range(4):
+        digits = parsed(
+            parser.parse(
+                raw(
+                    fields={"id": n},
+                    kind=EventKind.ROW_CHANGE,
+                    locator=f"ORDERS4471:row:{n}",
+                    template_hint="row_change ORDERS4471",
+                )
+            )
+        )
+        assert digits.template_text == f"row_change {MASK}"
+    hooks = [
+        parsed(
+            parser.parse(
+                raw(
+                    fields={"data": {"id": n}},
+                    kind=EventKind.WEBHOOK,
+                    locator=f"webhook:{n}",
+                    template_hint="order.paid",
+                )
+            )
+        )
+        for n in range(3)
+    ]
+    assert [h.template_text for h in hooks] == [MASK, MASK, "order.paid"]
+    mail = parsed(
+        parser.parse(
+            raw(
+                fields={"id": 7},
+                kind=EventKind.ROW_CHANGE,
+                locator="purchase_orders:row:7",
+                template_hint="row_change owner support@example.com",
+            )
+        )
+    )
+    assert mail.template_text == f"row_change {MASK} {MASK}"
+    assert "example.com" not in mail.template_text
+
+
+def test_parser_without_the_name_gate_masks_value_like_constants_only() -> None:
+    """Without a name store (parser unit tests only; the pipeline always passes one) the
+    three channels apply the value-shape rules alone, as field names do (ADR 0027)."""
+    parser = RecordParser(source(), TemplateStore(min_cluster_size=1))
+    assert parsed(parser.parse(raw("<customer_alice/>"))).template_text == "customer_alice"
+    assert parsed(parser.parse(raw("<ORDER4471/>"))).template_text == MASK
+    assert (
+        parsed(parser.parse(raw(access_line("GET /customers/alice")))).template_text
+        == "GET /customers/alice 2xx"
+    )
+    assert (
+        parsed(parser.parse(raw(access_line("HACK /customers/alice")))).template_text
+        == f"{MASK} /customers/alice 2xx"
+    )
+    hinted = parsed(
+        parser.parse(raw(fields={"id": 1}, template_hint="row_change ORDERS4471 owner@x.csv"))
+    )
+    assert hinted.template_text == f"row_change {MASK} {MASK}"
 
 
 @needs_sim

@@ -5,9 +5,15 @@ The built-in pattern covers the common format and its combined extension (refere
 agent), with trailing extra fields tolerated. A per-source ``access_log_pattern`` is compiled
 with ``google-re2`` (linear time whatever the customer writes, spec 2.3 invariant 8) and must
 use named groups; its ``groupdict`` becomes the fields. Either way the template is
-``<METHOD> <generalized path> <status class>`` (ADR 0016): the query string is dropped and
-digit runs, UUIDs and long hex segments in the path become ``*``, so ``GET /orders/4471/items
-2xx`` and ``GET /orders/9910/items 2xx`` are one node. Dash placeholders (``-``) of the
+``<METHOD> <route> <status class>`` (ADR 0016). The request line is attacker text and the
+template leaves the edge in clear (spec 2.3 invariant 2), so (ADR 0039 amendment of
+2026-11-02) the method is a constant only when it is a registered HTTP method
+(:data:`HTTP_METHODS`; anything else is ``<*>``) and the route is the path without its query
+string with every segment that looks like a value masked whole as ``<*>``: a UUID, a run of
+16 or more hex characters, or any digit, ``@`` or more than 64 characters
+(:func:`~carto_edge.pipeline.parse.common.is_value_like`), so ``GET /orders/4471/items 2xx``
+and ``GET /orders/9910/items 2xx`` are one node. The segments that pass are words by shape;
+whether each may travel is the parser's name-gate question. Dash placeholders (``-``) of the
 standard formats are absent fields.
 """
 
@@ -19,15 +25,69 @@ from typing import Any, Final
 
 import re2
 
+from carto_edge.pipeline.parse.common import TEMPLATE_MASK, is_value_like
+
 __all__ = [
+    "HTTP_METHODS",
     "AccessLogParser",
     "AccessLogRecord",
     "generalize_path",
     "looks_like_access_log",
+    "normalize_method",
     "status_class",
 ]
 
 MAX_PATH_LEN: Final = 512
+HTTP_METHODS: Final = frozenset(
+    {
+        # RFC 9110 and PATCH (RFC 5789)
+        "GET",
+        "HEAD",
+        "POST",
+        "PUT",
+        "DELETE",
+        "CONNECT",
+        "OPTIONS",
+        "TRACE",
+        "PATCH",
+        # WebDAV (RFC 4918), versioning (RFC 3253), ACL (RFC 3744), ordered collections
+        # (RFC 3648), redirect references (RFC 4437), CalDAV (RFC 4791), binding (RFC 5842),
+        # search (RFC 5323), linking (RFC 2068), HTTP/2 preface (RFC 9113), QUERY (draft)
+        "PROPFIND",
+        "PROPPATCH",
+        "MKCOL",
+        "COPY",
+        "MOVE",
+        "LOCK",
+        "UNLOCK",
+        "VERSION-CONTROL",
+        "REPORT",
+        "CHECKOUT",
+        "CHECKIN",
+        "UNCHECKOUT",
+        "MKWORKSPACE",
+        "UPDATE",
+        "LABEL",
+        "MERGE",
+        "BASELINE-CONTROL",
+        "MKACTIVITY",
+        "ACL",
+        "ORDERPATCH",
+        "MKREDIRECTREF",
+        "UPDATEREDIRECTREF",
+        "MKCALENDAR",
+        "BIND",
+        "UNBIND",
+        "REBIND",
+        "SEARCH",
+        "LINK",
+        "UNLINK",
+        "PRI",
+        "QUERY",
+    }
+)
+"""The request methods that may be a template constant, as the IANA HTTP method registry
+spells them (case-sensitive, so ``get`` is masked). Everything else is ``<*>``."""
 
 _STANDARD: Final = re.compile(
     r"^(?P<remote_addr>\S+) (?P<remote_ident>\S+) (?P<remote_user>\S+) "
@@ -40,7 +100,6 @@ _UUID: Final = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
 _HEX: Final = re.compile(r"^[0-9a-fA-F]{16,}$")
-_DIGITS: Final = re.compile(r"\d+")
 _DASH_IS_ABSENT: Final = frozenset(
     {"remote_ident", "remote_user", "bytes", "referer", "user_agent"}
 )
@@ -48,10 +107,15 @@ _DASH_IS_ABSENT: Final = frozenset(
 
 @dataclass(frozen=True, slots=True)
 class AccessLogRecord:
-    """The fields of one access-log line and its template text."""
+    """The fields of one access-log line and its template text, with the template's three
+    parts: ``method`` (from :data:`HTTP_METHODS`, ``-`` when absent, else ``<*>``), ``route``
+    (:func:`generalize_path`) and ``status`` (:func:`status_class`)."""
 
     fields: dict[str, str]
     template: str
+    method: str
+    route: str
+    status: str
 
 
 def looks_like_access_log(text: str) -> bool:
@@ -67,9 +131,17 @@ def status_class(status: str) -> str:
     return "-"
 
 
+def normalize_method(method: str | None) -> str:
+    """``method`` when it is in :data:`HTTP_METHODS`, ``-`` when absent, else ``<*>``."""
+    if not method:
+        return "-"
+    return method if method in HTTP_METHODS else TEMPLATE_MASK
+
+
 def generalize_path(path: str) -> str:
-    """The route of a request path (ADR 0016): no query or fragment, digit runs, UUIDs and
-    hex segments of 16 or more characters replaced by ``*``; ``-`` for an empty path."""
+    """The route of a request path (ADR 0016, ADR 0039 amendment): no query or fragment,
+    every segment that is a UUID, a hex run of 16 or more characters or value-like (any
+    digit, ``@``, over 64 characters) replaced whole by ``<*>``; ``-`` for an empty path."""
     if not path:
         return "-"
     cut = len(path)
@@ -80,19 +152,25 @@ def generalize_path(path: str) -> str:
     route = path[:cut][:MAX_PATH_LEN]
     if not route:
         return "-"
-    pieces: list[str] = []
-    for segment in route.split("/"):
-        if _UUID.match(segment) or _HEX.match(segment):
-            pieces.append("*")
-        else:
-            pieces.append(_DIGITS.sub("*", segment))
-    return "/".join(pieces)
+    return "/".join(
+        TEMPLATE_MASK
+        if segment and (_UUID.match(segment) or _HEX.match(segment) or is_value_like(segment))
+        else segment
+        for segment in route.split("/")
+    )
 
 
-def _template(fields: dict[str, str]) -> str:
-    method = fields.get("method") or "-"
-    path = fields.get("path") or ""
-    return f"{method} {generalize_path(path)} {status_class(fields.get('status', ''))}"
+def _record(fields: dict[str, str]) -> AccessLogRecord:
+    method = normalize_method(fields.get("method"))
+    route = generalize_path(fields.get("path") or "")
+    status = status_class(fields.get("status", ""))
+    return AccessLogRecord(
+        fields=fields,
+        template=f"{method} {route} {status}",
+        method=method,
+        route=route,
+        status=status,
+    )
 
 
 def _split_request(request: str, fields: dict[str, str]) -> None:
@@ -143,7 +221,7 @@ class AccessLogParser:
                 continue
             fields[name] = value
         _split_request(match.group("request"), fields)
-        return AccessLogRecord(fields=fields, template=_template(fields))
+        return _record(fields)
 
     def _parse_custom(self, line: str) -> AccessLogRecord | None:
         if self._custom is None:  # established by the constructor
@@ -157,4 +235,4 @@ class AccessLogParser:
         fields = {name: value for name, value in match.groupdict().items() if value is not None}
         if not fields:
             return None
-        return AccessLogRecord(fields=fields, template=_template(fields))
+        return _record(fields)

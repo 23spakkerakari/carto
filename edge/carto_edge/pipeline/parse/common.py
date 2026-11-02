@@ -17,6 +17,13 @@ in names. :func:`safe_path` masks every path segment that looks like a value, wi
 ``@`` after the first character (``@attr`` is the XML attribute convention), a run of three or
 more digits, or more than :data:`MAX_SEGMENT_LEN` characters. The parser applies it to every
 field path and to the signature keys.
+
+Template words that are not mined (an XML root element name, a route segment of an access
+log, a token of a connector's template hint) travel in clear like field names, and get the
+stricter of that rule and the template miner's masking: :func:`is_value_like` flags any digit,
+any ``@`` or more than :data:`MAX_SEGMENT_LEN` characters and :func:`template_word` writes
+:data:`TEMPLATE_MASK` over such a word (ADR 0039 amendment of 2026-11-02). Whether a word
+that passes may travel is the parser's name-gate question, not this module's.
 """
 
 from __future__ import annotations
@@ -40,15 +47,18 @@ __all__ = [
     "NOTE_ARRAY_LIMIT",
     "NOTE_DEPTH_LIMIT",
     "NOTE_FIELD_LIMIT",
+    "TEMPLATE_MASK",
     "Flattened",
     "Segment",
     "SegmentPath",
     "clean_text",
     "flatten",
+    "is_value_like",
     "key_signature",
     "safe_path",
     "safe_segment",
     "stringify",
+    "template_word",
     "utf8_len",
 ]
 
@@ -67,6 +77,8 @@ MAX_SIGNATURE_KEY_LEN: Final = 64
 MAX_SEGMENT_LEN: Final = 64
 """A path segment longer than this is a value, not a name."""
 MASKED_SEGMENT: Final = "*"
+TEMPLATE_MASK: Final = "<*>"
+"""The template placeholder (the miner's ``MASK``): what a value-like template word becomes."""
 _DIGIT_RUN: Final = re.compile(r"[0-9]{3}")
 NOTE_DEPTH_LIMIT: Final = "depth_limit"
 NOTE_ARRAY_LIMIT: Final = "array_limit"
@@ -257,3 +269,17 @@ def safe_path(path: str) -> str:
     if "." not in path:
         return safe_segment(path)
     return ".".join(safe_segment(segment) for segment in path.split("."))
+
+
+def is_value_like(word: str) -> bool:
+    """Whether a template word that was not mined (an XML root element name, a route segment
+    of an access log, a token of a connector's template hint) looks like a value: any digit,
+    any ``@`` or more than :data:`MAX_SEGMENT_LEN` characters. The rules of
+    :func:`safe_segment` and of the template miner's masking together (ADR 0039 amendment of
+    2026-11-02); such a word is never a constant, whatever the name gate says of it."""
+    return len(word) > MAX_SEGMENT_LEN or "@" in word or any(char.isdigit() for char in word)
+
+
+def template_word(word: str) -> str:
+    """``word``, or :data:`TEMPLATE_MASK` when :func:`is_value_like` says it is a value."""
+    return TEMPLATE_MASK if is_value_like(word) else word

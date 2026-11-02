@@ -356,7 +356,9 @@ def test_contract_violation_is_dropped_not_raised(monkeypatch: pytest.MonkeyPatc
 
 def test_template_text_is_redacted_and_counted() -> None:
     """A mined template masks digits and e-mail tokens before Drain3 sees them; a connector's
-    template hint is the path where a constant could still carry PII (spec 8.3)."""
+    template hint was the path where a constant could still carry PII (spec 8.3) until the
+    ADR 0039 amendment of 2026-11-02 put its words through the same masking and the name
+    gate, so the address is a placeholder before the redactor sees the text."""
     pipeline = make()
     hinted = RawRecord(
         source_id="src_wms",
@@ -370,8 +372,8 @@ def test_template_text_is_redacted_and_counted() -> None:
     event = pipeline.process(hinted).event
     assert event is not None
     assert "example.com" not in event.template_text
-    assert "<EMAIL_ADDRESS>" in event.template_text
-    assert event.redaction.entities_masked == 1
+    assert event.template_text == "row_change <*> <*>"
+    assert event.redaction.entities_masked == 0
     mined = pipeline.process(
         raw_line(json.dumps({"ts": "2026-09-23T04:00:00Z", "msg": "notify x@example.com now"}))
     ).event

@@ -8,7 +8,11 @@ elements by local name (namespaces stripped), attributes as ``@attr``, repeated 
 up to :data:`~carto_edge.pipeline.parse.common.MAX_DEPTH`. An element with text and nothing
 else maps to its path; one that also has attributes or children keeps its text under
 ``#text``. The root element name is returned separately: it is the template of XML records
-(ADR 0016).
+(ADR 0016), as ``template`` once the value-shape rule of
+:func:`~carto_edge.pipeline.parse.common.template_word` has been applied (a root with a digit,
+an ``@`` or more than 64 characters is ``<*>``); whether a root that passes travels in clear
+is the parser's name-gate question (ADR 0039 amendment of 2026-11-02). ``root`` is the raw
+local name.
 """
 
 from __future__ import annotations
@@ -29,6 +33,7 @@ from carto_edge.pipeline.parse.common import (
     NOTE_FIELD_LIMIT,
     NOTE_KEY_LIMIT,
     SegmentPath,
+    template_word,
 )
 
 __all__ = ["XmlRecord", "looks_like_xml", "parse_xml"]
@@ -36,10 +41,12 @@ __all__ = ["XmlRecord", "looks_like_xml", "parse_xml"]
 
 @dataclass(frozen=True, slots=True)
 class XmlRecord:
-    """The root element's local name, the flattened fields and the limit notes; ``structure``
-    as in :class:`~carto_edge.pipeline.parse.common.Flattened` (XML names may contain dots)."""
+    """The root element's local name, its template word (the name, or ``<*>`` when it looks
+    like a value), the flattened fields and the limit notes; ``structure`` as in
+    :class:`~carto_edge.pipeline.parse.common.Flattened` (XML names may contain dots)."""
 
     root: str
+    template: str
     fields: dict[str, str]
     notes: tuple[str, ...]
     structure: dict[str, SegmentPath] = field(default_factory=dict)
@@ -138,8 +145,10 @@ def parse_xml(text: str) -> XmlRecord | None:
     if root is None:
         return None
     out = _flatten_element(root)
+    name = _local_name(root.tag)
     return XmlRecord(
-        root=_local_name(root.tag),
+        root=name,
+        template=template_word(name),
         fields=out.fields,
         notes=tuple(sorted(out.notes)),
         structure=out.structure,

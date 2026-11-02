@@ -44,6 +44,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import os
 import re
 import warnings
 from collections import Counter
@@ -55,6 +56,7 @@ from typing import Any
 
 import pytest
 import structlog
+import yaml
 import zstandard
 
 with warnings.catch_warnings():
@@ -436,14 +438,15 @@ def test_leak_small_run(scenario: str, tmp_path: Path, restore_logging: None) ->
         ),
         sim,
     )
-    probes = _plant_probes(sim, layout)
+    config = tmp_path / "analyze.yaml"
+    probes = _plant_probes(sim, layout, config)
     markers_file = tmp_path / "markers.json"
     planted = json.loads((sim / "ground_truth" / "markers.json").read_text(encoding="utf-8"))
     assert len(planted["secret_values"]) == 7, "the simulator planted no secrets (ADR 0068)"
     planted["probes"] = probes
     markers_file.write_text(json.dumps(planted), encoding="utf-8")
     out = tmp_path / f"{scenario}.carto"
-    result = analyze(layout.config, sim, out, locator_map=True)
+    result = analyze(config, sim, out, locator_map=True)
     manifest = result.manifest
     assert manifest.counts.events > 0
     verified = verify_bundle(out)
@@ -470,7 +473,7 @@ def test_leak_small_run(scenario: str, tmp_path: Path, restore_logging: None) ->
     assert {entry.name for entry in out.iterdir()} == BUNDLE_FILES
     lines = [json.loads(line) for line in locator.read_text(encoding="utf-8").splitlines()]
     assert len(lines) == manifest.counts.events
-    source_ids = tuple(f"{source.id}:" for source in load_sources_file(layout.config).sources)
+    source_ids = tuple(f"{source.id}:" for source in load_sources_file(config).sources)
     assert all(line["key"].startswith(source_ids) for line in lines)
 
     # What the edge would forward, and what ingest-api would write.
@@ -529,14 +532,51 @@ def _letters(n: int) -> str:
     return "".join(chr(97 + (n // 26**place) % 26) for place in (2, 1, 0))
 
 
-def _plant_probes(sim: Path, layout: Layout) -> dict[str, list[str]]:
+_PROBE_SOURCES: list[dict[str, Any]] = [
+    {
+        "id": "src_probe_xml",
+        "system": "sys_probes",
+        "type": "upload",
+        "config": {"kind": "log", "paths": ["probes/xml-*.xml"]},
+        "parse": {
+            "format": "xml",
+            "timestamp_field": "timestamp",
+            "timestamp_format": "iso8601",
+            "timezone": "UTC",
+        },
+    },
+    {
+        "id": "src_probe_access",
+        "system": "sys_probes",
+        "type": "upload",
+        "config": {"kind": "log", "paths": ["probes/access-*.log"]},
+        "parse": {"format": "access_log", "timezone": "UTC"},
+    },
+    {
+        "id": "src_probe_files",
+        "system": "sys_probes",
+        "type": "upload",
+        "config": {"kind": "files", "paths": ["probes/drops/*.csv"]},
+    },
+]
+"""Three upload sources neither scenario configures, for the template channels that carry
+customer text without template mining (ADR 0039 amendment of 2026-11-02): an XML source
+whose root element name is the template, an access-log source whose request line is, and a
+file source whose file name is the ``file_arrived`` hint."""
+
+
+def _plant_probes(sim: Path, layout: Layout, config: Path) -> dict[str, list[str]]:
     """Records that exercise the leak classes the simulator does not generate (review): a JSON
     map keyed by a value, maps keyed by names without digits (rare keys, and enough distinct keys
     to make the parent a map, ADR 0030), free text in a field, a one-off message, a message seen
     twice (the analyzer reads its input twice), a message repeated three times verbatim (ADR
     0068: identical repeats must not make its words template constants), a logfmt line whose
-    message runs on unquoted, and rare free text in an otherwise low-cardinality field. Returns
-    the probe markers, which are scanned like the simulator's own."""
+    message runs on unquoted, rare free text in an otherwise low-cardinality field, and the
+    three template channels of :data:`_PROBE_SOURCES` (an XML root name, a route segment and
+    a request method, a file name), each seen in two records: one short of the name gate's
+    three, and the analyzer's second pass must not count them again. Writes the scenario's
+    analyzer configuration plus the probe sources to ``config``. Returns the probe markers,
+    which are scanned like the simulator's own."""
     ndjson = min(sim.glob(layout.ndjson_glob))
     logfmt = min(sim.glob(layout.logfmt_glob))
     day = ndjson.stem.removeprefix(layout.ndjson_prefix)
@@ -550,7 +590,18 @@ def _plant_probes(sim: Path, layout: Layout) -> dict[str, list[str]]:
         "thrice": ["mkprobethriceword"],
         "logfmt_words": ["mkprobebareword"],
         "rare_kept": [f"refund issued by mkprobe{n:03d}rare after review" for n in range(2)],
+        "xml_root": ["mkprobexmlroot"],
+        "route_word": ["mkprobepathword"],
+        "method": ["mkprobemethod"],
+        "file_name": ["mkprobefilename"],
     }
+    _plant_channel_probes(sim, day)
+    data = yaml.safe_load(layout.config.read_text(encoding="utf-8"))
+    data["systems"].append(
+        {"id": "sys_probes", "name": "Probes", "owner_group": "Tests", "criticality": "low"}
+    )
+    data["sources"].extend(_PROBE_SOURCES)
+    config.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8", newline=NL)
     lines: list[str] = []
     for n, key in enumerate(probes["map_key"]):
         stock = {key: n}
@@ -586,3 +637,34 @@ def _plant_probes(sim: Path, layout: Layout) -> dict[str, list[str]]:
         prefix = layout.logfmt_prefix.format(day=day)
         handle.write(f"{prefix} msg=refund approved for mkprobebareword order_id=4471{NL}")
     return probes
+
+
+def _plant_channel_probes(sim: Path, day: str) -> None:
+    """The inputs of :data:`_PROBE_SOURCES` under ``<sim>/probes``: two XML documents whose
+    root element carries a marker, two access-log lines whose route segment carries one and
+    two more with a marker as the request method (on another route: a word three distinct
+    records carry is trusted, which is the rule, not a leak), and two files whose names
+    generalize to the same ``file_arrived`` hint, stamped on ``day`` like the simulator's own
+    drops."""
+    probes = sim / "probes"
+    drops = probes / "drops"
+    drops.mkdir(parents=True)
+    stamp = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=UTC)
+    xml = "".join(
+        f"<mkprobexmlroot><timestamp>{day}T05:3{n}:00Z</timestamp><status>OK</status>"
+        f"</mkprobexmlroot>{NL}"
+        for n in range(2)
+    )
+    (probes / f"xml-{day}.xml").write_text(xml, encoding="utf-8", newline=NL)
+    clf_day = stamp.strftime("%d/%b/%Y")
+    requests = ["GET /customers/mkprobepathword"] * 2 + ["MKPROBEMETHOD /health"] * 2
+    access = "".join(
+        f'203.0.113.9 - - [{clf_day}:05:4{n}:00 +0000] "{request} HTTP/1.1" 200 12{NL}'
+        for n, request in enumerate(requests)
+    )
+    (probes / f"access-{day}.log").write_text(access, encoding="utf-8", newline=NL)
+    for n in range(2):
+        path = drops / f"DROP_mkprobefilename_{n}.csv"
+        path.write_text(f"x{NL}", encoding="utf-8", newline=NL)
+        arrived = (stamp + timedelta(hours=5, minutes=50 + n)).timestamp()
+        os.utime(path, (arrived, arrived))
