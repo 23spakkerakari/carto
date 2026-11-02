@@ -6,6 +6,9 @@ deliberately simple, so the ClickHouse queries are checked against it by the con
 Events are added as :class:`~carto_schema.event.CanonicalEvent` objects with the time they
 were stored. Adding an event a second time keeps the first copy's ``stored_at`` and ignores the
 rest, which is what the deduplication rule of the Protocol says a redelivered batch looks like.
+Membership rows (``txn_events``) are kept as appended; the latest ``version`` per
+``(txn_id, event_id)`` and per ``event_id`` wins, as the ReplacingMergeTree and the
+``argMax`` readers give (ADR 0060).
 """
 
 from __future__ import annotations
@@ -13,19 +16,26 @@ from __future__ import annotations
 import math
 import threading
 from collections import defaultdict
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Collection, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from carto_core.store.model import (
+    AssemblyRow,
     CooccurrenceRow,
     EventKeys,
     FieldForm,
     HourlyVolume,
     IdentifierRow,
+    OrderedTransaction,
     PairJoin,
     TemplateCount,
+    TokenHit,
+    TransactionEventRow,
+    TransactionSummary,
+    TxnEventWrite,
     Window,
+    event_order_key,
 )
 from carto_schema.event import CanonicalEvent
 
@@ -67,6 +77,7 @@ class InMemoryEventStore:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._events: dict[tuple[str, str], _Stored] = {}
+        self._txn_events: list[TxnEventWrite] = []
 
     # -- loading ------------------------------------------------------------------------------
 
@@ -296,3 +307,160 @@ class InMemoryEventStore:
                 attributes=dict(event.attributes),
                 identifiers=tuple(triples),
             )
+
+    # -- membership (spec 9.7, 9.8; ADR 0060) -------------------------------------------------
+
+    def assembly_rows(
+        self,
+        tenant_id: str,
+        window: Window,
+        *,
+        ends: Collection[FieldForm],
+        stored_after: datetime | None = None,
+        limit: int,
+    ) -> list[AssemblyRow]:
+        wanted = set(ends)
+        rows: list[AssemblyRow] = []
+        for item in self._in_window(tenant_id, window):
+            if stored_after is not None and item.stored_at <= stored_after:
+                continue
+            event = item.event
+            seen: set[tuple[str, str]] = set()
+            keys: list[tuple[str, str, str]] = []
+            for identifier in event.identifiers:
+                ref = _field_ref(event.system_id, event.template_id, identifier.field)
+                end = FieldForm(ref, identifier.form)
+                if end not in wanted or (ref, identifier.form) in seen:
+                    continue
+                seen.add((ref, identifier.form))
+                keys.append((ref, identifier.form, identifier.token))
+            if not keys:
+                continue
+            actor = event.actor
+            rows.append(
+                AssemblyRow(
+                    event_id=event.event_id,
+                    system_id=event.system_id,
+                    template_id=event.template_id,
+                    observed_at=event.observed_at,
+                    ingested_at=event.ingested_at,
+                    stored_at=item.stored_at,
+                    severity=event.severity.value if event.severity is not None else None,
+                    actor_kind=actor.kind.value if actor is not None else None,
+                    keys=tuple(keys),
+                )
+            )
+        rows.sort(key=lambda row: (row.stored_at, row.event_id))
+        return rows[: max(0, limit)]
+
+    def append_txn_events(self, rows: Sequence[TxnEventWrite]) -> int:
+        with self._lock:
+            self._txn_events.extend(rows)
+        return len(rows)
+
+    def _latest_by_event(
+        self, tenant_id: str, *, txn_id: str | None = None, window: Window | None = None
+    ) -> dict[str, TxnEventWrite]:
+        """The highest-version row per event, over the rows of one transaction or of all."""
+        latest: dict[str, TxnEventWrite] = {}
+        with self._lock:
+            rows = list(self._txn_events)
+        for row in rows:
+            if row.tenant_id != tenant_id:
+                continue
+            if txn_id is not None and row.txn_id != txn_id:
+                continue
+            if window is not None and not window.contains(row.observed_at):
+                continue
+            current = latest.get(row.event_id)
+            if current is None or row.version > current.version:
+                latest[row.event_id] = row
+        return latest
+
+    def _detail(self, tenant_id: str, row: TxnEventWrite) -> TransactionEventRow:
+        stored = self._events.get((tenant_id, row.event_id))
+        event = stored.event if stored is not None else None
+        actor = event.actor if event is not None else None
+        return TransactionEventRow(
+            event_id=row.event_id,
+            node_id=row.node_id,
+            observed_at=row.observed_at,
+            ingested_at=event.ingested_at if event is not None else row.observed_at,
+            severity=(
+                event.severity.value if event is not None and event.severity is not None else None
+            ),
+            actor_kind=actor.kind.value if actor is not None else None,
+            version=row.version,
+        )
+
+    def transaction_events(
+        self, tenant_id: str, txn_id: str, *, window: Window | None = None
+    ) -> list[TransactionEventRow]:
+        del window  # the lookup is in memory; the bound only matters to ClickHouse
+        latest = self._latest_by_event(tenant_id, txn_id=txn_id)
+        with self._lock:
+            details = [self._detail(tenant_id, row) for row in latest.values()]
+        return sorted(details, key=event_order_key)
+
+    def ordered_transactions(self, tenant_id: str, window: Window) -> Iterator[OrderedTransaction]:
+        latest = self._latest_by_event(tenant_id, window=window)
+        grouped: dict[str, list[TransactionEventRow]] = defaultdict(list)
+        with self._lock:
+            for row in latest.values():
+                grouped[row.txn_id].append(self._detail(tenant_id, row))
+        for txn_id in sorted(grouped):
+            yield OrderedTransaction(
+                txn_id=txn_id, events=tuple(sorted(grouped[txn_id], key=event_order_key))
+            )
+
+    def events_with_token(
+        self, tenant_id: str, tokens: Collection[str], window: Window
+    ) -> list[TokenHit]:
+        wanted = set(tokens)
+        if not wanted:
+            return []
+        latest = self._latest_by_event(tenant_id, window=window)
+        hits: list[TokenHit] = []
+        for row in self.identifier_rows(tenant_id, window):
+            if row.token not in wanted:
+                continue
+            assigned = latest.get(row.event_id)
+            hits.append(
+                TokenHit(
+                    token=row.token,
+                    field_ref=row.field_ref,
+                    form=row.form,
+                    event_id=row.event_id,
+                    system_id=row.system_id,
+                    observed_at=row.observed_at,
+                    txn_id=assigned.txn_id if assigned is not None else None,
+                )
+            )
+        hits.sort(key=lambda hit: (hit.token, hit.event_id, hit.field_ref, hit.form))
+        return hits
+
+    def transaction_summaries(
+        self, tenant_id: str, txn_ids: Collection[str], window: Window
+    ) -> dict[str, TransactionSummary]:
+        del window
+        wanted = set(txn_ids)
+        if not wanted:
+            return {}
+        latest = self._latest_by_event(tenant_id)
+        grouped: dict[str, list[TransactionEventRow]] = defaultdict(list)
+        with self._lock:
+            for row in latest.values():
+                if row.txn_id in wanted:
+                    grouped[row.txn_id].append(self._detail(tenant_id, row))
+        out: dict[str, TransactionSummary] = {}
+        for txn_id, details in grouped.items():
+            ordered = sorted(details, key=event_order_key)
+            out[txn_id] = TransactionSummary(
+                txn_id=txn_id,
+                event_count=len(ordered),
+                first_seen=ordered[0].observed_at,
+                last_seen=ordered[-1].observed_at,
+                last_node=ordered[-1].node_id,
+                last_severity=ordered[-1].severity,
+            )
+        return out

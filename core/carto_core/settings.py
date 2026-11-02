@@ -14,6 +14,7 @@
   caps (spec 8.5: 5 MB compressed batches; spec 2.3 invariant 8: size limits on every input).
 - ``profiler`` and ``linker``: every spec 9.1 to 9.6 threshold with its spec default, so eval
   tuning never edits code (plan M2 decision 13).
+- ``assembler`` and ``graph``: every spec 9.7 and 9.8 number, the same way (plan M3 decision 13).
 - ``api``: the console API listener, sessions, OIDC and rate limits (spec 12, 14.1, 14.2, 14.7).
 - ``worker``: how ``carto-core worker`` leases jobs (spec 5.3).
 
@@ -40,9 +41,12 @@ __all__ = [
     "ROLE_NAMES",
     "SESSION_COOKIE_NAME",
     "ApiSettings",
+    "AssemblerSettings",
     "ClickHouseSettings",
     "CoreConfigError",
     "CoreSettings",
+    "EdgeSettings",
+    "GraphSettings",
     "IngestListenerSettings",
     "LinkerSettings",
     "LogLevel",
@@ -346,6 +350,102 @@ class LinkerSettings(_Frozen):
     )
 
 
+class AssemblerSettings(_Frozen):
+    """Spec 9.7 transaction assembly, every number a setting (plan M3 decision 13)."""
+
+    interval_seconds: int = Field(
+        default=30, ge=5, le=3600, description="Micro-batch cadence (spec 9.7: every 30 s)."
+    )
+    read_margin_days: int = Field(
+        default=1,
+        ge=0,
+        le=30,
+        description="Read window is the entity max span plus this many days (M3 question 13).",
+    )
+    read_batch_rows: int = Field(
+        default=200_000, ge=1000, le=5_000_000, description="Rows per store read chunk."
+    )
+    fanout_threshold: int = Field(
+        default=50,
+        ge=2,
+        description="Distinct transactions per token per day at which it becomes a batch key.",
+    )
+    max_events: int = Field(
+        default=10_000, ge=2, description="A merge that would exceed this is refused (9.7)."
+    )
+    default_max_span_days: int = Field(
+        default=14, ge=1, le=400, description="Entity max span when the entity sets none."
+    )
+    nightly_rebuild: bool = Field(
+        default=True,
+        description="Full reassembly nightly (M3 question 2); the demo cut does not schedule it.",
+    )
+    rebuild_hour_utc: int = Field(default=4, ge=0, le=23)
+
+
+class GraphSettings(_Frozen):
+    """Spec 9.8 flow graph, every number a setting (plan M3 decision 13)."""
+
+    interval_seconds: int = Field(
+        default=300, ge=30, le=86_400, description="Graph pass cadence (rollup, terminals)."
+    )
+    window_days: int = Field(
+        default=14, ge=1, le=400, description="Hop statistics window (spec 9.8, 17)."
+    )
+    terminal_share: float = Field(
+        default=0.95, ge=0.5, le=1.0, description="Settled share with no further event (9.8)."
+    )
+    quiet_span_multiplier: float = Field(
+        default=3.0, ge=1.0, le=100.0, description="Quiet span = this x p99 inter-event gap."
+    )
+    min_settled_for_terminals: int = Field(
+        default=20, ge=1, description="Settled transactions before terminals are computed."
+    )
+    manual_human_share: float = Field(
+        default=0.7,
+        ge=0.0,
+        le=1.0,
+        description="Receiving events by people at or above: the manual preview badge (11.1).",
+    )
+
+
+class EdgeSettings(_Frozen):
+    """How core reaches the edge gateway for tokenize (M3 decision 7: one edge, dialled by core
+    over mutual TLS with the ``api`` role certificate of ``carto-ctl pki init``)."""
+
+    url: str | None = Field(
+        default=None, description="https://host:port of the edge gateway; none: search is 503."
+    )
+    edge_id: str = Field(default="edge", min_length=1, max_length=128)
+    ca_file: Path | None = Field(default=None, description="CA of the edge gateway certificate.")
+    client_cert_file: Path | None = Field(default=None, description="Core's api role cert.")
+    client_key_file: Path | None = Field(default=None)
+    timeout_seconds: float = Field(default=5.0, gt=0, le=60)
+
+    @field_validator("url")
+    @classmethod
+    def _https_origin(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        parts = urlsplit(value)
+        if parts.scheme != "https" or not parts.hostname or parts.username is not None:
+            msg = "api.edge.url must be an https:// origin without credentials (spec 14.4)"
+            raise ValueError(msg)
+        if parts.path not in ("", "/") or parts.query or parts.fragment:
+            msg = "api.edge.url must be an origin: scheme, host and port only"
+            raise ValueError(msg)
+        return f"{parts.scheme}://{parts.netloc}"
+
+    @model_validator(mode="after")
+    def _mtls_files(self) -> Self:
+        if self.url is not None and (
+            self.ca_file is None or self.client_cert_file is None or self.client_key_file is None
+        ):
+            msg = "api.edge needs ca_file, client_cert_file and client_key_file with a url"
+            raise ValueError(msg)
+        return self
+
+
 class OidcSettings(_Frozen):
     """Spec 14.1: SSO through OIDC, authorization code flow with PKCE (founder decision 1)."""
 
@@ -455,6 +555,16 @@ class ApiSettings(_Frozen):
     )
     login_rate_per_minute_per_ip: int = Field(default=10, ge=1, le=1000)
     request_rate_per_minute_per_user: int = Field(default=600, ge=10, le=100_000)
+    search_per_user_per_minute: int = Field(
+        default=10,
+        ge=1,
+        le=1000,
+        description=(
+            "Search burst cap per user (M3 decision 8); the edge's hourly tokenize quota is the "
+            "ceiling."
+        ),
+    )
+    edge: EdgeSettings = Field(default_factory=EdgeSettings)
     max_body_bytes: int = Field(default=MIB, ge=16 * 1024, le=16 * MIB)
     page_size_default: int = Field(default=50, ge=1, le=500)
 
@@ -505,6 +615,10 @@ class WorkerSettings(_Frozen):
         default=True, description="Queue a link pass after each profile pass over new sketches."
     )
     full_pass_hour_utc: int = Field(default=3, ge=0, le=23, description="Nightly full link pass.")
+    assemble_after_decision: bool = Field(
+        default=True,
+        description="A link decision queues a full assembly over the read window (ADR 0062).",
+    )
 
 
 class CoreSettings(ProductSettings):
@@ -520,6 +634,8 @@ class CoreSettings(ProductSettings):
     ingest: IngestListenerSettings = Field(default_factory=IngestListenerSettings)
     profiler: ProfilerSettings = Field(default_factory=ProfilerSettings)
     linker: LinkerSettings = Field(default_factory=LinkerSettings)
+    assembler: AssemblerSettings = Field(default_factory=AssemblerSettings)
+    graph: GraphSettings = Field(default_factory=GraphSettings)
     api: ApiSettings = Field(default_factory=lambda: ApiSettings(insecure_http=True))
     worker: WorkerSettings = Field(default_factory=WorkerSettings)
 

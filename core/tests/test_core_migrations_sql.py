@@ -43,6 +43,7 @@ ALL_MIGRATIONS = [
     "0006_event_identifiers_replacing.sql",
     "0007_events_stored_at.sql",
     "0008_event_identifiers_stored_at.sql",
+    "0009_txn_events.sql",
 ]
 
 
@@ -188,6 +189,28 @@ def test_identifiers_ddl_reproduces_spec_7_2_with_the_configured_ttl() -> None:
     assert "TTL toDateTime(observed_at) + INTERVAL 7 DAY;" in sql
 
 
+def test_txn_events_ddl_reproduces_spec_7_2_with_the_membership_ttl() -> None:
+    """ADR 0060: membership rows replace by version within one transaction; the TTL follows
+    ``retention.txn_membership_days``, never the event retention."""
+    migration = next(m for m in load_clickhouse_migrations() if m.name == "0009_txn_events.sql")
+    sql = render(migration, RetentionSettings(events_days=30, txn_membership_days=120))
+    assert "CREATE TABLE IF NOT EXISTS txn_events (" in sql
+    for column in (
+        "tenant_id LowCardinality(String)",
+        "txn_id String",
+        "event_id String",
+        "node_id LowCardinality(String)",
+        "observed_at DateTime64(3, 'UTC')",
+        "version UInt64",
+        "stored_at DateTime64(3, 'UTC')",
+    ):
+        assert column in sql, column
+    assert ") ENGINE = ReplacingMergeTree(version)" in sql
+    assert "ORDER BY (tenant_id, txn_id, observed_at, event_id)" in sql
+    assert "TTL toDateTime(observed_at) + INTERVAL 120 DAY;" in sql
+    assert "{" not in sql and "}" not in sql
+
+
 def test_render_rejects_unknown_placeholders() -> None:
     migration = Migration(name="0001_x.sql", sql="SELECT {bogus};", checksum="0" * 64)
     with pytest.raises(MigrationError, match="bogus"):
@@ -307,6 +330,15 @@ def test_apply_retention_skips_tables_that_do_not_exist_yet() -> None:
     ]
 
 
+def test_apply_retention_sets_the_membership_ttl_from_its_own_setting() -> None:
+    client = FakeClickHouse({"events": _engine(30), "txn_events": _engine(90)})
+    changed = apply_retention(client, RetentionSettings(events_days=30, txn_membership_days=180))
+    assert changed == ["txn_events"]
+    assert client.commands == [
+        "ALTER TABLE txn_events MODIFY TTL toDateTime(observed_at) + INTERVAL 180 DAY"
+    ]
+
+
 def test_apply_retention_rewrites_an_unreadable_ttl() -> None:
     client = FakeClickHouse({"events": "MergeTree ORDER BY x", "event_identifiers": _engine(30)})
     assert apply_retention(client, RetentionSettings(events_days=30)) == ["events"]
@@ -322,11 +354,22 @@ def test_postgres_scripts_form_one_linear_history() -> None:
     config = Config()
     config.set_main_option("script_location", str(POSTGRES_MIGRATIONS_DIR))
     script = ScriptDirectory.from_config(config)
-    assert script.get_heads() == ["0004"]
+    assert script.get_heads() == ["0005"]
     revisions = list(script.walk_revisions())
-    assert [revision.revision for revision in revisions] == ["0004", "0003", "0002", "0001"]
+    assert [revision.revision for revision in revisions] == [
+        "0005",
+        "0004",
+        "0003",
+        "0002",
+        "0001",
+    ]
     assert revisions[-1].down_revision is None
-    assert [revision.down_revision for revision in revisions[:-1]] == ["0003", "0002", "0001"]
+    assert [revision.down_revision for revision in revisions[:-1]] == [
+        "0004",
+        "0003",
+        "0002",
+        "0001",
+    ]
 
 
 def test_migration_0004_builds_only_fixed_grant_statements() -> None:
@@ -352,6 +395,44 @@ def test_migration_0004_builds_only_fixed_grant_statements() -> None:
     assert len(module._revoke_statements()) == 3
     assert "RAISE EXCEPTION" in module.AUDIT_TRIGGER_FUNCTION
     assert "BEFORE UPDATE OR DELETE ON audit_log" in module.AUDIT_TRIGGER_ROWS
+
+
+def test_migration_0005_grants_the_worker_writes_and_the_app_reads() -> None:
+    """ADR 0060, 0066: the assembly tables are the worker's; the app reads them and may only
+    rename nodes. The grant block names the demo's tables and nothing of 0004's."""
+    path = POSTGRES_MIGRATIONS_DIR / "versions" / "0005_trace.py"
+    spec = importlib.util.spec_from_file_location("migration_0005", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    grants = module._grant_statements()
+    assert len(grants) == 2
+    for statement in grants:
+        assert statement.startswith(
+            "DO $$ BEGIN IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = "
+        )
+        assert statement.endswith(" END IF; END $$;")
+        assert ":" not in statement and "%" not in statement
+    worker, app = grants
+    assert "GRANT SELECT, INSERT, UPDATE, DELETE ON transactions, txn_token_index" in worker
+    assert "TO carto_worker;" in worker
+    assert "GRANT SELECT ON transactions, txn_token_index" in app
+    assert "GRANT UPDATE ON nodes TO carto_app;" in app
+    assert "INSERT" not in app and "DELETE" not in app
+    for table in ("audit_log", "key_links", "entities", "users", "sessions"):
+        assert table not in worker and table not in app
+    assert set(module.NEW_TABLES) == {
+        "transactions",
+        "txn_token_index",
+        "txn_token_fanout",
+        "txn_merges",
+        "batch_keys",
+        "nodes",
+        "hops",
+        "terminal_nodes",
+        "entity_stats",
+    }
+    assert len(module._revoke_statements()) == 2
 
 
 def test_clickhouse_migrations_dir_is_the_repository_layout_of_section_20() -> None:

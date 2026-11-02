@@ -33,13 +33,20 @@ a sorted array, expands the ``i < j`` pairs with array functions (at most 64 end
 of spec 9.4. Its result is bounded by :data:`MAX_COOCCURRENCE_ROWS` with a warning when the
 bound is hit, because the caller cannot bound it.
 
+The membership queries (ADR 0060) read ``txn_events`` with ``argMax(..., version)`` per event
+so a moved event is seen under its latest transaction only; the ``events`` columns they need
+(``ingested_at``, ``severity``, ``actor_kind``) come from a ``LEFT JOIN`` bounded by the
+caller's window. A ``LEFT JOIN`` miss yields an empty string for ``txn_id``, which the store
+reads as "no transaction". ``assembly_rows`` filters ends as ``field_ref || tab || form``
+against an ``Array(String)`` parameter, because a tuple-array parameter is not bound portably.
+
 Failures raise :class:`~carto_core.store.model.StoreError` naming the driver error class only,
 never a parameter. Nothing here returns a raw value: tokens, shapes, counts and times only.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Sequence
+from collections.abc import Collection, Iterator, Sequence
 from datetime import UTC, datetime
 from typing import Any, Final, Protocol
 
@@ -48,18 +55,43 @@ from clickhouse_connect.driver.exceptions import ClickHouseError
 from carto_common.logging import get_logger
 from carto_core.store.memory import CONCENTRATION_TOP_N
 from carto_core.store.model import (
+    AssemblyRow,
     CooccurrenceRow,
     EventKeys,
     FieldForm,
     HourlyVolume,
     IdentifierRow,
+    OrderedTransaction,
     PairJoin,
     StoreError,
     TemplateCount,
+    TokenHit,
+    TransactionEventRow,
+    TransactionSummary,
+    TxnEventWrite,
     Window,
+    event_order_key,
 )
 
-__all__ = ["MAX_COOCCURRENCE_ROWS", "ClickHouseStore", "QueryClient"]
+__all__ = [
+    "MAX_COOCCURRENCE_ROWS",
+    "TXN_EVENTS_TABLE",
+    "TXN_EVENT_COLUMNS",
+    "ClickHouseStore",
+    "QueryClient",
+]
+
+TXN_EVENTS_TABLE: Final = "txn_events"
+TXN_EVENT_COLUMNS: Final[tuple[str, ...]] = (
+    "tenant_id",
+    "txn_id",
+    "event_id",
+    "node_id",
+    "observed_at",
+    "version",
+    "stored_at",
+)
+"""``txn_events`` columns in DDL order (``0009_txn_events.sql``)."""
 
 MAX_COOCCURRENCE_ROWS: Final = 100_000
 """Most pairs :meth:`ClickHouseStore.cooccurrences` returns; the rest are logged as dropped."""
@@ -88,6 +120,15 @@ class QueryClient(Protocol):
     def query_rows_stream(
         self, query: str, parameters: dict[str, Any] | None = None
     ) -> _StreamContext: ...
+
+    def insert(
+        self,
+        table: str,
+        data: Sequence[Sequence[Any]],
+        column_names: Sequence[str],
+        *,
+        column_oriented: bool = False,
+    ) -> Any: ...
 
     def ping(self) -> bool: ...
 
@@ -252,6 +293,112 @@ _EVENTS_WITH_KEYS_TAIL: Final = (
     " GROUP BY event_id, field_ref, form) GROUP BY event_id) AS i ON e.event_id = i.event_id"
 )
 
+# -- membership (ADR 0060) ---------------------------------------------------------------------
+#
+# ``ends`` arrive as ``field_ref`` + tab + ``form`` strings; the tab never occurs in a field
+# path (the edge's name gate, ADR 0030) or a form name. ``HAVING`` on the aggregated
+# ``stored_at`` keeps the watermark semantics of ``identifier_rows``.
+
+_ASSEMBLY_ROWS_HEAD: Final = (
+    "SELECT e.event_id, e.system_id_min, e.template_id_min, e.observed_at_min, "
+    "e.ingested_at_min, e.stored_at_min, e.severity_any, e.actor_kind_any, i.triples FROM ("
+    "SELECT event_id, min(system_id) AS system_id_min, min(template_id) AS template_id_min, "
+    "min(observed_at) AS observed_at_min, min(ingested_at) AS ingested_at_min, "
+    "min(stored_at) AS stored_at_min, any(severity) AS severity_any, "
+    "any(actor_kind) AS actor_kind_any FROM events WHERE tenant_id = {tenant_id:String} "
+    "AND observed_at >= fromUnixTimestamp64Milli({start:Int64}, 'UTC') "
+    "AND observed_at < fromUnixTimestamp64Milli({end:Int64}, 'UTC') GROUP BY event_id"
+)
+_ASSEMBLY_ROWS_STORED_AFTER: Final = (
+    " HAVING stored_at_min > fromUnixTimestamp64Milli({stored_after:Int64}, 'UTC')"
+)
+_ASSEMBLY_ROWS_TAIL: Final = (
+    ") AS e INNER JOIN ("
+    "SELECT event_id, groupArray((field_ref, form, token_min)) AS triples FROM ("
+    "SELECT event_id, field_ref, form, min(token) AS token_min FROM event_identifiers "
+    "WHERE tenant_id = {tenant_id:String} "
+    "AND observed_at >= fromUnixTimestamp64Milli({start:Int64}, 'UTC') "
+    "AND observed_at < fromUnixTimestamp64Milli({end:Int64}, 'UTC') "
+    "AND concat(field_ref, '\\t', form) IN {ends:Array(String)} "
+    "GROUP BY event_id, field_ref, form) GROUP BY event_id) AS i ON e.event_id = i.event_id "
+    "ORDER BY e.stored_at_min, e.event_id LIMIT {limit:UInt64}"
+)
+
+_WINDOW: Final = (
+    " AND observed_at >= fromUnixTimestamp64Milli({start:Int64}, 'UTC') "
+    "AND observed_at < fromUnixTimestamp64Milli({end:Int64}, 'UTC')"
+)
+"""The window clause the membership statements repeat (written out in each, as above)."""
+
+_TRANSACTION_EVENTS_HEAD: Final = (
+    "SELECT x.event_id, x.txn_id_last, x.node_id_last, x.observed_at_last, x.version_max, "
+    "e.ingested_at_min, e.severity_any, e.actor_kind_any FROM ("
+    "SELECT event_id, argMax(txn_id, version) AS txn_id_last, "
+    "argMax(node_id, version) AS node_id_last, argMax(observed_at, version) AS observed_at_last, "
+    "max(version) AS version_max FROM txn_events WHERE tenant_id = {tenant_id:String} "
+    "AND txn_id = {txn_id:String} GROUP BY event_id) AS x LEFT JOIN ("
+    "SELECT event_id, min(ingested_at) AS ingested_at_min, any(severity) AS severity_any, "
+    "any(actor_kind) AS actor_kind_any FROM events WHERE tenant_id = {tenant_id:String} "
+    "AND event_id IN (SELECT event_id FROM txn_events WHERE tenant_id = {tenant_id:String} "
+    "AND txn_id = {txn_id:String})"
+)
+_TRANSACTION_EVENTS_TAIL: Final = " GROUP BY event_id) AS e ON x.event_id = e.event_id"
+
+_ORDERED_TRANSACTIONS: Final = (
+    "SELECT x.event_id, x.txn_id_last, x.node_id_last, x.observed_at_last, x.version_max, "
+    "e.ingested_at_min, e.severity_any, e.actor_kind_any FROM ("
+    "SELECT event_id, argMax(txn_id, version) AS txn_id_last, "
+    "argMax(node_id, version) AS node_id_last, argMax(observed_at, version) AS observed_at_last, "
+    "max(version) AS version_max FROM txn_events WHERE tenant_id = {tenant_id:String} "
+    "AND observed_at >= fromUnixTimestamp64Milli({start:Int64}, 'UTC') "
+    "AND observed_at < fromUnixTimestamp64Milli({end:Int64}, 'UTC') "
+    "GROUP BY event_id) AS x LEFT JOIN ("
+    "SELECT event_id, min(ingested_at) AS ingested_at_min, any(severity) AS severity_any, "
+    "any(actor_kind) AS actor_kind_any FROM events WHERE tenant_id = {tenant_id:String} "
+    "AND observed_at >= fromUnixTimestamp64Milli({start:Int64}, 'UTC') "
+    "AND observed_at < fromUnixTimestamp64Milli({end:Int64}, 'UTC') "
+    "GROUP BY event_id) AS e ON x.event_id = e.event_id "
+    "ORDER BY x.txn_id_last, x.observed_at_last, e.ingested_at_min, x.event_id"
+)
+
+_IDENTIFIER_HITS: Final = (
+    "SELECT i.token, i.field_ref, i.form, i.event_id, i.system_id_min, i.observed_at_min, "
+    "t.txn_id_last FROM ("
+    "SELECT token, field_ref, form, event_id, min(system_id) AS system_id_min, "
+    "min(observed_at) AS observed_at_min FROM event_identifiers "
+    "WHERE tenant_id = {tenant_id:String} "
+    "AND observed_at >= fromUnixTimestamp64Milli({start:Int64}, 'UTC') "
+    "AND observed_at < fromUnixTimestamp64Milli({end:Int64}, 'UTC') "
+    "AND token IN {tokens:Array(String)} GROUP BY token, field_ref, form, event_id) AS i "
+    "LEFT JOIN (SELECT event_id, argMax(txn_id, version) AS txn_id_last FROM txn_events "
+    "WHERE tenant_id = {tenant_id:String} "
+    "AND observed_at >= fromUnixTimestamp64Milli({start:Int64}, 'UTC') "
+    "AND observed_at < fromUnixTimestamp64Milli({end:Int64}, 'UTC') "
+    "AND event_id IN (SELECT event_id FROM event_identifiers "
+    "WHERE tenant_id = {tenant_id:String} "
+    "AND observed_at >= fromUnixTimestamp64Milli({start:Int64}, 'UTC') "
+    "AND observed_at < fromUnixTimestamp64Milli({end:Int64}, 'UTC') "
+    "AND token IN {tokens:Array(String)}) GROUP BY event_id) AS t "
+    "ON i.event_id = t.event_id ORDER BY i.token, i.event_id, i.field_ref, i.form"
+)
+
+_TRANSACTION_SUMMARIES: Final = (
+    "SELECT x.txn_id_last, count(), min(x.observed_at_last), max(x.observed_at_last), "
+    "argMax(x.node_id_last, (x.observed_at_last, e.ingested_at_min, x.event_id)), "
+    "argMax(e.severity_any, (x.observed_at_last, e.ingested_at_min, x.event_id)) FROM ("
+    "SELECT event_id, argMax(txn_id, version) AS txn_id_last, "
+    "argMax(node_id, version) AS node_id_last, argMax(observed_at, version) AS observed_at_last, "
+    "max(version) AS version_max FROM txn_events WHERE tenant_id = {tenant_id:String} "
+    "AND event_id IN (SELECT event_id FROM txn_events WHERE tenant_id = {tenant_id:String} "
+    "AND txn_id IN {txn_ids:Array(String)}) GROUP BY event_id) AS x LEFT JOIN ("
+    "SELECT event_id, min(ingested_at) AS ingested_at_min, any(severity) AS severity_any, "
+    "any(actor_kind) AS actor_kind_any FROM events WHERE tenant_id = {tenant_id:String} "
+    "AND observed_at >= fromUnixTimestamp64Milli({start:Int64}, 'UTC') "
+    "AND observed_at < fromUnixTimestamp64Milli({end:Int64}, 'UTC') "
+    "GROUP BY event_id) AS e ON x.event_id = e.event_id "
+    "WHERE x.txn_id_last IN {txn_ids:Array(String)} GROUP BY x.txn_id_last"
+)
+
 
 # -- helpers -----------------------------------------------------------------------------------
 
@@ -271,6 +418,14 @@ def _aware(value: Any) -> datetime:
 
 def _window_parameters(tenant_id: str, window: Window) -> dict[str, Any]:
     return {"tenant_id": tenant_id, "start": _ms(window.start), "end": _ms(window.end)}
+
+
+def _text_or_none(value: Any) -> str | None:
+    """A nullable string column, or a ``LEFT JOIN`` miss (empty string), as ``None``."""
+    if value is None:
+        return None
+    text = str(value)
+    return text or None
 
 
 def _quantile(value: Any) -> float | None:
@@ -306,6 +461,19 @@ class ClickHouseStore:
         try:
             with self._client.query_rows_stream(sql, parameters=parameters) as stream:
                 yield from stream
+        except (ClickHouseError, OSError) as exc:
+            msg = f"store {what} failed: {type(exc).__name__}"
+            raise StoreError(msg) from exc
+
+    def _insert(self, what: str, table: str, columns: Sequence[str], rows: list[list[Any]]) -> None:
+        if not rows:
+            return
+        transposed: list[list[Any]] = [[] for _ in columns]
+        for row in rows:
+            for index, value in enumerate(row):
+                transposed[index].append(value)
+        try:
+            self._client.insert(table, transposed, column_names=list(columns), column_oriented=True)
         except (ClickHouseError, OSError) as exc:
             msg = f"store {what} failed: {type(exc).__name__}"
             raise StoreError(msg) from exc
@@ -465,3 +633,142 @@ class ClickHouseStore:
                 attributes={str(key): str(value) for key, value in attributes.items()},
                 identifiers=triples,
             )
+
+    # -- membership (spec 9.7, 9.8; ADR 0060) -------------------------------------------------
+
+    def assembly_rows(
+        self,
+        tenant_id: str,
+        window: Window,
+        *,
+        ends: Collection[FieldForm],
+        stored_after: datetime | None = None,
+        limit: int,
+    ) -> list[AssemblyRow]:
+        if not ends or limit <= 0:
+            return []
+        sql = _ASSEMBLY_ROWS_HEAD
+        parameters = _window_parameters(tenant_id, window) | {
+            "ends": sorted(f"{end.field_ref}\t{end.form}" for end in set(ends)),
+            "limit": int(limit),
+        }
+        if stored_after is not None:
+            sql += _ASSEMBLY_ROWS_STORED_AFTER
+            parameters["stored_after"] = _ms(stored_after)
+        sql += _ASSEMBLY_ROWS_TAIL
+        out: list[AssemblyRow] = []
+        for row in self._stream("assembly_rows", sql, parameters):
+            triples = tuple(
+                sorted((str(item[0]), str(item[1]), str(item[2])) for item in (row[8] or ()))
+            )
+            out.append(
+                AssemblyRow(
+                    event_id=str(row[0]),
+                    system_id=str(row[1]),
+                    template_id=str(row[2]),
+                    observed_at=_aware(row[3]),
+                    ingested_at=_aware(row[4]),
+                    stored_at=_aware(row[5]),
+                    severity=_text_or_none(row[6]),
+                    actor_kind=_text_or_none(row[7]),
+                    keys=triples,
+                )
+            )
+        return out
+
+    def append_txn_events(self, rows: Sequence[TxnEventWrite]) -> int:
+        data = [
+            [
+                row.tenant_id,
+                row.txn_id,
+                row.event_id,
+                row.node_id,
+                row.observed_at,
+                int(row.version),
+                row.stored_at,
+            ]
+            for row in rows
+        ]
+        self._insert("append_txn_events", TXN_EVENTS_TABLE, TXN_EVENT_COLUMNS, data)
+        return len(data)
+
+    @staticmethod
+    def _detail(row: Sequence[Any]) -> TransactionEventRow:
+        observed_at = _aware(row[3])
+        ingested = row[5]
+        return TransactionEventRow(
+            event_id=str(row[0]),
+            node_id=str(row[2]),
+            observed_at=observed_at,
+            ingested_at=_aware(ingested) if isinstance(ingested, datetime) else observed_at,
+            severity=_text_or_none(row[6]),
+            actor_kind=_text_or_none(row[7]),
+            version=int(row[4]),
+        )
+
+    def transaction_events(
+        self, tenant_id: str, txn_id: str, *, window: Window | None = None
+    ) -> list[TransactionEventRow]:
+        sql = _TRANSACTION_EVENTS_HEAD
+        parameters: dict[str, Any] = {"tenant_id": tenant_id, "txn_id": txn_id}
+        if window is not None:
+            sql += _WINDOW
+            parameters |= _window_parameters(tenant_id, window)
+        sql += _TRANSACTION_EVENTS_TAIL
+        rows = [self._detail(row) for row in self._query("transaction_events", sql, parameters)]
+        return sorted(rows, key=event_order_key)
+
+    def ordered_transactions(self, tenant_id: str, window: Window) -> Iterator[OrderedTransaction]:
+        current: str | None = None
+        events: list[TransactionEventRow] = []
+        for row in self._stream(
+            "ordered_transactions", _ORDERED_TRANSACTIONS, _window_parameters(tenant_id, window)
+        ):
+            txn_id = str(row[1])
+            if current is not None and txn_id != current:
+                yield OrderedTransaction(current, tuple(sorted(events, key=event_order_key)))
+                events = []
+            current = txn_id
+            events.append(self._detail(row))
+        if current is not None:
+            yield OrderedTransaction(current, tuple(sorted(events, key=event_order_key)))
+
+    def events_with_token(
+        self, tenant_id: str, tokens: Collection[str], window: Window
+    ) -> list[TokenHit]:
+        wanted = sorted(set(tokens))
+        if not wanted:
+            return []
+        parameters = _window_parameters(tenant_id, window) | {"tokens": wanted}
+        return [
+            TokenHit(
+                token=str(row[0]),
+                field_ref=str(row[1]),
+                form=str(row[2]),
+                event_id=str(row[3]),
+                system_id=str(row[4]),
+                observed_at=_aware(row[5]),
+                txn_id=_text_or_none(row[6]),
+            )
+            for row in self._query("events_with_token", _IDENTIFIER_HITS, parameters)
+        ]
+
+    def transaction_summaries(
+        self, tenant_id: str, txn_ids: Collection[str], window: Window
+    ) -> dict[str, TransactionSummary]:
+        wanted = sorted(set(txn_ids))
+        if not wanted:
+            return {}
+        parameters = _window_parameters(tenant_id, window) | {"txn_ids": wanted}
+        out: dict[str, TransactionSummary] = {}
+        for row in self._query("transaction_summaries", _TRANSACTION_SUMMARIES, parameters):
+            txn_id = str(row[0])
+            out[txn_id] = TransactionSummary(
+                txn_id=txn_id,
+                event_count=int(row[1]),
+                first_seen=_aware(row[2]),
+                last_seen=_aware(row[3]),
+                last_node=str(row[4]),
+                last_severity=_text_or_none(row[5]),
+            )
+        return out

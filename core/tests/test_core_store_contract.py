@@ -21,7 +21,14 @@ from carto_common.settings import RetentionSettings
 from carto_core.db.clickhouse import ClickHouseWriter, create_client
 from carto_core.migrations import apply_clickhouse_migrations
 from carto_core.settings import ClickHouseSettings
-from carto_core.store import EventStore, FieldForm, HourlyVolume, TemplateCount, Window
+from carto_core.store import (
+    EventStore,
+    FieldForm,
+    HourlyVolume,
+    TemplateCount,
+    TxnEventWrite,
+    Window,
+)
 from carto_core.store.clickhouse import ClickHouseStore
 from carto_core.store.memory import InMemoryEventStore
 from carto_schema.event import CanonicalEvent
@@ -622,3 +629,153 @@ def test_nothing_returned_is_a_raw_value(loaded: Loaded) -> None:
         row for item in loaded.store.cooccurrences(TENANT, W) for row in (item.a, item.b)
     ]
     assert all(isinstance(end, FieldForm) for end in serialized)
+
+
+# --- membership (spec 9.7, 9.8; ADR 0060) -------------------------------------------------------
+
+TXN_A = "01TXNAAAAAAAAAAAAAAAAAAAAA"
+TXN_B = "01TXNBBBBBBBBBBBBBBBBBBBBB"
+ORDER_NODE = "sys_orders/tpl_create"
+PAY_NODE = "sys_pay/tpl_pay"
+SHIP_NODE = "sys_orders/tpl_ship"
+A_PATH = ("order-1-0", "order-1-10", "order-1-20", "pay-1-0", "ship-1")
+"""Transaction A's events in spec 9.7 order (the orders are 10 s apart, the payment 60 s later)."""
+
+
+def _event_by_tag(loaded: Loaded, tag: str) -> CanonicalEvent:
+    """The dataset event built with ``tag`` (the ``event_id`` derives from it)."""
+    for item in loaded.batch1:
+        if item.event_id == derive_ulid(
+            int(item.observed_at.timestamp() * 1000), item.system_id, item.template_id, tag
+        ):
+            return item
+    msg = f"no event tagged {tag}"
+    raise AssertionError(msg)
+
+
+def _seed_membership(loaded: Loaded) -> dict[str, CanonicalEvent]:
+    """Two assignments: at version 1000 two order events are transaction A and the first
+    payment is transaction B; at version 2000 B merges into A (the payment moves, keeping its
+    old row under B), a third order event and the shipment join A. Appending the same rows
+    again is harmless, so every test may seed."""
+    events = {tag: _event_by_tag(loaded, tag) for tag in A_PATH}
+
+    def row(tag: str, txn_id: str, node: str, version: int) -> TxnEventWrite:
+        event = events[tag]
+        return TxnEventWrite(
+            tenant_id=TENANT,
+            txn_id=txn_id,
+            event_id=event.event_id,
+            node_id=node,
+            observed_at=event.observed_at,
+            version=version,
+            stored_at=T2 + timedelta(seconds=version),
+        )
+
+    first = [
+        row("order-1-0", TXN_A, ORDER_NODE, 1000),
+        row("order-1-10", TXN_A, ORDER_NODE, 1000),
+        row("pay-1-0", TXN_B, PAY_NODE, 1000),
+    ]
+    second = [
+        row("pay-1-0", TXN_A, PAY_NODE, 2000),
+        row("order-1-20", TXN_A, ORDER_NODE, 2000),
+        row("ship-1", TXN_A, SHIP_NODE, 2000),
+    ]
+    assert loaded.store.append_txn_events(first) == 3
+    assert loaded.store.append_txn_events(second) == 3
+    return events
+
+
+def test_assembly_rows_carry_the_requested_ends_only_in_stored_order(store: EventStore) -> None:
+    rows = store.assembly_rows(TENANT, W, ends=[ORDER_ID, ORDER_REF], limit=1000)
+    assert len(rows) == 63, "34 order events and 29 payments carry one of the two ends"
+    assert len({row.event_id for row in rows}) == 63
+    assert rows == sorted(rows, key=lambda r: (r.stored_at, r.event_id))
+    assert all(row.stored_at == T1 for row in rows), "the redelivery kept the first stored_at"
+    forms = {form for row in rows for _ref, form, _token in row.keys}
+    assert forms == {"raw"}, "digits.0 and cart_id were not asked for"
+    refs = {ref for row in rows for ref, _form, _token in row.keys}
+    assert refs == {ORDER_ID.field_ref, ORDER_REF.field_ref}
+    one = next(row for row in rows if row.node_id == ORDER_NODE)
+    assert one.ingested_at == one.observed_at + timedelta(seconds=3)
+    assert one.severity is None and one.actor_kind == "human"
+    orders = [row for row in rows if row.node_id == ORDER_NODE]
+    assert store.assembly_rows(TENANT, W, ends=[ORDER_ID], limit=10) == orders[:10]
+    assert store.assembly_rows(TENANT, W, ends=[ORDER_ID], stored_after=T1, limit=10) == []
+    late = store.assembly_rows(
+        TENANT, Window(D0, D4), ends=[FieldForm("sys_wms/tpl_recv/sku", "raw")], limit=100
+    )
+    assert sorted(row.stored_at for row in late) == [T1, T1, T1, T2, T2]
+    assert [row.stored_at for row in late[-2:]] == [T2, T2], "stored order, then event id"
+    assert store.assembly_rows(TENANT, W, ends=[], limit=10) == []
+    assert store.assembly_rows(OTHER, W, ends=[ORDER_ID], limit=10) == []
+
+
+def test_transaction_events_take_the_latest_row_per_event_in_spec_order(loaded: Loaded) -> None:
+    events = _seed_membership(loaded)
+    rows = loaded.store.transaction_events(TENANT, TXN_A, window=W)
+    assert [row.event_id for row in rows] == [events[tag].event_id for tag in A_PATH]
+    assert [row.node_id for row in rows] == [
+        ORDER_NODE,
+        ORDER_NODE,
+        ORDER_NODE,
+        PAY_NODE,
+        SHIP_NODE,
+    ]
+    assert [row.version for row in rows] == [1000, 1000, 2000, 2000, 2000]
+    assert all(row.ingested_at == row.observed_at + timedelta(seconds=3) for row in rows)
+    assert all(row.actor_kind == "human" and row.severity is None for row in rows)
+    assert rows[0].system_id == "sys_orders" and rows[0].template_id == "tpl_create"
+    stale = loaded.store.transaction_events(TENANT, TXN_B)
+    assert [(row.event_id, row.version) for row in stale] == [(events["pay-1-0"].event_id, 1000)], (
+        "a merged-away id still answers its old row; callers pass survivors (ADR 0060)"
+    )
+    assert loaded.store.transaction_events(TENANT, "01TXNNOPE00000000000000000") == []
+
+
+def test_ordered_transactions_group_every_event_under_its_latest_assignment(
+    loaded: Loaded,
+) -> None:
+    events = _seed_membership(loaded)
+    ordered = list(loaded.store.ordered_transactions(TENANT, W))
+    assert [item.txn_id for item in ordered] == [TXN_A], "B owns nothing any more"
+    assert [row.event_id for row in ordered[0].events] == [events[tag].event_id for tag in A_PATH]
+    assert list(loaded.store.ordered_transactions(TENANT, Window(D2, D3))) == []
+    assert list(loaded.store.ordered_transactions(OTHER, W)) == []
+
+
+def test_events_with_token_name_the_matching_form_and_the_latest_transaction(
+    loaded: Loaded,
+) -> None:
+    events = _seed_membership(loaded)
+    hits = loaded.store.events_with_token(TENANT, [tok("T", 1), tok("U", 1), tok("X", 9)], W)
+    assert len(hits) == 9
+    assert {hit.form for hit in hits} == {"raw"}
+    by_event = {hit.event_id: hit for hit in hits}
+    assert by_event[events["order-1-0"].event_id].txn_id == TXN_A
+    assert by_event[events["pay-1-0"].event_id].txn_id == TXN_A, "the latest assignment, not B"
+    assert by_event[events["ship-1"].event_id].field_ref == SHIP_ORDER_ID.field_ref
+    unassigned = [hit for hit in hits if hit.txn_id is None]
+    assert len(unassigned) == 4, "three later payments of T1 and the U1 payment"
+    assert {hit.token for hit in unassigned} == {tok("T", 1), tok("U", 1)}
+    assert all(hit.system_id == "sys_pay" for hit in unassigned)
+    assert loaded.store.events_with_token(TENANT, [], W) == []
+    other = loaded.store.events_with_token(OTHER, [tok("T", 1)], W)
+    assert len(other) == 1 and other[0].txn_id is None, "the other tenant's rows, unassigned"
+
+
+def test_transaction_summaries_count_distinct_events_under_the_latest_assignment(
+    loaded: Loaded,
+) -> None:
+    events = _seed_membership(loaded)
+    summaries = loaded.store.transaction_summaries(TENANT, [TXN_A, TXN_B], W)
+    assert set(summaries) == {TXN_A}, "B owns no event under the latest assignment"
+    summary = summaries[TXN_A]
+    assert summary.event_count == 5
+    assert summary.first_seen == events["order-1-0"].observed_at
+    assert summary.last_seen == events["ship-1"].observed_at
+    assert summary.last_node == SHIP_NODE
+    assert summary.last_severity is None
+    assert loaded.store.transaction_summaries(TENANT, [], W) == {}
+    assert loaded.store.transaction_summaries(TENANT, [TXN_B], W) == {}

@@ -1,7 +1,8 @@
-"""The event store as the engine sees it (plan M2 decision 1; spec 7.2, 9.1 to 9.5).
+"""The event store as the engine sees it (plan M2 decision 1; spec 7.2, 9.1 to 9.8).
 
-:class:`EventStore` is the handful of typed queries the profiler, the linker and the composite
-matcher need over ``events`` and ``event_identifiers``. ClickHouse is the only deployment
+:class:`EventStore` is the handful of typed queries the profiler, the linker, the composite
+matcher, the assembler and the graph rollup need over ``events``, ``event_identifiers`` and
+``txn_events`` (the membership table of spec 7.2, M3). ClickHouse is the only deployment
 implementation (:mod:`carto_core.store.clickhouse`, founder decision 3); the in-memory
 :class:`~carto_core.store.memory.InMemoryEventStore` is the reference for the semantics below and
 the double the engine's unit tests run against. The contract test module
@@ -18,27 +19,40 @@ Semantics every implementation must share:
   values, which the ClickHouse store computes explicitly over the sorted array, so the two
   implementations agree bit for bit.
 - **Ordering** of streamed rows is unspecified; callers never rely on it.
+- **Membership** (``txn_events``, ADR 0060): every ``(txn_id, event_id)`` assignment is a row
+  with a ``version``; a moved event keeps its old row under the merged-away transaction. A
+  reader that starts from an event takes the assignment with the highest version
+  (:meth:`EventStore.events_with_token`, :meth:`EventStore.ordered_transactions`,
+  :meth:`EventStore.transaction_summaries`); a reader that starts from a transaction id
+  (:meth:`EventStore.transaction_events`) is given a surviving id by the caller.
 - Nothing here returns raw values: tokens, shapes, counts and times only (spec 2.3 invariant 2).
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping
+from collections.abc import Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Protocol, runtime_checkable
 
 __all__ = [
+    "AssemblyRow",
     "CooccurrenceRow",
     "EventKeys",
     "EventStore",
     "FieldForm",
     "HourlyVolume",
     "IdentifierRow",
+    "OrderedTransaction",
     "PairJoin",
     "StoreError",
     "TemplateCount",
+    "TokenHit",
+    "TransactionEventRow",
+    "TransactionSummary",
+    "TxnEventWrite",
     "Window",
+    "event_order_key",
 ]
 
 
@@ -195,6 +209,103 @@ class EventKeys:
     """``(field_ref, form, token)`` triples, deduplicated."""
 
 
+@dataclass(frozen=True, slots=True)
+class AssemblyRow:
+    """One event with the identifier tokens of the requested ends (spec 9.7 step 1): what the
+    assembler keys on. ``keys`` are ``(field_ref, form, token)`` triples, deduplicated; an
+    event that carries none of the requested ends is not returned."""
+
+    event_id: str
+    system_id: str
+    template_id: str
+    observed_at: datetime
+    ingested_at: datetime
+    stored_at: datetime
+    severity: str | None
+    actor_kind: str | None
+    keys: tuple[tuple[str, str, str], ...]
+
+    @property
+    def node_id(self) -> str:
+        """The flow-graph node of the event (ADR 0066): ``system_id/template_id``."""
+        return f"{self.system_id}/{self.template_id}"
+
+
+@dataclass(frozen=True, slots=True)
+class TxnEventWrite:
+    """One ``txn_events`` row to append (spec 7.2)."""
+
+    tenant_id: str
+    txn_id: str
+    event_id: str
+    node_id: str
+    observed_at: datetime
+    version: int
+    stored_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class TransactionEventRow:
+    """One event of a transaction as the membership table and ``events`` describe it."""
+
+    event_id: str
+    node_id: str
+    observed_at: datetime
+    ingested_at: datetime
+    severity: str | None
+    actor_kind: str | None
+    version: int
+
+    @property
+    def system_id(self) -> str:
+        return self.node_id.partition("/")[0]
+
+    @property
+    def template_id(self) -> str:
+        return self.node_id.partition("/")[2]
+
+
+def event_order_key(row: TransactionEventRow) -> tuple[datetime, datetime, str]:
+    """Spec 9.7 item 6: ``observed_at``, ties by ``ingested_at`` then ``event_id``."""
+    return (row.observed_at, row.ingested_at, row.event_id)
+
+
+@dataclass(frozen=True, slots=True)
+class OrderedTransaction:
+    """A surviving transaction's events in spec 9.7 order."""
+
+    txn_id: str
+    events: tuple[TransactionEventRow, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class TokenHit:
+    """An identifier row that matched a searched token, with the event's latest transaction
+    (``None`` when the event is in no transaction yet)."""
+
+    token: str
+    field_ref: str
+    form: str
+    event_id: str
+    system_id: str
+    observed_at: datetime
+    txn_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class TransactionSummary:
+    """What the assembler needs to set a transaction's row after a write: the distinct
+    events whose latest assignment is this transaction, their first and last times, and the
+    node and severity of the last event in spec 9.7 order."""
+
+    txn_id: str
+    event_count: int
+    first_seen: datetime
+    last_seen: datetime
+    last_node: str
+    last_severity: str | None
+
+
 @runtime_checkable
 class EventStore(Protocol):
     """The queries of the engine. Implementations raise :class:`StoreError` on failure."""
@@ -247,4 +358,52 @@ class EventStore(Protocol):
     ) -> Iterator[EventKeys]:
         """Stream the events of one system in the window with their attributes and the
         identifier tokens of the requested forms (all forms when ``None``)."""
+        ...
+
+    # -- membership (spec 9.7, 9.8; ADR 0060) ---------------------------------------------------
+
+    def assembly_rows(
+        self,
+        tenant_id: str,
+        window: Window,
+        *,
+        ends: Collection[FieldForm],
+        stored_after: datetime | None = None,
+        limit: int,
+    ) -> list[AssemblyRow]:
+        """The events observed in ``window`` that carry at least one identifier in ``ends``,
+        with those identifiers only; with ``stored_after`` only events whose (earliest)
+        ``stored_at`` is strictly later. Ordered by ``(stored_at, event_id)`` and capped at
+        ``limit`` rows, so a caller pages by ``stored_after``."""
+        ...
+
+    def append_txn_events(self, rows: Sequence[TxnEventWrite]) -> int:
+        """Append membership rows; return how many were written."""
+        ...
+
+    def transaction_events(
+        self, tenant_id: str, txn_id: str, *, window: Window | None = None
+    ) -> list[TransactionEventRow]:
+        """The events assigned to ``txn_id`` (latest row per event among the rows of that
+        transaction), in spec 9.7 order; ``window`` bounds the ``events`` lookup."""
+        ...
+
+    def ordered_transactions(self, tenant_id: str, window: Window) -> Iterator[OrderedTransaction]:
+        """Every event observed in ``window`` under its latest assignment, grouped by
+        transaction, each transaction's events in spec 9.7 order; transaction order is
+        unspecified."""
+        ...
+
+    def events_with_token(
+        self, tenant_id: str, tokens: Collection[str], window: Window
+    ) -> list[TokenHit]:
+        """Identifier rows in ``window`` carrying any of ``tokens`` (one per event, field and
+        form), each with the event's latest transaction or ``None``."""
+        ...
+
+    def transaction_summaries(
+        self, tenant_id: str, txn_ids: Collection[str], window: Window
+    ) -> dict[str, TransactionSummary]:
+        """Per requested id that still owns events under the latest assignment: its summary.
+        ``window`` bounds the ``events`` lookup (the assembler's read window)."""
         ...

@@ -1,27 +1,41 @@
 """The event store the engine reads (plan M2 decision 1): one Protocol, ClickHouse behind it."""
 
 from carto_core.store.model import (
+    AssemblyRow,
     CooccurrenceRow,
     EventKeys,
     EventStore,
     FieldForm,
     HourlyVolume,
     IdentifierRow,
+    OrderedTransaction,
     PairJoin,
     StoreError,
     TemplateCount,
+    TokenHit,
+    TransactionEventRow,
+    TransactionSummary,
+    TxnEventWrite,
     Window,
+    event_order_key,
 )
 
 __all__ = [
+    "AssemblyRow",
     "CooccurrenceRow",
     "EventKeys",
     "EventStore",
     "FieldForm",
     "HourlyVolume",
     "IdentifierRow",
+    "OrderedTransaction",
     "PairJoin",
     "StoreError",
     "TemplateCount",
+    "TokenHit",
+    "TransactionEventRow",
+    "TransactionSummary",
+    "TxnEventWrite",
     "Window",
+    "event_order_key",
 ]

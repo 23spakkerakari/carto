@@ -79,9 +79,9 @@ MIGRATION_TABLE_DDL: Final = (
 TTL_TABLES: Final[tuple[tuple[str, str], ...]] = (
     ("events", "events_days"),
     ("event_identifiers", "events_days"),
+    ("txn_events", "txn_membership_days"),
 )
-"""Tables with a retention TTL and the retention setting that governs it (spec 7.2, 14.10).
-``txn_events`` joins with the assembler (M3)."""
+"""Tables with a retention TTL and the retention setting that governs it (spec 7.2, 14.10)."""
 
 _FILE_PATTERN: Final = re.compile(r"^(\d{4})_[a-z0-9_]+\.sql$")
 _PLACEHOLDER: Final = re.compile(r"\{([a-z_]+)\}")

@@ -43,6 +43,11 @@ class JobKind(StrEnum):
     """Link pass over the current sketches; ``payload['full']`` for the nightly full pass."""
     FAMILIES = "families"
     """Rebuild entity families after a review decision."""
+    ASSEMBLE = "assemble"
+    """Transaction assembly by store watermark (spec 9.7); ``payload['full']`` replays the
+    read window over the existing index (ADR 0060, 0062)."""
+    GRAPH = "graph"
+    """Flow graph rollup: nodes, hops, terminal nodes, the settling sweep (spec 9.8)."""
 
 
 @dataclass(frozen=True, slots=True)

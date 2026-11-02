@@ -73,6 +73,12 @@ def test_every_query_answers_empty_on_an_empty_store() -> None:
     assert store.cooccurrences("default", WINDOW) == []
     assert store.hourly_volumes("default", WINDOW) == []
     assert list(store.events_with_keys("default", "sys_warehouse", WINDOW)) == []
+    assert store.assembly_rows("default", WINDOW, ends=[END], limit=10) == []
+    assert store.transaction_events("default", "01TXN000000000000000000000") == []
+    assert list(store.ordered_transactions("default", WINDOW)) == []
+    assert store.events_with_token("default", ["t1.x"], WINDOW) == []
+    assert store.transaction_summaries("default", ["01TXN000000000000000000000"], WINDOW) == {}
+    assert store.append_txn_events([]) == 0
     join = store.pair_join("default", END, FieldForm("sys_pay/tpl_1/ref", "raw"), WINDOW)
     assert (join.n_a, join.n_b, join.n_match) == (0, 0, 0)
     assert join.c_ab == 0.0 and join.c_ba == 0.0
