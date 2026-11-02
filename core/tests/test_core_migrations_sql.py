@@ -206,6 +206,7 @@ def test_txn_events_ddl_reproduces_spec_7_2_with_the_membership_ttl() -> None:
     ):
         assert column in sql, column
     assert ") ENGINE = ReplacingMergeTree(version)" in sql
+    assert "PARTITION BY toYYYYMM(observed_at)" in sql, "by month (ADR 0061)"
     assert "ORDER BY (tenant_id, txn_id, observed_at, event_id)" in sql
     assert "TTL toDateTime(observed_at) + INTERVAL 120 DAY;" in sql
     assert "{" not in sql and "}" not in sql
@@ -417,7 +418,8 @@ def test_migration_0005_grants_the_worker_writes_and_the_app_reads() -> None:
     assert "GRANT SELECT, INSERT, UPDATE, DELETE ON transactions, txn_token_index" in worker
     assert "TO carto_worker;" in worker
     assert "GRANT SELECT ON transactions, txn_token_index" in app
-    assert "GRANT UPDATE ON nodes TO carto_app;" in app
+    assert "GRANT UPDATE (display_name, version, updated_at) ON nodes TO carto_app;" in app
+    assert "GRANT UPDATE ON" not in app, "column-level, never table-wide (least privilege)"
     assert "INSERT" not in app and "DELETE" not in app
     for table in ("audit_log", "key_links", "entities", "users", "sessions"):
         assert table not in worker and table not in app

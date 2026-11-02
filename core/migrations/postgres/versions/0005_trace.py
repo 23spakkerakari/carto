@@ -6,9 +6,13 @@ Revision ID: 0005
 Revises: 0004
 Create Date: 2026-11-02 00:00:00 UTC
 
-Every table is keyed ``tenant_id`` first (spec 5.5, 22.4) and carries ``created_at`` and
-``updated_at``. ``transactions.id`` is a ULID (``carto_common.ids``); ``merged_into`` names the
-survivor of a merge and stays set, so the old id answers 303 (M3 plan decision 2).
+Every table carries ``tenant_id`` (spec 5.5, 22.4; first in every primary key except the
+``txn_merges`` history, keyed by its sequence), ``created_at`` and ``updated_at``.
+``transactions.id`` is a ULID (``carto_common.ids``; spec 7.3 writes ``txn_id``, the column is
+``id`` like every other table's key); ``merged_into`` names the survivor of a merge and stays
+set, so the old id answers 303 (M3 plan decision 2). ``txn_merges.token_end`` names the
+``field_ref/form`` whose token caused a merge for the review screen (ADR 0061), never the
+token. ``entity_stats`` holds the per-entity quiet span of spec 9.8 (ADR 0061).
 ``txn_token_index`` is the union-find index of spec 9.7 (one row per live token);
 ``txn_token_fanout`` counts distinct transactions per token and day for hub detection;
 ``batch_keys`` holds the tokens that never merge (batch-role link ends and detected hubs).
@@ -18,8 +22,8 @@ entity (spec 9.8). ``entities.version`` is bumped by reviewer patches only and
 ``entities.max_span_days`` is null until a reviewer sets one (ADR 0064).
 
 Grants follow 0004's pattern and are applied only when the role exists: ``carto_worker``
-writes every new table; ``carto_app`` reads them and may update ``nodes`` (the rename route);
-``carto_ingest`` gets nothing here. Every statement is a fixed string.
+writes every new table; ``carto_app`` reads them and may update the three columns of ``nodes``
+the rename route sets; ``carto_ingest`` gets nothing here. Every statement is a fixed string.
 """
 
 from __future__ import annotations
@@ -94,7 +98,7 @@ def _grant_statements() -> list[str]:
             APP_ROLE,
             [
                 f"GRANT SELECT ON {tables} TO {APP_ROLE};",
-                f"GRANT UPDATE ON nodes TO {APP_ROLE};",
+                f"GRANT UPDATE (display_name, version, updated_at) ON nodes TO {APP_ROLE};",
             ],
         ),
     ]
@@ -135,7 +139,7 @@ def upgrade() -> None:
         *_audit_columns(),
         sa.PrimaryKeyConstraint("tenant_id", "id", name="pk_transactions"),
         sa.CheckConstraint(
-            "status IN ('in_progress', 'completed', 'errored', 'stalled')",
+            "status IN (" + ", ".join(f"'{status}'" for status in TXN_STATUSES) + ")",
             name="ck_transactions_status",
         ),
     )

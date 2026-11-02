@@ -471,8 +471,10 @@ CREATE TABLE txn_events (
   event_id String,
   node_id LowCardinality(String),
   observed_at DateTime64(3, 'UTC'),
-  version UInt64
+  version UInt64,
+  stored_at DateTime64(3, 'UTC')
 ) ENGINE = ReplacingMergeTree(version)
+PARTITION BY toYYYYMM(observed_at)
 ORDER BY (tenant_id, txn_id, observed_at, event_id)
 TTL toDateTime(observed_at) + INTERVAL 90 DAY;
 ```
@@ -500,7 +502,7 @@ Key tables (all include `tenant_id`, `created_at`, `updated_at`; migrations via 
 | `hops`                             | `id, from_node, to_node, entity_id, support, p_next, latency_p50/p95/p99, is_manual_score, is_manual_confirmed`                                                                               |
 | `txn_token_index`                  | `tenant_id, token, txn_id, last_seen, expires_at` (PK `tenant_id, token`)                                                                                                                                             |
 | `txn_merges`                       | `from_txn, to_txn, merged_at` (union-find history)                                                                                                                                            |
-| `transactions`                     | `txn_id, entity_id, first_seen, last_seen, current_node, status (in_progress / completed / errored / stalled), event_count, flow_variant, merged_into`                                                                                                   |
+| `transactions`                     | `id (ULID), entity_id, first_seen, last_seen, current_node, status (in_progress / completed / errored / stalled), event_count, flow_variant, merged_into`                                                                                                   |
 | `batch_keys`                       | `tenant_id, token, field_ref, fanout, first_seen` (PK `tenant_id, token`)                                                                                                                                                        |
 | `batches`                          | `batch_id, token, field_ref, node_id, first_seen, txn_count, expected_count (nullable), completed_count`                                                                                                                          |
 | `batch_txns`                       | `batch_id, txn_id`                                                                                                                                                                             |

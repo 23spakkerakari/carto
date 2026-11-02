@@ -30,6 +30,7 @@ from carto_schema.event import (
 )
 
 __all__ = [
+    "EDGE_ID_PATTERN",
     "MAX_INVENTORY_PINS",
     "MAX_INVENTORY_SOURCES",
     "MAX_INVENTORY_SYSTEMS",
@@ -39,6 +40,8 @@ __all__ = [
     "InventorySystem",
 ]
 
+EDGE_ID_PATTERN: Final = r"^[A-Za-z0-9._:-]{1,128}$"
+"""An edge's name as the inventory and core's edge settings spell it."""
 MAX_INVENTORY_SYSTEMS: Final = 1024
 MAX_INVENTORY_SOURCES: Final = 4096
 MAX_INVENTORY_PINS: Final = 4096
@@ -98,7 +101,7 @@ class EdgeInventory(ContractModel):
 
     schema_version: SchemaVersion
     tenant_id: TenantId
-    edge_id: Annotated[str, Field(pattern=r"^[A-Za-z0-9._:-]{1,128}$")]
+    edge_id: Annotated[str, Field(pattern=EDGE_ID_PATTERN)]
     """Which edge reports (its certificate subject or configured name); core keeps one inventory
     per edge and merges them for the console."""
     sent_at: UtcTimestamp

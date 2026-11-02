@@ -11,9 +11,13 @@ from pydantic import ValidationError
 
 from carto_core.settings import (
     MIB,
+    ApiSettings,
+    AssemblerSettings,
     ClickHouseSettings,
     CoreConfigError,
     CoreSettings,
+    EdgeSettings,
+    GraphSettings,
     IngestListenerSettings,
     PostgresSettings,
 )
@@ -189,3 +193,76 @@ def test_settings_are_frozen_and_reject_unknown_keys() -> None:
         settings.log_level = "debug"  # type: ignore[misc]
     with pytest.raises(ValidationError):
         CoreSettings(bogus=1)  # type: ignore[call-arg]
+
+
+# --- the trace milestone's sections (plan M3-demo, ADR 0060) -----------------------------------
+
+
+def test_edge_settings_need_an_https_origin_with_a_port_and_the_mtls_files(
+    tmp_path: Path,
+) -> None:
+    assert EdgeSettings().url is None, "no edge: search answers 503"
+    ca, cert, key = tmp_path / "ca.pem", tmp_path / "api.crt", tmp_path / "api.key"
+
+    def with_files(**overrides: object) -> EdgeSettings:
+        return EdgeSettings(ca_file=ca, client_cert_file=cert, client_key_file=key, **overrides)  # type: ignore[arg-type]
+
+    edge = with_files(url="https://edge-gateway:8443/")
+    assert edge.url == "https://edge-gateway:8443" and edge.edge_id == "edge"
+    assert edge.timeout_seconds == 5.0
+    for bad in (
+        "http://edge-gateway:8443",
+        "https://edge-gateway",
+        "https://user:pw@edge-gateway:8443",
+        "https://edge-gateway:8443/tokenize",
+        "https://edge-gateway:70000",
+        "https://edge-gateway:8443?x=1",
+    ):
+        with pytest.raises(ValidationError, match=r"api\.edge\.url"):
+            with_files(url=bad)
+    with pytest.raises(ValidationError, match="ca_file, client_cert_file and client_key_file"):
+        EdgeSettings(url="https://edge-gateway:8443")
+    with pytest.raises(ValidationError):
+        with_files(edge_id="not ok", url="https://edge-gateway:8443")
+    with pytest.raises(ValidationError):
+        EdgeSettings(timeout_seconds=0)
+    api = ApiSettings(insecure_http=True)
+    assert api.edge.url is None and api.search_per_user_per_minute == 10
+
+
+def test_public_url_is_an_origin_with_an_optional_port() -> None:
+    assert ApiSettings(insecure_http=True, public_url="https://carto.example/").public_url == (
+        "https://carto.example"
+    )
+    for bad in (
+        "https://carto.example/app",
+        "https://u:p@carto.example",
+        "https://carto.example:0",
+    ):
+        with pytest.raises(ValidationError, match=r"api\.public_url"):
+            ApiSettings(insecure_http=True, public_url=bad)
+
+
+def test_assembler_and_graph_numbers_carry_the_spec_defaults_and_ceilings() -> None:
+    assembler = AssemblerSettings()
+    assert (assembler.interval_seconds, assembler.fanout_threshold, assembler.max_events) == (
+        30,
+        50,
+        10_000,
+    )
+    assert assembler.default_max_span_days == 14 and assembler.read_margin_days == 1
+    graph = GraphSettings()
+    assert (graph.interval_seconds, graph.window_days, graph.terminal_share) == (300, 14, 0.95)
+    assert graph.quiet_span_multiplier == 3.0 and graph.manual_human_share == 0.7
+    for bad in (
+        lambda: AssemblerSettings(fanout_threshold=1),
+        lambda: AssemblerSettings(max_events=10_000_000),
+        lambda: AssemblerSettings(interval_seconds=1),
+        lambda: GraphSettings(terminal_share=0.1),
+        lambda: GraphSettings(min_settled_for_terminals=0),
+    ):
+        with pytest.raises(ValidationError):
+            bad()
+    settings = CoreSettings(_env_file=None)
+    assert settings.assembler == assembler and settings.graph == graph
+    assert settings.worker.assemble_after_decision is True

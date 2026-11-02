@@ -147,7 +147,7 @@ def test_migration_0004_creates_the_map_discovery_tables(engine: sqlalchemy.Engi
         version = connection.execute(
             sqlalchemy.text("SELECT version_num FROM alembic_version")
         ).scalar_one()
-    assert version == "0004"
+    assert version == "0005"
 
 
 def test_the_audit_log_refuses_update_and_delete(engine: sqlalchemy.Engine) -> None:

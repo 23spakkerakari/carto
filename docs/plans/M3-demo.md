@@ -54,8 +54,10 @@ Package letters are the M3 plan's. "Lite" means the subset named.
 
 - PostgreSQL migration 0005 with the M3 plan's grant block, holding the tables the demo
   needs: `transactions` (with `merged_into`), `txn_token_index`, `txn_token_fanout`,
-  `txn_merges`, `batch_keys` (batch-role ends, so they never merge), `nodes` (with `version`),
-  `terminal_nodes`, `hops`; `entities.max_span_days` and `entities.version`. Not now:
+  `txn_merges` (with `token_end`, the `field_ref/form` behind a merge, for the review
+  screen), `batch_keys` (batch-role ends, so they never merge), `nodes` (with `version`),
+  `terminal_nodes`, `hops`, `entity_stats` (the per-entity quiet span of spec 9.8 the settling
+  sweep reads; ADR 0061); `entities.max_span_days` and `entities.version`. Not now:
   `batches`, `batch_txns`, `composite_matches`, `flow_variants`, `system_clock_offsets`,
   `search_counters` (each listed under "Left for M3 proper"; a later migration adds them).
 - ClickHouse 0009 `txn_events` (spec 7.2 plus `stored_at`) only. No `hop_transitions`, no
@@ -70,9 +72,10 @@ Package letters are the M3 plan's. "Lite" means the subset named.
   family that inherits the name inherits the id), `entities.version`, `replace_all` leaving
   `version`, `updated_at` and `max_span_days` alone on unchanged rows, the namer's re-read
   before its upsert, the try-lock around the profile and link passes, the worker docstring.
-- `JobKind.ASSEMBLE`, `JobKind.GRAPH`, `WorkerSettings.assemble_interval_seconds`,
-  `AssemblerSettings`, `GraphSettings` (every number a setting, M3 decision 13),
-  `ApiSettings.edge`, `ApiSettings.search_per_user_per_minute`.
+- `JobKind.ASSEMBLE`, `JobKind.GRAPH`, `AssemblerSettings` (with `interval_seconds`),
+  `GraphSettings` (with `interval_seconds`; every number a setting, M3 decision 13),
+  `WorkerSettings.assemble_after_decision` (decision D3), `ApiSettings.edge`,
+  `ApiSettings.search_per_user_per_minute`.
 - `carto_schema.api`: `TraceSummary`, `TraceView`, `TraceEventView`, `IdentifierView`,
   `SearchResponse` (with `matched_forms`, never tokens), `GraphView`, `NodeView`, `HopView`
   (with `manual_signals`, decision D4), `NodePatch`, `Problem.type`, `Permission.SEARCH`.
@@ -91,7 +94,8 @@ Package letters are the M3 plan's. "Lite" means the subset named.
   reassembly over the read window (needed by decision D3).
 - Property tests: no event lost or duplicated; order independence when no guardrail fires;
   deterministic refusals otherwise; a batch key never merges; expiry exact; a late event joins
-  and re-evaluates status; `full` equals incremental; a repeated micro-batch changes nothing.
+  and re-evaluates status; a `full` replay equals the incremental result on the same data (D8);
+  a repeated micro-batch changes nothing.
 - Coverage at least 85% on `core/carto_core/assembler`.
 
 ### C-lite. Graph
@@ -169,7 +173,9 @@ Package letters are the M3 plan's. "Lite" means the subset named.
 ### I-lite. Compose
 
 - `api` gets the edge URL, CA and client certificate (already issued by `carto-ctl pki init`
-  as the `api` role); `carto-ctl key init` output mounted into `edge-gateway` as
+  as the `api` role) and joins the `edge` network beside `core` (today only `ingest-api`
+  bridges the two, so search would answer 503 on the stack; ADR 0065); `carto-ctl key init`
+  output mounted into `edge-gateway` as
   `assertion-public.key`; the worker runs `assemble` every 30 s and `graph` every five
   minutes; `README` of `deploy/compose` gains the two steps. No CI browser step against the
   stack; the recording is the manual run of journey 4.4.
@@ -192,9 +198,17 @@ plan's decisions as built, each marked with what the demo leaves out.
   assembler keys events as they arrive; events stored before a link was accepted carry no key
   from it. Spec 4.3 then 4.4 (accept, then trace) needs those events assembled without waiting
   for the nightly `full` pass, so the accept, reject and association routes enqueue
-  `assemble` with `payload['full']` (deduped by the queue), and the console's review screen
-  says "transactions are being rebuilt" from the job's state. This is not a demo shortcut; it
-  belongs in M3 proper. ADR 0062.
+  `assemble` with `payload['full']` (deduped by the queue; `WorkerSettings.assemble_after_decision`),
+  and the console's review screen says "transactions are being rebuilt" from the job's state.
+  This is not a demo shortcut; it belongs in M3 proper. Under D8 a reject's enqueue cannot
+  undo merges the rejected link already caused; it only stops new ones. ADR 0062.
+- **D8. `full` assembly in the demo cut replays the read window over the existing index.**
+  The M3 plan's `full` reassembles from scratch into new ids (the nightly repair of bounded
+  hub merges, since union-find cannot split). The demo clears the watermark instead and
+  re-reads the window: transaction ids stay, every event is re-keyed, and the keys of a newly
+  accepted link merge the transactions they join. Merges a since-rejected link caused stay
+  until the nightly rebuild of M3 proper. The property test is "a `full` replay equals the
+  incremental result on the same data". ADR 0060.
 - **D4. The "Likely manual" badge is a preview from two of spec 11.1's six signals.** Link
   type (the two systems are joined by an accepted composite link and no accepted exact link)
   and actor (the share of receiving events with `actor_kind = human`). `HopView.manual_signals`
@@ -210,6 +224,12 @@ plan's decisions as built, each marked with what the demo leaves out.
   M3 proper, not now: on scenario A every Warehouse row carries `order_ref`, so the warehouse
   event joins its transaction through the exact link and only the 2% clerk typos (0.6% of
   transactions) would need the composite pair. Scenario C needs it; the demo does not.
+
+## Spec edits made with this plan (editorial)
+
+- 7.3 `transactions`: the key column is `id` (a ULID), as every other table's key; the spec
+  wrote `txn_id`.
+- 7.2 `txn_events`: carries `stored_at` (ADR 0046) and is partitioned by month (ADR 0061).
 
 ## Left for M3 proper (nothing here is dropped)
 

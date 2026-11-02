@@ -577,9 +577,20 @@ def test_a_family_built_from_accepted_links_is_listed_and_renamed() -> None:
         "entity.patch",
         f"entity:{entity['id']}",
     )
-    # A later rebuild keeps the confirmed name (families.inherit_names).
+    # A later rebuild keeps the confirmed name (families.inherit_names) and, having changed
+    # nothing, leaves the ETag alone, so a reviewer's next patch with the tag they read is not
+    # a 412 (ADR 0064).
+    w.clock.tick(minutes=5)
     FamilyBuilder(w.links, w.entities, namer=lambda _m: "Order").rebuild(TENANT, now=w.clock())
-    assert w.client.get(f"{API_PREFIX}/entities").json()["items"][0]["name"] == "Customer order"
+    listed = w.client.get(f"{API_PREFIX}/entities").json()["items"][0]
+    assert listed["name"] == "Customer order" and listed["etag"] == 'W/"2"'
+    described = w.client.patch(
+        f"{API_PREFIX}/entities/{entity['id']}",
+        json={"description": "Web orders"},
+        headers={**headers, "If-Match": 'W/"2"'},
+    )
+    assert described.status_code == 200, described.text
+    assert described.json()["etag"] == 'W/"3"' and described.json()["description"] == "Web orders"
 
 
 def test_readiness_asks_every_data_port() -> None:

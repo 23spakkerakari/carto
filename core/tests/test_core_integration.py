@@ -258,6 +258,7 @@ def test_clickhouse_migrations_apply_once_and_retention_rewrites_ttls(
             "0006_event_identifiers_replacing.sql",
             "0007_events_stored_at.sql",
             "0008_event_identifiers_stored_at.sql",
+            "0009_txn_events.sql",
         ]
         first = apply_clickhouse_migrations(client, RetentionSettings())
         assert first in (names, [])
@@ -319,7 +320,7 @@ def test_postgres_migrations_apply_idempotently(postgres: PostgresSettings) -> N
             version = connection.execute(
                 sqlalchemy.text("SELECT version_num FROM alembic_version")
             ).scalar_one()
-        assert version == "0004"
+        assert version == "0005"
         health_columns = {column["name"] for column in inspector.get_columns("source_health")}
         assert "sent_at" in health_columns
         source_columns = {column["name"] for column in inspector.get_columns("sources")}

@@ -37,6 +37,12 @@ assembler's shape is settled and code may start.
 
 ## Consequences
 
+- The worker writes ClickHouse: `txn_events` now, the hop tables of M3 proper later. A
+  ClickHouse user scoped to reads belongs to the `api` process only (the security plan's
+  package G); the worker keeps a writing user.
+- A `full` replay cannot undo the merges a since-rejected link caused (union-find has no
+  split); the reject route's enqueue (ADR 0062) only stops new ones until the nightly rebuild
+  of M3 proper.
 - Spec 21's M3 acceptance (F1 on scenario C, batch targets, p95 at the Section 17 volume) is
   not claimed by the demo cut; the plan's acceptance table is the recording checklist.
 - Every module built here is named in `M3.md`'s packages, so M3 proper extends rather than

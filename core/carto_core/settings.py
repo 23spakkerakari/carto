@@ -34,6 +34,7 @@ from urllib.parse import urlsplit
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from carto_common.settings import ProductSettings
+from carto_schema.inventory import EDGE_ID_PATTERN
 
 __all__ = [
     "MAX_PASSWORD_FILE_BYTES",
@@ -83,6 +84,36 @@ class _Frozen(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
 
+def _origin(value: str, name: str, *, schemes: tuple[str, ...], require_port: bool) -> str:
+    """``scheme://host[:port]`` and nothing else: no credentials, path, query or fragment; the
+    port, when present (or required), is 1 to 65535. Returns the normalized origin."""
+    parts = urlsplit(value)
+    if parts.scheme not in schemes:
+        msg = f"{name} must start with " + " or ".join(f"{scheme}://" for scheme in schemes)
+        raise ValueError(msg)
+    if parts.username is not None or parts.password is not None:
+        msg = f"{name} must not carry credentials"
+        raise ValueError(msg)
+    try:
+        port = parts.port
+    except ValueError as exc:
+        msg = f"{name} port is not a number in range"
+        raise ValueError(msg) from exc
+    if not parts.hostname:
+        msg = f"{name} must name a host"
+        raise ValueError(msg)
+    if port is None and require_port:
+        msg = f"{name} must be scheme://host:port with an explicit port (1 to 65535)"
+        raise ValueError(msg)
+    if port is not None and not 1 <= port <= 65535:
+        msg = f"{name} port must be 1 to 65535"
+        raise ValueError(msg)
+    if parts.path not in ("", "/") or parts.query or parts.fragment:
+        msg = f"{name} must be an origin: scheme, host and port only"
+        raise ValueError(msg)
+    return f"{parts.scheme}://{parts.netloc}"
+
+
 def _read_secret_file(path: Path | None, what: str) -> str:
     """Return the trimmed content of a secret file, or ``""`` when no file is configured."""
     if path is None:
@@ -126,25 +157,7 @@ class ClickHouseSettings(_Frozen):
     @field_validator("url")
     @classmethod
     def _scheme_host_port(cls, value: str) -> str:
-        parts = urlsplit(value)
-        if parts.scheme not in ("http", "https"):
-            msg = "clickhouse.url must start with http:// or https://"
-            raise ValueError(msg)
-        if parts.username is not None or parts.password is not None:
-            msg = "clickhouse.url must not carry credentials; use password_file"
-            raise ValueError(msg)
-        try:
-            port = parts.port
-        except ValueError as exc:
-            msg = "clickhouse.url port is not a number in range"
-            raise ValueError(msg) from exc
-        if not parts.hostname or port is None or not 1 <= port <= 65535:
-            msg = "clickhouse.url must be http(s)://host:port with an explicit port (1 to 65535)"
-            raise ValueError(msg)
-        if parts.path not in ("", "/") or parts.query or parts.fragment:
-            msg = "clickhouse.url must not have a path, query or fragment"
-            raise ValueError(msg)
-        return f"{parts.scheme}://{parts.netloc}"
+        return _origin(value, "clickhouse.url", schemes=("http", "https"), require_port=True)
 
     @model_validator(mode="after")
     def _secure_matches_scheme(self) -> Self:
@@ -368,19 +381,18 @@ class AssemblerSettings(_Frozen):
     fanout_threshold: int = Field(
         default=50,
         ge=2,
+        le=100_000,
         description="Distinct transactions per token per day at which it becomes a batch key.",
     )
     max_events: int = Field(
-        default=10_000, ge=2, description="A merge that would exceed this is refused (9.7)."
+        default=10_000,
+        ge=2,
+        le=1_000_000,
+        description="A merge that would exceed this is refused (9.7).",
     )
     default_max_span_days: int = Field(
         default=14, ge=1, le=400, description="Entity max span when the entity sets none."
     )
-    nightly_rebuild: bool = Field(
-        default=True,
-        description="Full reassembly nightly (M3 question 2); the demo cut does not schedule it.",
-    )
-    rebuild_hour_utc: int = Field(default=4, ge=0, le=23)
 
 
 class GraphSettings(_Frozen):
@@ -399,7 +411,10 @@ class GraphSettings(_Frozen):
         default=3.0, ge=1.0, le=100.0, description="Quiet span = this x p99 inter-event gap."
     )
     min_settled_for_terminals: int = Field(
-        default=20, ge=1, description="Settled transactions before terminals are computed."
+        default=20,
+        ge=1,
+        le=1_000_000,
+        description="Settled transactions before terminals are computed (ADR 0061).",
     )
     manual_human_share: float = Field(
         default=0.7,
@@ -416,7 +431,7 @@ class EdgeSettings(_Frozen):
     url: str | None = Field(
         default=None, description="https://host:port of the edge gateway; none: search is 503."
     )
-    edge_id: str = Field(default="edge", min_length=1, max_length=128)
+    edge_id: str = Field(default="edge", pattern=EDGE_ID_PATTERN)
     ca_file: Path | None = Field(default=None, description="CA of the edge gateway certificate.")
     client_cert_file: Path | None = Field(default=None, description="Core's api role cert.")
     client_key_file: Path | None = Field(default=None)
@@ -427,14 +442,7 @@ class EdgeSettings(_Frozen):
     def _https_origin(cls, value: str | None) -> str | None:
         if value is None:
             return None
-        parts = urlsplit(value)
-        if parts.scheme != "https" or not parts.hostname or parts.username is not None:
-            msg = "api.edge.url must be an https:// origin without credentials (spec 14.4)"
-            raise ValueError(msg)
-        if parts.path not in ("", "/") or parts.query or parts.fragment:
-            msg = "api.edge.url must be an origin: scheme, host and port only"
-            raise ValueError(msg)
-        return f"{parts.scheme}://{parts.netloc}"
+        return _origin(value, "api.edge.url", schemes=("https",), require_port=True)
 
     @model_validator(mode="after")
     def _mtls_files(self) -> Self:
@@ -571,14 +579,7 @@ class ApiSettings(_Frozen):
     @field_validator("public_url")
     @classmethod
     def _origin_only(cls, value: str) -> str:
-        parts = urlsplit(value)
-        if parts.scheme not in ("http", "https") or not parts.hostname:
-            msg = "api.public_url must be an http(s):// origin"
-            raise ValueError(msg)
-        if parts.path not in ("", "/") or parts.query or parts.fragment or parts.username:
-            msg = "api.public_url must be an origin: scheme, host and port only"
-            raise ValueError(msg)
-        return f"{parts.scheme}://{parts.netloc}"
+        return _origin(value, "api.public_url", schemes=("http", "https"), require_port=False)
 
     @model_validator(mode="after")
     def _tls_or_insecure(self) -> Self:
