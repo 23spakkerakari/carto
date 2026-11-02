@@ -142,6 +142,7 @@ def make(postgres: dict[str, Any], username: str, password: str, batch: int = 10
             "port": postgres["port"],
             "database": "wms",
             "sslmode": "disable",
+            "insecure_transport": True,  # the Compose fixture has no TLS (ADR 0067)
             "query_timeout_seconds": 5,
             "batch": batch,
             "queries": [

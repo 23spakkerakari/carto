@@ -210,6 +210,17 @@ WRITE_CAPABLE = ConnectorTestResult(
 )
 
 
+class TransportConfig(ConnectorConfig):
+    """A config block that names its weakened transport keys, as SqlConfig and SplunkConfig
+    do once ``insecure_transport`` accepted them (ADR 0067)."""
+
+    weakened: tuple[str, ...] = ()
+
+    @property
+    def weakened_transport(self) -> tuple[str, ...]:
+        return self.weakened
+
+
 class FakeConnector:
     type: ClassVar[str] = "upload"
 
@@ -221,19 +232,23 @@ class FakeConnector:
         fail: bool = False,
         age: float = 30.0,
         tests: list[ConnectorTestResult | Exception] | None = None,
+        weakened: tuple[str, ...] | None = None,
     ) -> None:
         self.source = source
         self.records = records
         self.fail = fail
         self.age = age
         self.tests = list(tests) if tests else [READ_ONLY]
+        self.weakened = weakened
         self.test_calls = 0
         self.reads: list[Cursor | None] = []
         self.generator_closed = False
         self.closed = False
 
     def validate_config(self, cfg: Mapping[str, Any]) -> ConnectorConfig:
-        return ConnectorConfig()
+        if self.weakened is None:
+            return ConnectorConfig()
+        return TransportConfig(weakened=self.weakened)
 
     async def test(self) -> ConnectorTestResult:
         self.test_calls += 1
@@ -719,3 +734,81 @@ async def test_a_checkpoint_is_committed_after_the_flush_and_not_counted(
         assert buffer.pending_events() == 2
     finally:
         await poll.close()
+
+
+# ---------------------------------------------------------------------------------------------
+# Weakened transport is audited and warned once per enable (spec 8.1, ADR 0067)
+# ---------------------------------------------------------------------------------------------
+
+
+def audit_rows(runtime: EdgeRuntime, action: str) -> list[dict[str, Any]]:
+    lines = runtime.audit.path.read_text(encoding="utf-8").splitlines()
+    rows = [json.loads(line) for line in lines if line]
+    return [row for row in rows if row["action"] == action]
+
+
+async def test_an_insecure_transport_source_is_audited_and_warned_once_per_enable(
+    runtime: EdgeRuntime, cursors: CursorStore
+) -> None:
+    made: dict[str, FakeConnector] = {}
+    poll = scheduler(
+        runtime,
+        FakeIngestor(),
+        cursors,
+        connector_factory=factory_for(made, weakened=("sslmode", "trust_server_certificate")),
+    )
+    with structlog.testing.capture_logs() as logs:
+        await poll.poll_once("src_web")
+        await poll.poll_once("src_web")
+        await poll.poll_once("src_web")
+    assert made["src_web"].test_calls == 1
+    rows = audit_rows(runtime, "source.insecure_transport")
+    assert len(rows) == 1
+    assert rows[0]["target"] == "src_web"
+    assert rows[0]["actor"] == "system:edge"
+    assert rows[0]["details"] == {
+        "connector": "upload",
+        "keys": ["sslmode", "trust_server_certificate"],
+    }
+    warnings = [e for e in logs if e["event"] == "scheduler.insecure_transport"]
+    assert len(warnings) == 1
+    assert warnings[0]["log_level"] == "warning"
+    assert warnings[0]["source_id"] == "src_web"
+    assert warnings[0]["keys"] == ["sslmode", "trust_server_certificate"]
+
+
+async def test_a_refused_test_writes_no_row_and_the_enabling_one_writes_one(
+    runtime: EdgeRuntime, cursors: CursorStore
+) -> None:
+    """The row belongs to the enable, not to the test: a write-capable credential is refused
+    without a row; the corrected grant that enables the source writes exactly one."""
+    made: dict[str, FakeConnector] = {}
+    poll = scheduler(
+        runtime,
+        FakeIngestor(),
+        cursors,
+        connector_factory=factory_for(
+            made, tests=[WRITE_CAPABLE, READ_ONLY], weakened=("verify_tls",)
+        ),
+    )
+    with pytest.raises(ReadOnlyViolationError):
+        await poll.poll_once("src_web")
+    assert audit_rows(runtime, "source.insecure_transport") == []
+    await poll.poll_once("src_web")
+    await poll.poll_once("src_web")
+    rows = audit_rows(runtime, "source.insecure_transport")
+    assert [row["details"]["keys"] for row in rows] == [["verify_tls"]]
+
+
+async def test_a_verified_transport_source_writes_no_row_and_no_warning(
+    runtime: EdgeRuntime, cursors: CursorStore
+) -> None:
+    made: dict[str, FakeConnector] = {}
+    for weakened in (None, ()):
+        poll = scheduler(
+            runtime, FakeIngestor(), cursors, connector_factory=factory_for(made, weakened=weakened)
+        )
+        with structlog.testing.capture_logs() as logs:
+            await poll.poll_once("src_web")
+        assert audit_rows(runtime, "source.insecure_transport") == []
+        assert [e for e in logs if e["event"] == "scheduler.insecure_transport"] == []

@@ -21,6 +21,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
+from carto_common.crypto import _create_private
 from carto_common.mtls import role_uri
 
 __all__ = [
@@ -185,16 +186,20 @@ def issue_certificate(
 
 
 def write_pem(pair: CertificatePair, certificate_path: Path, key_path: Path) -> None:
-    """Write both files. The key file gets owner-only permissions and is never overwritten."""
+    """Write both files. The key file is created exclusively with owner-only permissions from
+    its first instant (``crypto._create_private``: ``O_EXCL`` and mode 0600 on the ``open``
+    itself, so no umask or chmod window ever leaves it readable) and is never overwritten."""
     certificate_path.parent.mkdir(parents=True, exist_ok=True)
     key_path.parent.mkdir(parents=True, exist_ok=True)
     if key_path.exists():
         msg = f"refusing to overwrite existing private key {key_path}"
         raise PkiError(msg)
     certificate_path.write_bytes(pair.certificate_pem)
-    with key_path.open("xb") as handle:
-        handle.write(pair.private_key_pem)
-    key_path.chmod(0o600)
+    try:
+        _create_private(key_path, pair.private_key_pem)
+    except FileExistsError as exc:  # created between the check and the open
+        msg = f"refusing to overwrite existing private key {key_path}"
+        raise PkiError(msg) from exc
 
 
 def load_certificate(path: Path) -> x509.Certificate:

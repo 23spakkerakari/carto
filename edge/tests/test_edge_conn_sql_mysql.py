@@ -176,6 +176,7 @@ def make(
             "port": mysql["port"],
             "database": "wms",
             "ssl": False,
+            "insecure_transport": True,  # the Compose fixture has no TLS (ADR 0067)
             "query_timeout_seconds": 5,
             "batch": batch,
             "queries": [

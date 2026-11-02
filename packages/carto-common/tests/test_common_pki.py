@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import datetime as dt
+import os
 import ssl
+import stat
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -92,6 +95,36 @@ def test_write_and_load_pem_refuses_to_overwrite_keys(tmp_path: Path) -> None:
         load_certificate(tmp_path / "missing.crt")
     with pytest.raises(PkiError, match="cannot load"):
         load_private_key(tmp_path / "missing.key")
+
+
+@pytest.fixture
+def open_umask() -> Iterator[None]:
+    """A permissive umask: the key's mode must come from its creation, not from the process."""
+    previous = os.umask(0)
+    try:
+        yield
+    finally:
+        os.umask(previous)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+@pytest.mark.usefixtures("open_umask")
+def test_private_key_is_owner_only_from_creation(tmp_path: Path) -> None:
+    ca = create_ca()
+    write_pem(ca, tmp_path / "ca.crt", tmp_path / "ca.key")
+    assert stat.S_IMODE((tmp_path / "ca.key").stat().st_mode) == 0o600
+    # The certificate is public and keeps the ordinary mode.
+    assert stat.S_IMODE((tmp_path / "ca.crt").stat().st_mode) & 0o044
+
+
+def test_an_existing_key_is_never_overwritten(tmp_path: Path) -> None:
+    key_path = tmp_path / "ca.key"
+    key_path.write_bytes(b"operator key")
+    certificate_path = tmp_path / "ca.crt"
+    with pytest.raises(PkiError, match="refusing to overwrite"):
+        write_pem(create_ca(), certificate_path, key_path)
+    assert key_path.read_bytes() == b"operator key"
+    assert not certificate_path.exists()
 
 
 def test_fingerprint_format() -> None:
