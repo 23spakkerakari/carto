@@ -39,7 +39,8 @@ def test_no_faults_means_empty_faults_and_a_file_on_day_9(
     sql = (out_dir / "warehouse/purchase_orders.sql").read_text(encoding="utf-8")
     assert "ALTER TABLE" not in sql
     assert not (out_dir / "warehouse/purchase_orders.renamed.csv").exists()
-    assert "L07b" not in {link.link_id for link in truth.links}
+    assert not {"L07b", "L11b", "L13b"} & {link.link_id for link in truth.links}
+    assert "L15" in {link.link_id for link in truth.links}
     assert "sys_warehouse/src_wms_db/po_number" not in truth.markers.identifier_values
     assert not any(e.is_error for e in iter_events(out_dir))
     assert truth.manifest.faults_enabled is False

@@ -16,7 +16,12 @@
    ``actor.token`` (spec 7.1), ``kind`` ``service`` when the value looks like a service account
    (``svc_`` prefix or an ``api``, ``integration``, ``system``, ``bot``, ``daemon`` or
    ``service`` segment), else ``human``.
-5. ``event_id = derive_ulid(observed_at_ms, source_id, locator)`` (spec 8.1, ADR 0006), so a
+5. ``observed_at`` must lie in the plausible range of ADR 0036, read on the pipeline's
+   clock: no older than event retention plus one day (the record is dropped with reason
+   ``too_old``) and no more than one day ahead (the time becomes the ingest time, with
+   ``observed_at_quality=ingest``: a future time is almost always a parsing error, and the
+   event is still worth keeping). Both are counted in ``PipelineCounters.out_of_range``.
+   ``event_id = derive_ulid(observed_at_ms, source_id, locator)`` (spec 8.1, ADR 0006), so a
    record read twice gets the same id. ``ingested_at`` is the connector's ``received_at``.
 6. The :class:`~carto_schema.event.CanonicalEvent` is validated by the contract model. A
    validation failure is a bug in this pipeline: it is logged by error type and field
@@ -46,7 +51,7 @@ from __future__ import annotations
 import threading
 from collections import Counter
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, Final
 
@@ -54,6 +59,7 @@ from pydantic import ValidationError
 
 from carto_common.ids import derive_ulid
 from carto_common.logging import get_logger
+from carto_common.settings import observed_at_range
 from carto_edge.config import SourceConfig, SourcesFile
 from carto_edge.pipeline.classify import Classifier
 from carto_edge.pipeline.forms import normalize
@@ -85,27 +91,41 @@ from carto_schema.event import (
     Actor,
     ActorKind,
     CanonicalEvent,
+    ObservedAtQuality,
     Redaction,
 )
 
 __all__ = [
+    "OUT_OF_RANGE_FUTURE",
     "REASON_CONTRACT",
+    "REASON_TOO_OLD",
     "REASON_UNKNOWN_SOURCE",
     "SERVICE_ACCOUNT_SEGMENTS",
     "EdgePipeline",
     "PipelineCounters",
     "actor_kind",
+    "wall_clock",
 ]
 
 REASON_CONTRACT: Final = "contract"
 REASON_UNKNOWN_SOURCE: Final = "unknown_source"
 REASON_ATTRIBUTE_UNCLEAN: Final = "attribute_unclean"
+REASON_TOO_OLD: Final = "too_old"
+"""Drop reason, and ``out_of_range`` value, of a record older than the plausible range."""
+OUT_OF_RANGE_FUTURE: Final = "future"
+"""``out_of_range`` value of an event whose future time was replaced by the ingest time."""
 SERVICE_ACCOUNT_SEGMENTS: Final = frozenset(
     {"svc", "api", "integration", "system", "bot", "daemon", "service"}
 )
 _SEGMENT_SEPARATORS: Final = frozenset("_-.:@/ ")
 
 log = get_logger(component="carto_edge.pipeline")
+
+
+def wall_clock() -> datetime:
+    """The gateway's reference time for the plausible range (ADR 0036). Looked up at each call,
+    so the edge tests can pin it to a fixed day for their fixed-date data."""
+    return datetime.now(UTC)
 
 
 def _segments(value: str) -> list[str]:
@@ -150,6 +170,7 @@ class PipelineCounters:
     vault_entries: int = 0
     attributes_refused: int = 0
     observed: int = 0
+    out_of_range: Counter[str] = field(default_factory=Counter)
 
     @property
     def dropped_total(self) -> int:
@@ -166,6 +187,7 @@ class PipelineCounters:
             "vault_entries": self.vault_entries,
             "attributes_refused": self.attributes_refused,
             "observed": self.observed,
+            "out_of_range": dict(self.out_of_range),
         }
 
 
@@ -194,6 +216,8 @@ class EdgePipeline:
         observe_on_process: bool = True,
         names: FieldNameStore | None = None,
     ) -> None:
+        """``clock`` is the time the plausible ``observed_at`` range is read against (ADR 0036):
+        the wall clock in the gateway, the run's reference time in the analyzer."""
         self._sources = {source.id: source for source in sources.sources}
         self._observe_on_process = observe_on_process
         self._templates = templates
@@ -207,8 +231,10 @@ class EdgePipeline:
         self._detector = detector
         self._tokenizer = tokenizer
         self._tenant_id = tenant_id
+        self._retention_days = retention_days
         self._retention = timedelta(days=retention_days)
-        self._clock = clock if clock is not None else lambda: datetime.now(UTC)
+        # A lambda, not the function: it is looked up per call so tests can pin it.
+        self._clock = clock if clock is not None else lambda: wall_clock()  # noqa: PLW0108
         self._parsers: dict[str, RecordParser] = {}
         self._lock = threading.RLock()
         self.counters = PipelineCounters()
@@ -286,7 +312,9 @@ class EdgePipeline:
             ref = field_ref(parsed.system_id, parsed.template_id, path)
             if self._observe_on_process:
                 self._classifier.observe(ref, path, value)
-            decisions[path] = self._classifier.decide(ref, path)
+            decisions[path] = self._classifier.decide(
+                ref, path, name_class=parsed.name_classes.get(path)
+            )
         return decisions
 
     # -- streaming and pass 2 -------------------------------------------------------------------
@@ -301,8 +329,25 @@ class EdgePipeline:
             parsed = parser.parse(raw)
             if isinstance(parsed, ParseFailure):
                 return self._drop(raw.locator, parsed.reason)
+            lower, upper = observed_at_range(self._clock(), self._retention_days)
+            out_of_range: str | None = None
+            if parsed.observed_at < lower:
+                self.counters.out_of_range[REASON_TOO_OLD] += 1
+                result = self._drop(raw.locator, REASON_TOO_OLD)
+                result.out_of_range = REASON_TOO_OLD
+                return result
+            if parsed.observed_at > upper:
+                self.counters.out_of_range[OUT_OF_RANGE_FUTURE] += 1
+                out_of_range = OUT_OF_RANGE_FUTURE
+                parsed = replace(
+                    parsed,
+                    observed_at=parsed.received_at,
+                    observed_at_quality=ObservedAtQuality.INGEST,
+                )
             decisions = self._decide_fields(parsed)
-            return self._emit(parsed, decisions)
+            emitted = self._emit(parsed, decisions)
+            emitted.out_of_range = out_of_range
+            return emitted
 
     def _drop(self, locator: str, reason: str) -> PipelineResult:
         self.counters.dropped[reason] += 1
@@ -398,8 +443,10 @@ class EdgePipeline:
         """Persist templates and field names; the caller flushes the statistics store on its
         own clock."""
         with self._lock:
-            self._templates.flush()
-            self._names.flush()
+            try:
+                self._templates.flush()
+            finally:
+                self._names.flush()
 
     def parser_internal_errors(self) -> int:
         return sum(parser.internal_errors for parser in self._parsers.values())

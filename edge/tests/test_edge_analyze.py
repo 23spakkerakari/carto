@@ -1,14 +1,16 @@
 """carto-edge analyze end to end on a tiny simulator run (spec 4.1, 8.1.1; ADR 0017, 0024, 0025):
 the bundle verifies, its counts match the events and the simulator, the locator map sits next to
 it with one line per event, the state directory keeps the key and the reveal vault (never the
-bundle), a second run over the same state directory reproduces event ids and tokens, and usage
-errors exit 2 without touching anything."""
+bundle), a second run over the same state directory reproduces event ids and tokens, event times
+are checked against the run time or ``--as-of`` (ADR 0036), and usage errors exit 2 without
+touching anything."""
 
 from __future__ import annotations
 
 import json
 import logging
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -23,14 +25,15 @@ from carto_edge.cli.analyze import (
     analyze,
     default_producer,
     default_state_dir,
+    parse_as_of,
 )
 from carto_edge.cli.main import main
 from carto_edge.config import EdgeSettings, PiiSettings, load_sources_file
 from carto_edge.pipeline.pii import RegexDetector
 from carto_edge.runtime import build_runtime
 from carto_schema.bundle import EVENTS_FILE
-from carto_schema.event import CanonicalEvent
-from carto_simulator.api import GenerationRequest, generate
+from carto_schema.event import CanonicalEvent, ObservedAtQuality
+from carto_simulator.api import GenerationRequest, generate, run_as_of
 
 ROOT = Path(__file__).resolve().parents[2]
 CONFIG = ROOT / "simulator" / "analyze.shop.yaml"
@@ -256,3 +259,87 @@ def test_an_input_over_the_limits_fails_with_1_and_leaves_no_bundle(tmp_path: Pa
     assert failed.value.code == 1
     assert not out.exists()
     assert not default_locator_map_path(out).exists()
+
+
+# --- the plausible range and --as-of (ADR 0036) ------------------------------------------------
+
+
+def test_a_clean_run_reports_no_event_out_of_range(first_run: AnalyzeResult) -> None:
+    counts = first_run.manifest.counts
+    assert (counts.events_too_old, counts.events_future) == (0, 0)
+    assert not any("--as-of" in note for note in first_run.manifest.notes)
+
+
+def test_as_of_long_after_the_run_drops_every_record_as_too_old(
+    sim_dir: Path, tmp_path: Path
+) -> None:
+    late = datetime(2027, 6, 1, tzinfo=UTC)
+    result = analyze(CONFIG, sim_dir, tmp_path / "late.carto", detector=RegexDetector(), as_of=late)
+    counts = result.manifest.counts
+    assert counts.events == 0
+    assert counts.events_too_old == counts.records_read == counts.records_dropped > 0
+    assert result.dropped == {"too_old": counts.records_read}
+    manifest_md = (tmp_path / "late.carto" / "MANIFEST.md").read_text(encoding="utf-8")
+    assert "Dropped as older than retention (ADR 0036)" in manifest_md
+    assert any(late.isoformat() in note and "--as-of" in note for note in result.manifest.notes)
+
+
+def test_as_of_before_the_run_keeps_its_events_with_the_ingest_time(
+    sim_dir: Path, tmp_path: Path
+) -> None:
+    early = datetime(2026, 9, 1, tzinfo=UTC)
+    result = analyze(
+        CONFIG, sim_dir, tmp_path / "early.carto", detector=RegexDetector(), as_of=early
+    )
+    counts = result.manifest.counts
+    assert counts.events_future == counts.events > 0
+    events = events_of(tmp_path / "early.carto")
+    assert all(event.observed_at_quality is ObservedAtQuality.INGEST for event in events)
+
+
+def test_the_simulators_as_of_keeps_every_event_of_the_run(
+    sim_dir: Path, tmp_path: Path, first_run: AnalyzeResult
+) -> None:
+    result = analyze(
+        CONFIG,
+        sim_dir,
+        tmp_path / "asof.carto",
+        detector=RegexDetector(),
+        as_of=run_as_of(sim_dir),
+    )
+    assert result.manifest.counts.events == first_run.manifest.counts.events
+    assert result.manifest.counts.events_too_old == 0
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("2026-10-08", datetime(2026, 10, 8, tzinfo=UTC)),
+        ("2026-10-08T00:00:00Z", datetime(2026, 10, 8, tzinfo=UTC)),
+        ("2026-10-08T02:00:00+02:00", datetime(2026, 10, 8, tzinfo=UTC)),
+    ],
+)
+def test_as_of_accepts_a_date_or_a_time_with_an_offset(text: str, expected: datetime) -> None:
+    assert parse_as_of(text) == expected
+
+
+@pytest.mark.parametrize("text", ["2026-10-08T00:00:00", "yesterday", "2026-13-01"])
+def test_as_of_refuses_a_naive_time_or_anything_else(text: str) -> None:
+    with pytest.raises(ValueError, match="--as-of"):
+        parse_as_of(text)
+
+
+def test_the_command_takes_as_of(
+    sim_dir: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+    restore_logging: None,
+) -> None:
+    monkeypatch.setenv("CARTO_PII__ENABLED", "false")
+    out = tmp_path / "cli.carto"
+    args = ["analyze", "--config", str(CONFIG), "--input", str(sim_dir), "--out", str(out)]
+    assert main([*args, "--as-of", "2027-06-01"]) == 0
+    printed = capsys.readouterr().out
+    records = verify_bundle(out).manifest.counts.records_read
+    assert f"out of range    {records:,} too old (dropped), 0 in the future" in printed

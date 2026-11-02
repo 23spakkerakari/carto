@@ -1,6 +1,7 @@
 """carto_edge.pipeline.pipeline: parse, classify, redact and tokenize end to end (spec 5.4
 steps 2 to 6, 7.1, 18.1): deterministic event ids, no raw value for a tokenized or dropped field,
-actor handling, drop reasons, the two-pass analyzer mode and counters."""
+actor handling, drop reasons, the plausible observed_at range (ADR 0036), the two-pass analyzer
+mode and counters."""
 
 from __future__ import annotations
 
@@ -28,7 +29,9 @@ from carto_edge.pipeline.classify import Classifier
 from carto_edge.pipeline.model import RawRecord
 from carto_edge.pipeline.pii import RegexDetector
 from carto_edge.pipeline.pipeline import (
+    OUT_OF_RANGE_FUTURE,
     REASON_CONTRACT,
+    REASON_TOO_OLD,
     REASON_UNKNOWN_SOURCE,
     EdgePipeline,
     actor_kind,
@@ -533,3 +536,63 @@ def test_rare_values_of_a_kept_field_stay_at_the_edge() -> None:
         text = event.model_dump_json()
         assert "MKTAIL" not in text
         assert "Bob" not in text
+
+
+# --- the plausible observed_at range (ADR 0036) ------------------------------------------------
+
+
+def _at(ts: str, line: int = 1) -> RawRecord:
+    return raw_line(json.dumps({"ts": ts, "level": "info", "msg": "cart created"}), line)
+
+
+def test_a_record_older_than_retention_plus_a_day_is_dropped_and_counted() -> None:
+    pipeline = make()  # clock RECEIVED (2026-10-08 12:00), retention 30 days
+    edge = pipeline.process(_at("2026-09-07T12:00:00.000Z"))  # the lower bound itself
+    assert edge.event is not None and edge.out_of_range is None
+    old = pipeline.process(_at("2026-09-07T11:59:59.999Z", 2))
+    assert old.event is None
+    assert old.dropped_reason == REASON_TOO_OLD
+    assert old.out_of_range == REASON_TOO_OLD
+    assert pipeline.counters.out_of_range == {REASON_TOO_OLD: 1}
+    assert pipeline.counters.dropped[REASON_TOO_OLD] == 1
+    assert pipeline.counters.snapshot()["out_of_range"] == {REASON_TOO_OLD: 1}
+
+
+@pytest.mark.parametrize("ts", ["2026-10-09T12:00:00.001Z", "2099-01-01T00:00:00.000Z"])
+def test_a_future_time_becomes_the_ingest_time_and_the_event_is_kept(ts: str) -> None:
+    pipeline = make()
+    result = pipeline.process(_at(ts))
+    event = result.event
+    assert event is not None
+    assert result.out_of_range == OUT_OF_RANGE_FUTURE
+    assert event.observed_at == RECEIVED
+    assert event.observed_at_quality is ObservedAtQuality.INGEST
+    observed_ms = int(RECEIVED.timestamp() * 1000)
+    assert event.event_id == derive_ulid(observed_ms, "src_web", "app.ndjson:line:1")
+    assert pipeline.counters.out_of_range == {OUT_OF_RANGE_FUTURE: 1}
+    assert pipeline.counters.dropped_total == 0
+
+
+def test_the_upper_bound_itself_is_in_range() -> None:
+    result = make().process(_at("2026-10-09T12:00:00.000Z"))
+    assert result.event is not None and result.out_of_range is None
+    assert result.event.observed_at_quality is ObservedAtQuality.SOURCE
+
+
+def test_the_range_reads_the_pipelines_clock_at_each_record() -> None:
+    now = [RECEIVED]
+    pipeline = EdgePipeline(
+        sources=sources_file(),
+        templates=TemplateStore(),
+        classifier=Classifier(
+            ClassifySettings(), [], RegexDetector(), FieldStatsStore(sample_size=64)
+        ),
+        detector=RegexDetector(),
+        tokenizer=Tokenizer(KEYRING, "default"),
+        tenant_id="default",
+        retention_days=7,
+        clock=lambda: now[0],
+    )
+    assert pipeline.process(_at("2026-10-01T00:00:00.000Z")).event is not None
+    now[0] = datetime(2026, 10, 20, tzinfo=UTC)
+    assert pipeline.process(_at("2026-10-01T00:00:00.000Z", 2)).out_of_range == REASON_TOO_OLD

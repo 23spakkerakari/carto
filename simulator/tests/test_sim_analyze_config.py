@@ -94,7 +94,9 @@ def test_analyze_config_kinds_and_row_columns(analyze: SourcesFile) -> None:
     assert rows["kind"] == "rows"
     assert rows["table"] == PO_TABLE
     assert rows["primary_key"] == "id"
-    assert rows["timestamp_column"] == "updated_at"
+    # created_at, not updated_at: the truth times a row at the PO's creation and the linker's
+    # temporal adjacency to the payments depends on it (M2 eval follow-up).
+    assert rows["timestamp_column"] == "created_at"
     assert rows["actor_column"] == "created_by"
     assert rows["paths"] == [f"warehouse/{PO_TABLE}*.csv"]  # the CSV and, after F4, .renamed.csv
     assert by_id[SRC_SHIP_SFTP].config["kind"] == "files"

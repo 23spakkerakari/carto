@@ -94,6 +94,20 @@ def test_manifest_round_trip_preserves_field_order() -> None:
     assert dumped["created_at"] == "2026-10-08T09:00:00.000Z"
 
 
+def test_out_of_range_counts_default_to_zero_so_older_manifests_still_load() -> None:
+    """ADR 0036 added the counts after bundles of version 1 were written."""
+    data = manifest_dict()
+    assert "events_too_old" not in data["counts"]
+    counts = BundleManifest.model_validate(data).counts
+    assert (counts.events_too_old, counts.events_future) == (0, 0)
+    data["counts"] |= {"events_too_old": 3, "events_future": 1}
+    counts = BundleManifest.model_validate(data).counts
+    assert (counts.events_too_old, counts.events_future) == (3, 1)
+    data["counts"]["events_future"] = -1
+    with pytest.raises(ValidationError):
+        BundleManifest.model_validate(data)
+
+
 @pytest.mark.parametrize(
     "overrides",
     [

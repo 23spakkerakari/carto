@@ -194,13 +194,23 @@ class CircuitBreaker:
         if self._opened_at is not None or self._failures >= self._threshold:
             self._opened_at = self._clock()
 
+    def release_probe(self) -> None:
+        """Forget an unfinished probe without counting it (a cancelled call): the next caller
+        in the half-open state may probe again."""
+        self._probe_in_flight = False
+
     async def call[T](self, op: Callable[[], Awaitable[T]]) -> T:
-        """Run ``op`` through the breaker: refused when open, recorded otherwise."""
+        """Run ``op`` through the breaker: refused when open, recorded otherwise. A call ended
+        by cancellation (or another ``BaseException``) is neither a success nor a failure, but
+        it frees the half-open probe slot, so the breaker can never stay wedged half-open."""
         self.check()
         try:
             result = await op()
         except Exception:
             self.record_failure()
+            raise
+        except BaseException:
+            self.release_probe()
             raise
         self.record_success()
         return result

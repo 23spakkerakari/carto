@@ -1,0 +1,300 @@
+{
+  "$defs": {
+    "InventoryFieldPolicy": {
+      "additionalProperties": false,
+      "description": "One admin pin of the sources file (spec 8.3; ``FieldPolicyPin`` on the edge).",
+      "properties": {
+        "field": {
+          "maxLength": 512,
+          "minLength": 3,
+          "title": "Field",
+          "type": "string"
+        },
+        "field_class": {
+          "enum": [
+            "identifier",
+            "low_card_attribute",
+            "timestamp",
+            "amount",
+            "date",
+            "person_name",
+            "contact",
+            "government_id",
+            "financial",
+            "health",
+            "free_text",
+            "secret_like",
+            "unknown"
+          ],
+          "title": "Field Class",
+          "type": "string"
+        },
+        "forms": {
+          "items": {
+            "maxLength": 32,
+            "type": "string"
+          },
+          "maxItems": 16,
+          "title": "Forms",
+          "type": "array"
+        },
+        "policy": {
+          "enum": [
+            "keep",
+            "tokenize",
+            "drop"
+          ],
+          "title": "Policy",
+          "type": "string"
+        },
+        "reason": {
+          "default": "",
+          "maxLength": 256,
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "field",
+        "field_class",
+        "policy"
+      ],
+      "title": "InventoryFieldPolicy",
+      "type": "object"
+    },
+    "InventorySource": {
+      "additionalProperties": false,
+      "properties": {
+        "backfill_days": {
+          "anyOf": [
+            {
+              "maximum": 400,
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Backfill Days"
+        },
+        "config": {
+          "additionalProperties": {
+            "anyOf": [
+              {
+                "maxLength": 1024,
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "boolean"
+              },
+              {
+                "items": {
+                  "maxLength": 1024,
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "maxProperties": 64,
+          "propertyNames": {
+            "maxLength": 64
+          },
+          "title": "Config",
+          "type": "object"
+        },
+        "enabled": {
+          "default": true,
+          "title": "Enabled",
+          "type": "boolean"
+        },
+        "id": {
+          "pattern": "^[a-z][a-z0-9_]{0,63}$",
+          "title": "Id",
+          "type": "string"
+        },
+        "last_test": {
+          "anyOf": [
+            {
+              "maxLength": 1024,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Last Test"
+        },
+        "last_test_at": {
+          "anyOf": [
+            {
+              "format": "date-time",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Last Test At"
+        },
+        "schedule": {
+          "anyOf": [
+            {
+              "maxLength": 128,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Schedule"
+        },
+        "secret_ref": {
+          "anyOf": [
+            {
+              "maxLength": 1024,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Secret Ref"
+        },
+        "system_id": {
+          "pattern": "^[a-z][a-z0-9_]{0,63}$",
+          "title": "System Id",
+          "type": "string"
+        },
+        "type": {
+          "maxLength": 32,
+          "minLength": 1,
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "system_id",
+        "type"
+      ],
+      "title": "InventorySource",
+      "type": "object"
+    },
+    "InventorySystem": {
+      "additionalProperties": false,
+      "properties": {
+        "criticality": {
+          "default": "medium",
+          "pattern": "^(low|medium|high)$",
+          "title": "Criticality",
+          "type": "string"
+        },
+        "id": {
+          "pattern": "^[a-z][a-z0-9_]{0,63}$",
+          "title": "Id",
+          "type": "string"
+        },
+        "name": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Name",
+          "type": "string"
+        },
+        "owner_group": {
+          "default": "",
+          "maxLength": 128,
+          "title": "Owner Group",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "name"
+      ],
+      "title": "InventorySystem",
+      "type": "object"
+    }
+  },
+  "$id": "urn:carto:schema:edge_inventory:v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "One ``POST /internal/inventory`` body.",
+  "properties": {
+    "edge_id": {
+      "pattern": "^[A-Za-z0-9._:-]{1,128}$",
+      "title": "Edge Id",
+      "type": "string"
+    },
+    "field_policies": {
+      "items": {
+        "$ref": "#/$defs/InventoryFieldPolicy"
+      },
+      "maxItems": 4096,
+      "title": "Field Policies",
+      "type": "array"
+    },
+    "schema_version": {
+      "const": "1",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "sent_at": {
+      "format": "date-time",
+      "title": "Sent At",
+      "type": "string"
+    },
+    "sources": {
+      "items": {
+        "$ref": "#/$defs/InventorySource"
+      },
+      "maxItems": 4096,
+      "title": "Sources",
+      "type": "array"
+    },
+    "sources_file_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "title": "Sources File Sha256",
+      "type": "string"
+    },
+    "systems": {
+      "items": {
+        "$ref": "#/$defs/InventorySystem"
+      },
+      "maxItems": 1024,
+      "title": "Systems",
+      "type": "array"
+    },
+    "tenant_id": {
+      "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+      "title": "Tenant Id",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "tenant_id",
+    "edge_id",
+    "sent_at",
+    "sources_file_sha256",
+    "systems",
+    "sources"
+  ],
+  "title": "carto edge inventory (schema version 1)",
+  "type": "object"
+}

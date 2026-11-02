@@ -249,7 +249,9 @@ The one-shot `migrate` service runs `carto-core migrate` once PostgreSQL and Cli
 healthy. It creates the ClickHouse tables `events` and `event_identifiers` with the retention TTL
 (`CARTO_RETENTION__EVENTS_DAYS`, default 30, range 7 to 400; spec 14.10) and brings PostgreSQL to
 the head revision (the batch ledger and source health tables). It is idempotent: a second run
-prints `clickhouse: up to date` and `postgres: at head`. To run it by hand:
+prints `clickhouse: up to date` and `postgres: at head`. Migrations 0003 to 0006 drop and
+recreate both event tables as `ReplacingMergeTree` (ADR 0034), so a stack installed before them
+loses the events it held; load or replay them again after the upgrade. To run it by hand:
 
 ```sh
 docker compose -f deploy/compose/compose.yaml run --rm migrate
@@ -409,6 +411,7 @@ Server: through the availability group listener; carto connects with
             SELECT id, po_num, order_ref, status, warehouse_code, created_by, updated_at
             FROM carto_purchase_orders
             WHERE updated_at > :watermark
+            AND updated_at <= :upper
             ORDER BY updated_at
             LIMIT :batch
           watermark_column: updated_at
@@ -481,7 +484,9 @@ token in Vault as the whole secret value.
 | --- | --- | --- |
 | `base_url` | required | Origin only (`https://host:port`, no path, no credentials) |
 | `search` | required | The search string run through `/services/search/jobs/export` |
-| `window_minutes`, `overlap_minutes` | 5, 2 | Sliding windows and their overlap; results are deduplicated on `_cd`, `_indextime` and a hash |
+| `window_minutes`, `overlap_minutes` | 5, 2 | Sliding windows of **index time** and their overlap; results are deduplicated on `_cd`, `_indextime` and a hash. Every searched window moves the cursor, even an empty one (ADR 0035) |
+| `settle_seconds` | 60 | A window ends no later than now minus this, so events still being indexed are read on the next poll |
+| `max_event_lag_hours` | 24 | Bounds the event time searched (`earliest_time` = window start minus this). An event whose own timestamp is older than this when it is indexed is not read; raise it for sources with long forwarder backlogs |
 | `max_concurrency`, `backfill_chunk_minutes` | 2, 60 | Backfill protection for the search head |
 | `verify_tls`, `ca_file` | `true`, none | Certificate verification and a custom CA |
 | `allow_plaintext` | `false` | Admin flag to allow `http://`; leave it off |
@@ -490,9 +495,15 @@ token in Vault as the whole secret value.
 | `failure_threshold`, `breaker_reset_seconds` | 5, 60 | Circuit breaker |
 
 Splunk's extracted fields are parsed; `_raw`, `linecount` and `splunk_server` are dropped and
-`_time` is among the default timestamp fields. The test reads the token's roles and capabilities
-and reports the token as write-capable when any capability starts with `edit_`, `delete_`,
-`admin_`, `change_`, `restart_` or `output_file`.
+`_time` is among the default timestamp fields. The search may use only built-in read-only
+commands (ADR 0037): every pipeline stage and subsearch is checked when the configuration loads,
+and commands that write, send, call out or start other searches (`outputlookup`, `collect`,
+`delete`, `sendemail`, `outputcsv`, `rest`, `map`, `script`, custom commands) and macros are
+refused with the command's name. If you need a read-only command that is refused, ask for it to
+be added; there is no setting to widen the list. The test reads the token's roles and
+capabilities and reports the token as write-capable when any capability is not on the read list:
+`search`, `rtsearch`, `list_*`, `get_*`, `rest_properties_get`, `rest_apps_view`,
+`export_results_is_visible` and `pattern_detect`.
 
 #### SFTP or file-drop watch (spec 8.1.5)
 
@@ -744,8 +755,8 @@ done
 
 | Service | Metrics (Prometheus text, `GET /metrics`, internal network only; spec 16) |
 | --- | --- |
-| `edge-gateway` | Counters `carto_edge_records_total`, `carto_edge_events_total`, `carto_edge_dropped_total` (by source and reason), `carto_edge_vault_entries_total`, `carto_edge_batches_sealed_total`, `carto_edge_batches_sent_total`, `carto_edge_batches_parked_total`, `carto_edge_send_errors_total`, `carto_edge_heartbeats_total`, `carto_edge_requests_total`, `carto_edge_mtls_refused_total` (by route), `carto_edge_connector_errors_total`; gauges `carto_edge_buffer_bytes`, `carto_edge_buffer_depth`, `carto_edge_buffer_oldest_age_seconds`, `carto_edge_backpressure` (0 ok, 1 above 80%, 2 full), `carto_edge_connector_lag_seconds`, `carto_edge_key_versions` |
-| `ingest-api` | `carto_ingest_batches_total`, `carto_ingest_events_total`, `carto_ingest_duplicates_total`, `carto_ingest_errors_total`, `carto_heartbeats_total`, `carto_ingest_mtls_refused_total` |
+| `edge-gateway` | Counters `carto_edge_records_total`, `carto_edge_events_total`, `carto_edge_dropped_total` (by source and reason), `carto_edge_events_out_of_range_total` (by source and reason: `too_old` records dropped, `future` times replaced by the ingest time; ADR 0036), `carto_edge_vault_entries_total`, `carto_edge_vault_purged_total` (expired reveal vault entries removed by the hourly housekeeping), `carto_edge_batches_sealed_total`, `carto_edge_batches_sent_total`, `carto_edge_batches_parked_total`, `carto_edge_send_errors_total`, `carto_edge_heartbeats_total`, `carto_edge_requests_total`, `carto_edge_mtls_refused_total` (by route), `carto_edge_connector_errors_total`; gauges `carto_edge_buffer_bytes`, `carto_edge_buffer_depth`, `carto_edge_buffer_oldest_age_seconds`, `carto_edge_backpressure` (0 ok, 1 above 80%, 2 full), `carto_edge_connector_lag_seconds`, `carto_edge_key_versions` |
+| `ingest-api` | `carto_ingest_batches_total`, `carto_ingest_events_total`, `carto_ingest_duplicates_total`, `carto_ingest_errors_total`, `carto_heartbeats_total`, `carto_ingest_mtls_refused_total`, `carto_ingest_busy_total` (429, too many batches in flight), `carto_ingest_claims_busy_total` (503, another delivery is writing the batch), `carto_ingest_claims_taken_over_total` (stale claims rewritten), `carto_ingest_out_of_range_total` (422, an `observed_at` out of range), `carto_ingest_refused_total` (422, ClickHouse refused the data) |
 
 The stack has no Prometheus server in M1. A scraper needs a client certificate from each
 listener's CA, so name it in `--services` when you run `pki init` (step 4); a name that is not a
@@ -782,6 +793,77 @@ NDJSON log records because the dev stack has no source database (the header of
 `deploy/compose/sources.dev.yaml` describes this gap). `make dev-down` stops the stack and
 **removes every volume**, keys and vault included: never run it against a pilot.
 
+## Step 11: The console (M2)
+
+The stack now runs the console: `api` (spec 12), `worker` (the profiler and linker jobs) and
+`web` (nginx serving the console and proxying `/api/` to `api` over mutual TLS). Users open
+one origin, `https://<host>:${CARTO_WEB_PORT:-8080}`, served with the certificate in
+`deploy/compose/proxy-tls/` (`make dev` generates a self-signed pair; install your own there).
+
+### Secrets and database roles
+
+`make dev` generates, next to `pg_password` and `ch_password`, the files `pg_ingest_password`,
+`pg_app_password`, `pg_worker_password` and `oidc_client_secret` under
+`deploy/compose/secrets/`. On the first start of an empty PostgreSQL volume,
+`postgres/init-roles.sh` creates the roles `carto_ingest`, `carto_app` and `carto_worker` from
+them; `migrate` (as the owner `carto`) grants each role what it needs (spec 14.4). A volume
+created by an M1 install has no such roles: create them once by hand before the first M2 start:
+
+```
+docker compose -f deploy/compose/compose.yaml exec -T postgres psql -U carto -d carto -c \
+  "CREATE ROLE carto_ingest LOGIN PASSWORD '$(cat deploy/compose/secrets/pg_ingest_password)'" \
+  -c "CREATE ROLE carto_app LOGIN PASSWORD '$(cat deploy/compose/secrets/pg_app_password)'" \
+  -c "CREATE ROLE carto_worker LOGIN PASSWORD '$(cat deploy/compose/secrets/pg_worker_password)'"
+```
+
+then run `migrate` again so the grants apply.
+
+### Login
+
+Login is single sign-on through your identity provider (OIDC authorization code flow with PKCE,
+spec 14.1). Set in the pilot `.env`:
+
+| Variable | Meaning |
+| --- | --- |
+| `CARTO_OIDC_ISSUER` | The provider's issuer URL (`https://login.example.com/realms/carto`). The redirect URI to register at the provider is `https://<host>:<port>/api/v1/auth/callback`. |
+| `CARTO_OIDC_CLIENT_ID` | The client id registered at the provider (default `carto-console`). |
+| `deploy/compose/secrets/oidc_client_secret` | The client secret, as a file (never an environment value). |
+| `CARTO_OIDC_GROUPS_CLAIM` | The ID token claim that carries group names (default `groups`; ask the provider to include it). |
+| `CARTO_OIDC_GROUP_ROLES` | JSON mapping group names to roles `admin`, `integration_engineer`, `business_viewer`, `auditor` (spec 14.2), applied once to `role_bindings` when the table is empty. |
+| `CARTO_OIDC_BACKCHANNEL_URL`, `CARTO_OIDC_ALLOW_HTTP` | Leave unset for a real provider: the api then reaches the issuer directly over HTTPS. |
+
+A user whose groups match no binding can sign in but may do nothing (deny by default); an
+admin changes bindings in M6's Admin screen, for now in `role_bindings`. Sessions idle out after
+30 minutes and end after 12 hours (`CARTO_API__SESSION_*`). The break-glass local admin arrives
+in M6; until then the console needs the provider.
+
+In the `dev` profile the stack runs Dex (ADR 0052) under the console origin at `/dex`, with
+four users bound by email: `admin@carto.local`, `engineer@carto.local`, `viewer@carto.local`,
+`auditor@carto.local`, password `password`. Dex is never part of a customer install.
+
+### First look
+
+After the edge has forwarded for a few minutes: Systems and Setup > Sources show what the edge
+reported through `POST /internal/inventory` (configuration without secrets, health, last test,
+ADR 0050); Setup > Field policies shows every field with its class, policy and shapes (never a
+value). The worker profiles every five minutes and links after each pass; the nightly rebuild
+runs at `CARTO_PROFILER__REBUILD_HOUR_UTC` (02:00) and the full link pass at
+`CARTO_WORKER__FULL_PASS_HOUR_UTC` (03:00). Map > Review lists proposed links by confidence
+times volume; accept, reject with a reason, or mark as association; accepted transaction links
+and bridges form entity families that Entities lets you name. Every decision is audited
+(`carto-core audit-verify` walks the chain; Admin > Audit shows it to admins and auditors).
+
+### Optional LLM assist
+
+Off by default (ADR 0004). To enable label and name suggestions through a provider you
+approve: `CARTO_LLM__ENABLED=true`, `CARTO_LLM__PROVIDER=anthropic` or `openai` (any
+OpenAI-compatible chat completions endpoint), `CARTO_LLM__ENDPOINT=https://...`,
+`CARTO_LLM__MODEL=...`, and the credential in a file named by `CARTO_LLM__API_KEY_FILE` (mount
+it as a Docker secret into `api` and `worker`). The gateway sends field paths, shapes and
+template text only, never tokens or values; suggestions appear as "Suggested" until a person
+confirms them; every call is audited in `llm_calls` (ADR 0054). The network policy should allow
+`api` and `worker` egress to that endpoint only.
+
 ## Operations
 
 ### Back up the edge state volume
@@ -791,7 +873,7 @@ reveal vault and the edge audit trail exist (ADR 0014, 0025):
 
 | Path | Content | Loss means |
 | --- | --- | --- |
-| `keys/` | `local-kms.key` (local KMS only), `tenant-key.json`, `tenant-key.v<n>.json` during a rotation overlap, `rotation.json`, `vault-data-key.json`, `secrets-data-key.json`, `assertion-public.key` (M3) | Old tokens unjoinable with new ones; vault and local secrets unreadable |
+| `keys/` | `local-kms.key` (local KMS only), `tenant-key.json` until the first rotation, then `tenant-key.v<n>.json` for the active version and each version still in its overlap, `rotation.json` (names the active version), `vault-data-key.json`, `secrets-data-key.json`, `assertion-public.key` (M3) | Old tokens unjoinable with new ones; vault and local secrets unreadable |
 | `vault.sqlite` | Reveal vault: token to AES-256-GCM ciphertext of the raw value, expiring with event retention | Reveal impossible for past events |
 | `audit.ndjson` | Hash-chained record of every tokenize and reveal call | Loss of the edge's independent audit record |
 | `cursors.sqlite` | Connector positions | Sources re-read; core deduplicates |
@@ -818,8 +900,14 @@ Back up after `key init` and every key change, and at least daily for the vault 
 ### Buffer, batching and backpressure
 
 The gateway seals batches of at most 5,000 events or 5 MB (zstd), or after 2 seconds, appends them
-to `buffer.sqlite`, and only then commits the source cursor (at-least-once; core deduplicates by
-batch id, ADR 0015). The forwarder posts the oldest pending batch to `ingest-api`, retries 429,
+to `buffer.sqlite`, and only then commits the source cursor (at-least-once; core claims each
+batch id in its ledger before writing it, and the event tables merge a second copy of an event,
+ADR 0034). The gateway drops a record whose time lies more than one day past event retention
+and gives a record more than one day ahead its ingest time (ADR 0036), so a backfill deeper than
+retention loads nothing past retention. `ingest-api` refuses a batch with such an event with
+422; `carto-core load-bundle` skips such events and reports how many.
+Ledger rows older than retention plus one day are pruned hourly. The forwarder posts the oldest
+pending batch to `ingest-api`, retries 429,
 5xx and network errors with jittered backoff up to 60 seconds, and parks batches that `ingest-api`
 refuses for good (400, 403, 413, 415, 422). Parked batches count toward the cap and appear in
 `carto_edge_batches_parked_total`; this build has no command to inspect or clear them.
@@ -864,6 +952,42 @@ and that volume for the longest core outage you want to ride out. Watch
 refuses to start when the chain is broken. Check it with
 `carto-edge audit verify --file /var/lib/carto/audit.ndjson` inside the `edge-gateway` container.
 
+The chain alone cannot show that the last rows were deleted, or that a row was rewritten with
+every later hash recomputed. The gateway therefore writes an **anchor** every hour and at
+shutdown (ADR 0033): one log line with `"event": "audit.anchor"` and the last row's `seq`,
+`row_hash` and `ts`. Keep the gateway's container logs somewhere the edge host cannot rewrite
+(your log shipper, SIEM or syslog), or send the anchors straight to your syslog server:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `CARTO_AUDIT__ANCHOR_SYSLOG__HOST` | none (off) | Syslog or SIEM host that receives each anchor |
+| `CARTO_AUDIT__ANCHOR_SYSLOG__PORT` | 6514 | TCP port |
+| `CARTO_AUDIT__ANCHOR_SYSLOG__TLS` | `true` | RFC 5425 TLS (1.2 or later); `false` sends plain TCP with the same framing |
+| `CARTO_AUDIT__ANCHOR_SYSLOG__CA_FILE` | system trust store | CA bundle that signed the syslog server's certificate |
+| `CARTO_AUDIT__ANCHOR_SYSLOG__TIMEOUT_SECONDS` | 5 | Connect and send timeout |
+
+Messages are RFC 5424 (facility `log audit`, severity informational, MSGID `audit.anchor`, text
+`event=audit.anchor seq=<n> row_hash=<hex> ts=<time>`) with RFC 5425 octet-counting framing. A
+failed send is logged as `audit.anchor_syslog_failed` and the next hourly anchor is sent as
+usual; it never delays a reveal or an audit row.
+
+To check the file against anchors you trust, pass them as `<seq>:<row_hash>` (repeatable):
+
+```bash
+$COMPOSE exec edge-gateway carto-edge audit verify --file /var/lib/carto/audit.ndjson \
+  --anchor 1532:<row_hash from the 09:00 anchor> --anchor 1610:<row_hash from the 10:00 anchor>
+```
+
+Each anchor reports `holds`, `MISSING` (rows were removed after it) or `MISMATCH` (the chain was
+rewritten); any of the last two makes the command exit 1. Rows written after the newest anchor
+(at most an hour) are not covered.
+
+A power cut during an append can leave a partial last line. On its next start the gateway (or
+any `carto-edge` command that writes the audit file) moves that line to
+`audit.ndjson.torn-<UTC time>` next to the file, keeps it for inspection, and appends an
+`audit.recovered` row with its size. `audit verify` reports such a line without failing. Any
+other mismatch still stops the gateway.
+
 ## Troubleshooting
 
 | Symptom | Likely cause | What to do |
@@ -886,7 +1010,9 @@ refuses to start when the chain is broken. Check it with
 | `carto_edge_dropped_total` grows with reason `unknown_source`, or OTLP partial success counts rejected records | `carto.source_id` does not match an enabled `otlp` source | Align the collector receivers with `sources.yaml` |
 | Webhook 401, 404, 413 or 400 | Signature or timestamp, unknown source, body over 1 MB, malformed body | See the webhook section |
 | PostgreSQL authentication fails after editing `pg_password` | The image applies the password only on first initialisation | Restore the original file or reset the password inside PostgreSQL |
-| `audit chain broken at line N` and the gateway stops | `audit.ndjson` was edited or truncated | Treat as a security incident; restore from backup |
+| `audit chain broken at line N` and the gateway stops | `audit.ndjson` was edited | Treat as a security incident; restore from backup |
+| `audit verify --anchor` reports `MISSING` or `MISMATCH` | Rows were removed or the chain rewritten after that anchor | Treat as a security incident; compare with a backup and the anchors in your log store |
+| `audit.anchor_syslog_failed` in the gateway log | The syslog target is unreachable or its certificate does not verify | Check host, port and `CA_FILE`; the anchors are still in the product log |
 | `/internal/tokenize` or `/internal/reveal` answer 503 | No assertion public key | Expected until M3 |
 
 ## Security notes

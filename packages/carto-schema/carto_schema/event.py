@@ -6,6 +6,11 @@ and a length, ``template_text`` holds the template constants only, and ``attribu
 fields classified as low-cardinality and non-sensitive. Unknown keys are rejected so a newer edge
 cannot leak a field an older core would store without looking at it. Timestamps are UTC with
 millisecond precision.
+
+Field names travel in clear (attribute keys, identifier fields, dropped fields), so the model is
+core's backstop for the edge's name masking (ADR 0027, 0030): every dot-separated segment of a
+name must not look like a value, the rule :func:`name_carries_no_value` states. ``template_text``
+must not hold a run of :data:`MAX_TEMPLATE_DIGIT_RUN` or more digits.
 """
 
 from __future__ import annotations
@@ -40,6 +45,16 @@ MAX_TEMPLATE_TEXT_LEN: Final = 4096
 MAX_DROPPED_FIELDS: Final = 1024
 MAX_ATTRIBUTE_KEY_LEN: Final = 128
 MAX_FIELD_NAME_LEN: Final = 256
+MAX_NAME_SEGMENT_LEN: Final = 64
+"""A name segment longer than this is a value (the edge masks it as ``*``, ADR 0027)."""
+NAME_DIGIT_RUN: Final = 3
+"""Consecutive ASCII digits that make a name segment a value (array and map indexes stay
+below 20, so they never reach it)."""
+MAX_TEMPLATE_DIGIT_RUN: Final = 6
+"""Consecutive ASCII digits that make ``template_text`` carry a value (an order number, a
+card number); shorter numbers are protocol constants like ``HTTP/1.1 200``."""
+_NAME_DIGITS: Final = re.compile(r"[0-9]{%d}" % NAME_DIGIT_RUN)  # noqa: UP031
+_TEMPLATE_DIGITS: Final = re.compile(r"[0-9]{%d}" % MAX_TEMPLATE_DIGIT_RUN)  # noqa: UP031
 
 ULID_PATTERN: Final = re.compile(r"^[0-7][0-9A-HJKMNP-TV-Z]{25}$")
 """A ULID in its canonical form: 26 upper-case Crockford base32 characters, first one 0 to 7."""
@@ -49,14 +64,61 @@ SOURCE_ID_PATTERN: Final = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 """Shared by ``source_id`` and ``system_id``."""
 TEMPLATE_ID_PATTERN: Final = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
 
+
+def name_carries_no_value(name: str) -> bool:
+    """Whether every ``.``-separated segment of a field name passes the edge's masking rule
+    (ADR 0027): at most :data:`MAX_NAME_SEGMENT_LEN` characters, no ``@`` after the first
+    character (``@attr`` is the XML attribute convention), no run of :data:`NAME_DIGIT_RUN`
+    digits. The masked segment ``*`` and array or map indexes (``items.3``, ``map.0.key``) pass.
+    """
+    for segment in name.split("."):
+        if (
+            len(segment) > MAX_NAME_SEGMENT_LEN
+            or "@" in segment[1:]
+            or _NAME_DIGITS.search(segment) is not None
+        ):
+            return False
+    return True
+
+
+def _require_name(value: str) -> str:
+    """The message never echoes the name: it may be the value it should not carry."""
+    if not name_carries_no_value(value):
+        msg = (
+            f"a name segment looks like a value (over {MAX_NAME_SEGMENT_LEN} characters, '@' "
+            f"after its first character, or {NAME_DIGIT_RUN} digits in a row); the edge masks "
+            "such segments as '*'"
+        )
+        raise ValueError(msg)
+    return value
+
+
+def _require_template_constants(value: str) -> str:
+    if _TEMPLATE_DIGITS.search(value) is not None:
+        msg = (
+            f"template_text holds {MAX_TEMPLATE_DIGIT_RUN} or more digits in a row, which is a "
+            "value, not a template constant"
+        )
+        raise ValueError(msg)
+    return value
+
+
 Ulid = Annotated[str, Field(pattern=ULID_PATTERN.pattern)]
 TenantId = Annotated[str, Field(pattern=TENANT_ID_PATTERN.pattern)]
 SourceId = Annotated[str, Field(pattern=SOURCE_ID_PATTERN.pattern)]
 SystemId = Annotated[str, Field(pattern=SOURCE_ID_PATTERN.pattern)]
 TemplateId = Annotated[str, Field(pattern=TEMPLATE_ID_PATTERN.pattern)]
 AttributeKey = Annotated[str, Field(min_length=1, max_length=MAX_ATTRIBUTE_KEY_LEN)]
+"""An attribute key. :class:`CanonicalEvent` checks the keys before this type does, so a
+rejected key never appears in an error location (a dict key is part of the location)."""
 AttributeValue = Annotated[str, Field(max_length=MAX_ATTRIBUTE_VALUE_LEN)]
-FieldName = Annotated[str, Field(min_length=1, max_length=MAX_FIELD_NAME_LEN)]
+FieldName = Annotated[
+    str, Field(min_length=1, max_length=MAX_FIELD_NAME_LEN), AfterValidator(_require_name)
+]
+"""An identifier or dropped field name, under the same rule as :data:`AttributeKey`."""
+TemplateText = Annotated[
+    str, Field(max_length=MAX_TEMPLATE_TEXT_LEN), AfterValidator(_require_template_constants)
+]
 
 
 def _require_text_or_datetime(value: object) -> object:
@@ -185,8 +247,9 @@ class CanonicalEvent(ContractModel):
     """The canonical event the edge sends to core (spec 7.1).
 
     Field order matches the JSON in the spec so ``model_dump_json()`` reproduces it key for key.
-    ``template_text`` must contain constants only; that is enforced at the edge (spec 8.3 rule 7),
-    not by this model, which can only bound its length.
+    ``template_text`` must contain constants only; that is enforced at the edge (spec 8.3 rule 7).
+    This model bounds its length and refuses long digit runs, and refuses field names that look
+    like values, as a backstop.
     """
 
     schema_version: SchemaVersion
@@ -199,13 +262,29 @@ class CanonicalEvent(ContractModel):
     ingested_at: UtcTimestamp
     observed_at_quality: ObservedAtQuality
     template_id: TemplateId
-    template_text: Annotated[str, Field(max_length=MAX_TEMPLATE_TEXT_LEN)]
+    template_text: TemplateText
     severity: Severity | None = None
     attributes: Annotated[dict[AttributeKey, AttributeValue], Field(max_length=MAX_ATTRIBUTES)]
     identifiers: Annotated[list[Identifier], Field(max_length=MAX_IDENTIFIERS_PER_EVENT)]
     actor: Actor | None = None
     dropped_fields: list[FieldName] = Field(default_factory=list, max_length=MAX_DROPPED_FIELDS)
     redaction: Redaction
+
+    @field_validator("attributes", mode="before")
+    @classmethod
+    def _keys_carry_no_value(cls, attributes: object) -> object:
+        """Attribute keys: 1 to 128 characters and :func:`name_carries_no_value`. Checked here,
+        not per key, because pydantic puts a rejected key in the error location and the error
+        would then repeat the value the key should not carry."""
+        if isinstance(attributes, dict):
+            for key in attributes:
+                if not isinstance(key, str):
+                    continue
+                if not 1 <= len(key) <= MAX_ATTRIBUTE_KEY_LEN:
+                    msg = f"an attribute key must have 1 to {MAX_ATTRIBUTE_KEY_LEN} characters"
+                    raise ValueError(msg)
+                _require_name(key)
+        return attributes
 
     @field_validator("identifiers")
     @classmethod

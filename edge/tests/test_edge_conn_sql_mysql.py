@@ -18,7 +18,7 @@ from sqlalchemy.exc import DBAPIError
 from carto_edge.config import SourceConfig, SourceType
 from carto_edge.connectors.base import ConnectorContext, ReadOnlyStatus, ResolvedHost
 from carto_edge.connectors.sql import SqlConnector
-from carto_edge.pipeline.model import RawRecord
+from carto_edge.pipeline.model import CursorCheckpoint, RawRecord, ReadItem
 
 pytestmark = pytest.mark.integration
 
@@ -26,6 +26,7 @@ QUERY = """
 SELECT id, po_num, order_ref, status, warehouse_code, created_by, updated_at
 FROM purchase_orders
 WHERE updated_at > :watermark
+AND updated_at <= :upper
 ORDER BY updated_at
 LIMIT :batch
 """
@@ -181,10 +182,16 @@ def make(
     ), network
 
 
+async def collect_items(
+    connector: SqlConnector, cursor: dict[str, object] | None = None
+) -> list[ReadItem]:
+    return [item async for item in connector.read(cursor)]
+
+
 async def collect(
     connector: SqlConnector, cursor: dict[str, object] | None = None
 ) -> list[RawRecord]:
-    return [record async for record in connector.read(cursor)]
+    return [item for item in await collect_items(connector, cursor) if isinstance(item, RawRecord)]
 
 
 async def test_select_only_login_is_verified(mysql: dict[str, Any]) -> None:
@@ -215,14 +222,20 @@ async def test_insert_grant_is_refused(mysql: dict[str, Any]) -> None:
 async def test_polling_by_watermark(mysql: dict[str, Any]) -> None:
     connector, _network = make(mysql, "carto_ro", RO_PASSWORD, batch=2)
     try:
-        records = await collect(connector)
+        items = await collect_items(connector)
+        records = [item for item in items if isinstance(item, RawRecord)]
         assert [r.locator for r in records] == [f"purchase_orders:row:{n}" for n in range(1, 6)]
         assert records[0].fields is not None and records[0].fields["po_num"] == "88-210"
         assert isinstance(records[0].fields["updated_at"], datetime)
-        assert records[-1].commit_cursor == {
-            "watermarks": {"purchase_orders": "2026-09-23T22:04:00"}
-        }
-        assert await collect(connector, dict(records[-1].commit_cursor or {})) == []
+        # ADR 0035: the cursor travels in checkpoints and ends at :upper (the database clock
+        # minus the settle delay), past every row; a later read finds nothing.
+        assert all(r.commit_cursor is None for r in records)
+        checkpoints = [item for item in items if isinstance(item, CursorCheckpoint)]
+        assert checkpoints and checkpoints[-1].source_id == "src_wms_mysql"
+        final = checkpoints[-1].cursor["watermarks"]["purchase_orders"]
+        assert final["t"] == "datetime"
+        assert datetime.fromisoformat(final["v"]) > datetime(2026, 9, 23, 22, 4)
+        assert await collect(connector, dict(checkpoints[-1].cursor)) == []
     finally:
         await connector.close()
 

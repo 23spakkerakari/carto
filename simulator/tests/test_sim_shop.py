@@ -26,9 +26,11 @@ from carto_simulator.ground_truth import (
     read_ground_truth,
 )
 from carto_simulator.names import FIRST_NAMES, LAST_NAMES, SERVICE_ACCOUNT
+from carto_simulator.scenarios.shop_model import CounterBases
 
 START = date(2026, 9, 23)
 DAYS = 14
+SEED = 7
 LOGFMT_PAIR = re.compile(r'([A-Za-z_][A-Za-z0-9_]*)=("(?:[^"\\]|\\.)*"|[^\s"]*)')
 LOGFMT_LINE = re.compile(
     r'^[A-Za-z_][A-Za-z0-9_]*=(?:"(?:[^"\\]|\\.)*"|[^\s"]*)'
@@ -80,7 +82,7 @@ def local_utc(number: int, at: time) -> datetime:
 def run(tmp_path_factory: pytest.TempPathFactory) -> Run:
     out_dir = tmp_path_factory.mktemp("shop")
     request = GenerationRequest(
-        days=DAYS, seed=7, daily_volume=40, start_date=START, noise_rate=0.25
+        days=DAYS, seed=SEED, daily_volume=40, start_date=START, noise_rate=0.25
     )
     generate(request, out_dir)
     return Run(out_dir, read_ground_truth(out_dir), list(iter_events(out_dir)))
@@ -160,7 +162,9 @@ def test_sql_seed_executes_in_sqlite_and_matches_row_keys(run: Run) -> None:
     assert "po_number" in columns
     assert "po_num" not in columns
     ids = [row[0] for row in connection.execute("SELECT id FROM purchase_orders ORDER BY id")]
-    assert ids == list(range(1, count + 1))
+    first = CounterBases.for_seed(SEED).row
+    assert ids == list(range(first, first + count))
+    assert 600_000 <= first < 700_000
     totals = connection.execute("SELECT typeof(order_total), typeof(id) FROM purchase_orders")
     assert set(totals.fetchall()) <= {("real", "integer"), ("integer", "integer")}
 
@@ -391,7 +395,8 @@ def test_every_event_key_resolves(run: Run) -> None:
         if p.is_file() and not p.name.startswith("purchase_orders")
     }
     assert set(per_file) == log_files
-    assert sorted(row_ids) == list(range(1, len(row_ids) + 1))
+    first = CounterBases.for_seed(SEED).row
+    assert sorted(row_ids) == list(range(first, first + len(row_ids)))
     assert sorted(file_names) == [p.name for p in run.files("shipping/outbound/*.csv")]
 
 
@@ -526,10 +531,38 @@ def test_identifier_values_are_keyed_by_field_ref(run: Run) -> None:
         f'"cart_id": "{v}"' in webstore
         for v in values["sys_webstore/src_webstore_log/cart_id"][:50]
     )
-    assert values["sys_orders/src_orders_log/order_id"][0] == "4471"
-    assert values["sys_warehouse/src_wms_db/po_num"][0] == "88-210"
-    assert values["sys_shipping/src_ship_log/shipment_no"][0] == "SH-5521"
-    assert values["sys_orders/src_orders_log/merchant_ref"][0] == "X9-0442"
+    bases = CounterBases.for_seed(SEED)
+    assert min(values["sys_orders/src_orders_log/order_id"], key=int) == str(bases.order)
+    assert min(values["sys_warehouse/src_wms_db/po_num"]) == f"{bases.po // 1000}-{bases.po % 1000}"
+    assert min(values["sys_shipping/src_ship_log/shipment_no"]) == f"SH-{bases.shipment}"
+    assert min(values["sys_orders/src_orders_log/merchant_ref"]) == f"X9-{bases.merchant}"
+    assert min(values["sys_webstore/src_webstore_log/cart_id"]) == f"c-{bases.cart}"
+    shapes = {
+        "sys_webstore/src_webstore_log/cart_id": r"c-\d{8}",
+        "sys_orders/src_orders_log/order_id": r"\d{4,5}",
+        "sys_orders/src_orders_log/merchant_ref": r"X9-\d{6}",
+        "sys_warehouse/src_wms_db/po_num": r"\d{2,3}-\d{3}",
+        "sys_shipping/src_ship_log/shipment_no": r"SH-\d{7}",
+    }
+    for key, pattern in shapes.items():
+        assert all(re.fullmatch(pattern, v) for v in values[key]), key
+    # The digit runs of the dense counters never share a value (M2 eval follow-up): the forms
+    # `digits.0`/`alnum` of one identifier equal those of another only for the true link L05.
+    digit_sets = {
+        key: {int(re.sub(r"\D", "", v)) for v in values[key]}
+        for key in (*shapes, "sys_warehouse/src_wms_db/order_ref")
+    }
+    digit_sets["row_id"] = {int(row["id"]) for row in warehouse_rows(run)}
+    for a, numbers in digit_sets.items():
+        for b, others in digit_sets.items():
+            if a < b and {a, b} != {
+                "sys_orders/src_orders_log/order_id",
+                "sys_warehouse/src_wms_db/order_ref",
+            }:
+                assert not numbers & others, (a, b)
+    refs = digit_sets["sys_warehouse/src_wms_db/order_ref"]
+    shared = refs & digit_sets["sys_orders/src_orders_log/order_id"]
+    assert len(shared) / len(refs) > 0.97, "L05 holds except for the 2% clerk typos"
 
 
 def test_links_and_entities(run: Run) -> None:
@@ -546,8 +579,32 @@ def test_links_and_entities(run: Run) -> None:
         "L08",
         "L09",
         "L10",
+        "L11",
+        "L12",
+        "L13",
+        "L11b",
+        "L13b",
+        "L14",
+        "L15",
     ]
     assert links["L05"].form_b == "digits.0" and links["L05"].b.field == "order_ref"
+    for link_id in ("L11", "L12", "L13", "L11b", "L13b"):
+        link = links[link_id]
+        assert link.link_type == "bridge" and link.role == "transaction"
+        assert link.direction == "undirected" and link.entity_id == "ent_order"
+        assert link.a.source_id == link.b.source_id == "src_wms_db"
+    assert (links["L11"].a.field, links["L11"].b.field) == ("id", "po_num")
+    assert (links["L12"].b.field, links["L12"].form_b) == ("order_ref", "digits.0")
+    assert (links["L13"].a.field, links["L13"].form_a, links["L13"].b.field) == (
+        "order_ref", "digits.0", "po_num",
+    )  # fmt: skip
+    assert links["L11b"].b.field == links["L13b"].b.field == "po_number"
+    for link_id in ("L14", "L15"):
+        link = links[link_id]
+        assert link.link_type == "bridge" and link.role == "batch"
+        assert link.entity_id == "ent_shipping_file" and link.a.field == "file"
+        assert link.a.source_id == link.b.source_id == "src_ship_log"
+    assert {links["L14"].b.field, links["L15"].b.field} == {"shipment_no", "po_num"}
     composite = links["L06"]
     assert composite.link_type == "composite" and composite.manual
     rates = {c.a.field: c.agreement_rate for c in composite.components}
@@ -558,7 +615,11 @@ def test_links_and_entities(run: Run) -> None:
     assert links["L10"].role == "batch" and links["L10"].entity_id == "ent_manifest"
     entities = {e.entity_id: e for e in run.truth.entities}
     assert set(entities) == {"ent_order", "ent_shipping_file", "ent_manifest"}
-    assert len(entities["ent_order"].fields) == 10
+    assert len(entities["ent_order"].fields) == 11
+    assert any(
+        f.ref.field == "id" and f.ref.source_id == "src_wms_db"
+        for f in entities["ent_order"].fields
+    )
 
 
 def test_manifest_counts_and_hashes(run: Run) -> None:

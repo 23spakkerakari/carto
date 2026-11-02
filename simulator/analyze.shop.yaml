@@ -87,8 +87,13 @@ sources:
   # holds the rows created before the day-12 column rename (po_num) and
   # purchase_orders.renamed.csv the rows from then on (po_number); a pilot exports its table
   # the same way (one CSV per table, primary key column included). Rows are `row_change`
-  # events keyed by the primary key, timestamped by updated_at, with created_by as the actor
-  # (clerk or service account: the manual-hop signal of spec 11.1).
+  # events keyed by the primary key, timestamped by created_at, with created_by as the actor
+  # (clerk or service account: the manual-hop signal of spec 11.1). created_at, not updated_at:
+  # a snapshot export carries one row per PO, and the ground truth times that record at the
+  # PO's creation (minutes after the payment, or the clerk's keying), which is what the linker's
+  # temporal adjacency to the payments needs (spec 9.5). updated_at is the last status change,
+  # for 95% of rows the shipment in the nightly burst around 21:30 local, a day later; stamped
+  # that way the rows did not follow the payments at any lag (M2 eval follow-up).
   - id: src_wms_db
     system: sys_warehouse
     type: upload
@@ -97,11 +102,11 @@ sources:
       paths: ["warehouse/purchase_orders*.csv"]
       table: purchase_orders
       primary_key: id
-      timestamp_column: updated_at
+      timestamp_column: created_at
       actor_column: created_by
     parse:
       format: csv
-      timestamp_field: updated_at
+      timestamp_field: created_at
       timestamp_format: "%Y-%m-%d %H:%M:%S"
       timezone: America/New_York
       actor_field: created_by

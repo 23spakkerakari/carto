@@ -268,6 +268,109 @@ def build_links(rename_active: bool, rates: tuple[float, float, float]) -> list[
             ),
         ]
     )
+    # Bridges the data holds because several identifiers sit in one record (spec 9.4): the
+    # warehouse row id with its own columns, two columns of one row, and the SHIP file name a
+    # shipment line travelled in (M2 eval follow-up: the engine found them; the truth lists them).
+    wh_id = _ref(SYS_WAREHOUSE, SRC_WMS_DB, "id")
+    row_note = "Bridge inside purchase_orders rows: the primary key and one of its columns."
+    links.extend(
+        [
+            _link(
+                "L11",
+                wh_id,
+                "raw",
+                wh_po,
+                "raw",
+                "bridge",
+                "transaction",
+                "undirected",
+                ENT_ORDER,
+                row_note,
+            ),
+            _link(
+                "L12",
+                wh_id,
+                "raw",
+                wh_order_ref,
+                "digits.0",
+                "bridge",
+                "transaction",
+                "undirected",
+                ENT_ORDER,
+                row_note,
+            ),
+            _link(
+                "L13",
+                wh_order_ref,
+                "digits.0",
+                wh_po,
+                "raw",
+                "bridge",
+                "transaction",
+                "undirected",
+                ENT_ORDER,
+                "Bridge inside purchase_orders rows: two columns of one row.",
+            ),
+        ]
+    )
+    if rename_active:
+        links.extend(
+            [
+                _link(
+                    "L11b",
+                    wh_id,
+                    "raw",
+                    wh_po_renamed,
+                    "raw",
+                    "bridge",
+                    "transaction",
+                    "undirected",
+                    ENT_ORDER,
+                    f"{row_note} Rows after the rename (fault F4).",
+                ),
+                _link(
+                    "L13b",
+                    wh_order_ref,
+                    "digits.0",
+                    wh_po_renamed,
+                    "raw",
+                    "bridge",
+                    "transaction",
+                    "undirected",
+                    ENT_ORDER,
+                    "Two columns of one row, after the rename (fault F4).",
+                ),
+            ]
+        )
+    file_note = "Bridge inside 'shipment created' lines: the SHIP file is a batch key (spec 9.7)."
+    links.extend(
+        [
+            _link(
+                "L14",
+                ship_file,
+                "raw",
+                ship_no,
+                "raw",
+                "bridge",
+                "batch",
+                "undirected",
+                ENT_SHIPPING_FILE,
+                file_note,
+            ),
+            _link(
+                "L15",
+                ship_file,
+                "raw",
+                ship_po,
+                "raw",
+                "bridge",
+                "batch",
+                "undirected",
+                ENT_SHIPPING_FILE,
+                file_note,
+            ),
+        ]
+    )
     return links
 
 
@@ -281,6 +384,7 @@ def build_entities(rename_active: bool) -> list[EntityTruth]:
         ent(SYS_ORDERS, SRC_ORDERS, "order_id"),
         ent(SYS_ORDERS, SRC_ORDERS, "merchant_ref"),
         ent(SYS_PAYMENTS, SRC_PAYMENTS, "merchantRef"),
+        ent(SYS_WAREHOUSE, SRC_WMS_DB, "id"),
         ent(SYS_WAREHOUSE, SRC_WMS_DB, "order_ref", "digits.0"),
         ent(SYS_WAREHOUSE, SRC_WMS_DB, "po_num"),
     ]

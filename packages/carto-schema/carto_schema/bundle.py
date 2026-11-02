@@ -142,6 +142,24 @@ class BundleCounts(ContractModel):
     fields_kept: Annotated[int, Field(ge=0, strict=True)]
     fields_tokenized: Annotated[int, Field(ge=0, strict=True)]
     fields_dropped: Annotated[int, Field(ge=0, strict=True)]
+    events_too_old: Annotated[
+        int,
+        Field(
+            ge=0,
+            strict=True,
+            description="Records dropped because their time lay before the plausible range "
+            "(ADR 0036); also counted in records_dropped.",
+        ),
+    ] = 0
+    events_future: Annotated[
+        int,
+        Field(
+            ge=0,
+            strict=True,
+            description="Events whose time lay after the plausible range and became the ingest "
+            "time (ADR 0036); also counted in events.",
+        ),
+    ] = 0
 
 
 class BundleManifest(ContractModel):

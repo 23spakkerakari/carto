@@ -2,9 +2,13 @@
 
     carto-eval run --scenario shop --days 14 --seed 1 --sim-out sim-out/shop --out eval/reports \\
         [--predictions DIR] [--regenerate] [--tolerance 2] [--enforce-targets] \\
-        [--enforce-regressions] [--daily-volume 800]
+        [--enforce-regressions] [--daily-volume 800] \\
+        [--engine memory|stores] [--reuse-bundle] [--config FILE]
     carto-eval self-check --sim-out DIR [--scenario shop] [--days 14] [--seed 1] \\
         [--daily-volume 800]
+    carto-eval fit-weights --scenario shop --scenario people_ops [--days N] [--seed 1] \\
+        [--daily-volume 800] [--sim-out sim-out] --out eval/weights/fitted.json [--reuse-bundle]
+    carto-eval bench-linker [--systems 50] [--fields 20] [--tokens 150] [--verify-cap 100]
 
 ``run`` generates the scenario when ``DIR/ground_truth`` is missing or ``--regenerate`` is
 given, and never otherwise: an existing ground truth generated with another scenario, day count,
@@ -17,8 +21,17 @@ beyond the tolerance; 2 for a usage error, a ground truth that cannot be scored,
 file that cannot be read, an output directory the simulator refuses or a report that cannot be
 written.
 
+``run --engine memory|stores`` (M2) runs the whole path instead of reading ``--predictions``:
+analyze, load, discover, map and score (:mod:`carto_eval.driver`); ``memory`` needs no Docker,
+``stores`` uses the ClickHouse and PostgreSQL of the ``CARTO_`` settings. Without ``--engine``
+the command keeps the M0 behaviour.
+
 ``self-check`` scores the ground truth against itself and returns 0 only when the result is
 perfect (see :func:`carto_eval.scoring.self_check_problems`).
+
+``fit-weights`` fits the logistic scoring weights on the named scenarios' truth and writes a
+weights file (:mod:`carto_eval.fit_weights`; ADR 0049); ``bench-linker`` times candidate
+generation and a capped verification at the spec 17 scale (:mod:`carto_eval.bench_linker`).
 
 ``generated_at`` is taken from the wall clock here and nowhere else.
 """
@@ -31,6 +44,7 @@ from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
+from carto_common.logging import configure_logging
 from carto_eval.predictions import Predictions, PredictionsError
 from carto_eval.report import (
     HISTORY_FILE,
@@ -87,10 +101,59 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--enforce-regressions", action="store_true", help="exit 1 when a metric regressed"
     )
+    run.add_argument(
+        "--engine",
+        choices=("memory", "stores"),
+        default=None,
+        help="run analyze, load, discover and map in process (memory) or against the "
+        "configured stores (stores) instead of reading --predictions",
+    )
+    run.add_argument(
+        "--reuse-bundle",
+        action="store_true",
+        help="with --engine: keep an existing <sim-out>.carto bundle that still verifies",
+    )
+    run.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="with --engine: analyzer configuration (default simulator/analyze.<scenario>.yaml)",
+    )
 
     check = commands.add_parser("self-check", help="score the ground truth against itself")
     _add_scenario_arguments(check)
     check.add_argument("--sim-out", type=Path, required=True, help="simulator output directory")
+
+    fit = commands.add_parser("fit-weights", help="fit the scoring weights on simulator truth")
+    fit.add_argument(
+        "--scenario",
+        action="append",
+        default=None,
+        help="scenario to fit on; repeat for several (default shop and people_ops)",
+    )
+    fit.add_argument(
+        "--days",
+        type=int,
+        default=None,
+        help="days per scenario (default: 14 for shop, 28 for people_ops)",
+    )
+    fit.add_argument("--seed", type=int, default=api.DEFAULT_SEED)
+    fit.add_argument("--daily-volume", type=int, default=api.DEFAULT_DAILY_VOLUME)
+    fit.add_argument(
+        "--sim-out",
+        type=Path,
+        default=Path("sim-out"),
+        help="root of the simulator outputs (<root>/<scenario>; default sim-out)",
+    )
+    fit.add_argument("--out", type=Path, required=True, help="weights file to write")
+    fit.add_argument("--reuse-bundle", action="store_true", help="keep bundles that verify")
+
+    bench = commands.add_parser("bench-linker", help="time the linker at the spec 17 scale")
+    bench.add_argument("--systems", type=int, default=50)
+    bench.add_argument("--fields", type=int, default=20, help="candidate fields per system")
+    bench.add_argument("--tokens", type=int, default=150, help="distinct tokens per field")
+    bench.add_argument("--verify-cap", type=int, default=100, help="pairs to verify")
+    bench.add_argument("--seed", type=int, default=1)
     return parser
 
 
@@ -167,7 +230,100 @@ def _report(
     return report, scorecard
 
 
+def _run_engine(args: argparse.Namespace) -> int:
+    """``run --engine``: the M2 driver; the report it writes replaces the M0 scoring."""
+    from carto_core.bundle import BundleError  # noqa: PLC0415 - engine path only
+    from carto_core.discover import DiscoverError  # noqa: PLC0415
+    from carto_eval import driver  # noqa: PLC0415
+    from carto_eval.mapping import MappingError  # noqa: PLC0415
+
+    # The analyzer and the engine log through structlog, which prints to stdout until it is
+    # configured; the report goes to stdout, so logs go to stderr at warning and above.
+    configure_logging("carto-eval", "warning", json_output=False, stream=sys.stderr)
+    engine: driver.EngineRunner
+    try:
+        engine = driver.InMemoryEngine() if args.engine == "memory" else driver.StoresEngine()
+    except Exception as exc:  # pydantic settings errors name the field, never a secret value
+        return _fail(f"invalid settings: {type(exc).__name__}")
+    try:
+        result = driver.run(
+            args.scenario,
+            args.days,
+            args.seed,
+            args.daily_volume,
+            args.sim_out,
+            args.out,
+            engine=engine,
+            config=args.config,
+            regenerate=bool(args.regenerate),
+            reuse_bundle=bool(args.reuse_bundle),
+            tolerance_points=args.tolerance,
+        )
+    except (driver.DriverError, MappingError, DiscoverError, BundleError) as exc:
+        return _fail(str(exc))
+    except Exception as exc:  # a store or analyzer failure; the class says enough
+        return _fail(f"engine run failed: {type(exc).__name__}: {str(exc)[:300]}")
+    if result.prepared.generated is not None:
+        _emit(
+            f"generated scenario {args.scenario} into {args.sim_out} ({result.prepared.generated})"
+        )
+    _emit(result.markdown)
+    _emit(f"wrote {result.json_path}, {result.markdown_path} and {result.mapping_path}")
+    code = 0
+    failed = result.report.failed_metrics()
+    if args.enforce_targets and failed:
+        print(f"carto-eval: metrics below target: {', '.join(failed)}", file=sys.stderr)
+        code = 1
+    if args.enforce_regressions and result.report.regressions:
+        print(f"carto-eval: {len(result.report.regressions)} regression(s)", file=sys.stderr)
+        code = 1
+    return code
+
+
+def _fit_weights(args: argparse.Namespace) -> int:
+    from carto_core.bundle import BundleError  # noqa: PLC0415
+    from carto_eval import driver, fit_weights  # noqa: PLC0415
+    from carto_eval.mapping import MappingError  # noqa: PLC0415
+
+    configure_logging("carto-eval", "warning", json_output=False, stream=sys.stderr)
+    scenarios = list(args.scenario) if args.scenario else ["shop", "people_ops"]
+    try:
+        result = fit_weights.run_fit(
+            scenarios,
+            sim_root=args.sim_out,
+            out=args.out,
+            days=args.days,
+            seed=args.seed,
+            daily_volume=args.daily_volume,
+            reuse_bundle=bool(args.reuse_bundle),
+        )
+    except (fit_weights.FitError, driver.DriverError, MappingError, BundleError) as exc:
+        return _fail(str(exc))
+    for line in result.lines():
+        _emit(line)
+    return 0
+
+
+def _bench_linker(args: argparse.Namespace) -> int:
+    from carto_eval import bench_linker  # noqa: PLC0415
+
+    if min(args.systems, args.fields, args.tokens, args.verify_cap) < 1:
+        return _fail("--systems, --fields, --tokens and --verify-cap must be at least 1")
+    result = bench_linker.run_bench(
+        systems=args.systems,
+        fields_per_system=args.fields,
+        tokens_per_field=args.tokens,
+        verify_cap=args.verify_cap,
+        seed=args.seed,
+    )
+    for line in result.lines():
+        _emit(line)
+    return 0
+
+
 def _run(args: argparse.Namespace) -> int:
+    if args.engine is not None:
+        return _run_engine(args)
     prepared = _prepare(args)
     if isinstance(prepared, int):
         return prepared
@@ -250,6 +406,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         return code if isinstance(code, int) else 2
     if args.command == "self-check":
         return _self_check(args)
+    if args.command == "fit-weights":
+        return _fit_weights(args)
+    if args.command == "bench-linker":
+        return _bench_linker(args)
     return _run(args)
 
 

@@ -162,11 +162,57 @@ CARRIERS = ("UPS", "FEDEX", "USPS")
 SERVICE_LEVELS = ("GROUND", "2DAY")
 STALLED_WAREHOUSE = "DC-03"
 
-FIRST_CART_NUMBER = 88213
+FIRST_CART_NUMBER = 10_000_000
 FIRST_ORDER_ID = 4471
-FIRST_MERCHANT_NUMBER = 442
+FIRST_MERCHANT_NUMBER = 200_000
 FIRST_PO_COUNTER = 88210
-FIRST_SHIPMENT_NUMBER = 5521
+FIRST_SHIPMENT_NUMBER = 3_000_000
+FIRST_ROW_ID = 600_000
+COUNTER_OFFSET_RANGES: dict[str, int] = {
+    "cart": 5_000_000,
+    "order": 1_000,
+    "merchant": 50_000,
+    "po": 5_000,
+    "shipment": 1_000_000,
+    "row": 100_000,
+}
+"""Each dense counter starts at its ``FIRST_*`` minimum plus a per-seed offset below this bound,
+so the counters live at different magnitudes and their ``digits``/``alnum`` forms never share a
+value: cart ids are 8 digits (``c-13088213``), order ids 4 to 5 (``4471``, the ``digits.0`` of
+``order_ref`` ``SO-0004471``: link L05 by construction), merchant refs 6 (``X9-213442``), PO
+numbers ``88-210`` to ``99-999`` then ``100-000`` (``alnum`` 88,210 upwards), shipment numbers 7
+(``SH-3405521``) and warehouse row ids 6 (``600001`` upwards). The ranges stay disjoint for runs
+of fewer than about 80,000 orders (order ids below 88,210), which covers 28 days at 2,800 orders
+per weekday. Real systems' counters sit at unrelated magnitudes like this; equal dense ranges
+made the eval's engine propose exact links between unrelated ids (M2 eval, package H follow-up)."""
+
+
+@dataclass(frozen=True, slots=True)
+class CounterBases:
+    """The first value of each counter for a seed; see :data:`COUNTER_OFFSET_RANGES`."""
+
+    cart: int
+    order: int
+    merchant: int
+    po: int
+    shipment: int
+    row: int
+
+    @classmethod
+    def for_seed(cls, seed: int) -> CounterBases:
+        """Offsets drawn from a generator of their own, so the scenario's draw sequence (times,
+        people, clerks) is the same as before the offsets existed and tests can recompute them."""
+        rng = random.Random(f"shop-counters-{seed}")
+        offsets = {name: rng.randrange(bound) for name, bound in COUNTER_OFFSET_RANGES.items()}
+        return cls(
+            cart=FIRST_CART_NUMBER + offsets["cart"],
+            order=FIRST_ORDER_ID + offsets["order"],
+            merchant=FIRST_MERCHANT_NUMBER + offsets["merchant"],
+            po=FIRST_PO_COUNTER + offsets["po"],
+            shipment=FIRST_SHIPMENT_NUMBER + offsets["shipment"],
+            row=FIRST_ROW_ID + offsets["row"],
+        )
+
 
 CLERK_SHARE = 0.3
 CLERK_TYPO_RATE = 0.02

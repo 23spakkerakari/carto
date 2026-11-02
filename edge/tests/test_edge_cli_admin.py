@@ -79,9 +79,15 @@ def test_key_rotate_and_rewrap_keep_tokens_and_are_audited(
     assert run("key", "rewrap", "--state-dir", str(state)) == EXIT_FAILURE
 
     audit = verify_audit(settings.audit_file)
-    assert audit.ok and audit.rows == 2
-    actions = [json.loads(line)["action"] for line in settings.audit_file.read_text().splitlines()]
-    assert actions == ["key.rotate", "key.rewrap"]
+    assert audit.ok and audit.rows == 6
+    assert _actions(settings) == [
+        "key.rotate.intent",
+        "key.rotate.done",
+        "key.rewrap.intent",
+        "key.rewrap.done",
+        "key.rewrap.intent",
+        "key.rewrap.failed",
+    ]
 
 
 def test_key_commands_fail_cleanly_without_keys(
@@ -161,3 +167,74 @@ def test_source_test_reports_each_source_and_fails_when_one_cannot_be_enabled(
     argv = ["source", "test", "--config", str(good), "--source", "src_nope"]
     assert run(*argv, "--state-dir", str(state)) == EXIT_USAGE
     assert run("source", "test", "--state-dir", str(state)) == EXIT_USAGE  # no sources file
+
+
+def _actions(settings: EdgeSettings) -> list[str]:
+    lines = settings.audit_file.read_text(encoding="utf-8").splitlines()
+    return [json.loads(line)["action"] for line in lines]
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ("key", "rotate"),
+        ("key", "rewrap"),
+        ("secret", "set", "splunk-token"),
+        ("secret", "delete", "splunk-token"),
+    ],
+)
+def test_no_change_without_an_audit_row_first(
+    state: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    argv: tuple[str, ...],
+) -> None:
+    settings = EdgeSettings(state_dir=state)
+    monkeypatch.setattr("sys.stdin", io.StringIO(SECRET_VALUE + "\n"))
+    assert run("secret", "set", "splunk-token", "--state-dir", str(state)) == EXIT_OK
+    keys_before = {path.name: path.read_bytes() for path in settings.keys_dir.iterdir()}
+    master_before = settings.local_kms_key_file.read_bytes()
+    # A row edited in place: the chain no longer verifies, so nothing can be audited.
+    text = settings.audit_file.read_text(encoding="utf-8")
+    settings.audit_file.write_text(text.replace("splunk-token", "other-token", 1), encoding="utf-8")
+    capsys.readouterr()
+
+    monkeypatch.setattr("sys.stdin", io.StringIO("a-new-value\n"))
+    assert run(*argv, "--state-dir", str(state)) == EXIT_FAILURE
+    assert "audit" in capsys.readouterr().err
+    assert {path.name: path.read_bytes() for path in settings.keys_dir.iterdir()} == keys_before
+    assert settings.local_kms_key_file.read_bytes() == master_before
+    resolver = EdgeSecretResolver(settings, KeyManager(settings).kms)
+    try:
+        assert resolver.resolve("local://splunk-token") == SECRET_VALUE
+    finally:
+        resolver.close()
+
+
+def test_changes_write_intent_then_outcome(state: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = EdgeSettings(state_dir=state)
+    monkeypatch.setattr("sys.stdin", io.StringIO(SECRET_VALUE + "\n"))
+    assert run("secret", "set", "splunk-token", "--state-dir", str(state)) == EXIT_OK
+    assert run("key", "rotate", "--state-dir", str(state)) == EXIT_OK
+    assert run("secret", "delete", "missing", "--state-dir", str(state)) == EXIT_FAILURE
+    assert _actions(settings) == [
+        "secret.set.intent",
+        "secret.set.done",
+        "key.rotate.intent",
+        "key.rotate.done",
+        "secret.delete.intent",
+        "secret.delete.done",
+    ]
+    rows = [json.loads(line) for line in settings.audit_file.read_text().splitlines()]
+    assert rows[3]["details"]["active_version"] == 2
+    assert rows[5]["details"] == {"existed": False}
+    assert verify_audit(settings.audit_file).ok
+
+
+def test_a_failed_change_records_the_failure(state: Path) -> None:
+    settings = EdgeSettings(state_dir=state)
+    (settings.keys_dir / "rotation.json").write_text("{}", encoding="utf-8")
+    assert run("key", "rotate", "--state-dir", str(state)) == EXIT_FAILURE
+    assert _actions(settings) == ["key.rotate.intent", "key.rotate.failed"]
+    rows = [json.loads(line) for line in settings.audit_file.read_text().splitlines()]
+    assert rows[1]["details"] == {"error": "KeyManagementError"}

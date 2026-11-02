@@ -8,6 +8,8 @@ schemas).
 from __future__ import annotations
 
 import os
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -15,6 +17,7 @@ from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
 
 from carto_common.settings import (
     MAX_SECRET_REF_LENGTH,
+    OBSERVED_AT_SLACK,
     SECRET_REF_SCHEMES,
     CartoBaseSettings,
     LlmSettings,
@@ -121,6 +124,15 @@ def test_retention_rejects_unknown_fields() -> None:
         RetentionSettings(**unknown)
 
 
+def test_the_plausible_observed_at_range_is_retention_plus_a_day_back_and_a_day_ahead() -> None:
+    """ADR 0036: ``now - events_days - 1 day`` to ``now + 1 day``."""
+    now = datetime(2026, 10, 15, 12, 0, tzinfo=UTC)
+    lower, upper = RetentionSettings(events_days=45).observed_at_range(now)
+    assert lower == datetime(2026, 8, 30, 12, 0, tzinfo=UTC)
+    assert upper == datetime(2026, 10, 16, 12, 0, tzinfo=UTC)
+    assert timedelta(days=1) == OBSERVED_AT_SLACK
+
+
 # ---------------------------------------------------------------------------------------------
 # LLM (spec 9.9, 2.3 invariant 5) and telemetry (2.3 invariant 4)
 # ---------------------------------------------------------------------------------------------
@@ -134,14 +146,22 @@ def test_llm_enabled_requires_a_provider() -> None:
     assert LlmSettings(enabled=False, provider=None).enabled is False
 
 
-@pytest.mark.parametrize("provider", ["anthropic", "bedrock", "vertex"])
-def test_llm_providers_are_the_adr_0004_set(provider: str) -> None:
+@pytest.mark.parametrize("provider", ["anthropic", "openai", "bedrock", "vertex"])
+def test_llm_providers_are_the_adr_0004_set_plus_openai_compatible(provider: str) -> None:
+    """ADR 0004 names Anthropic, Bedrock and Vertex; plan M2 decision 12 adds any
+    OpenAI-compatible endpoint as the adapter most self-hosted deployments speak."""
     assert LlmSettings(enabled=True, provider=provider).provider == provider  # type: ignore[arg-type]
 
 
 def test_llm_rejects_other_providers() -> None:
     with pytest.raises(ValidationError):
-        LlmSettings(enabled=True, provider="openai")  # type: ignore[arg-type]
+        LlmSettings(enabled=True, provider="cohere")  # type: ignore[arg-type]
+
+
+def test_llm_credential_comes_from_a_file_not_a_value() -> None:
+    settings = LlmSettings(api_key_file=Path("/run/secrets/llm_key"))
+    assert settings.api_key_file == Path("/run/secrets/llm_key")
+    assert "api_key" not in {name for name in LlmSettings.model_fields if name != "api_key_file"}
 
 
 def test_llm_endpoint_must_be_https() -> None:

@@ -435,7 +435,7 @@ def test_cli_generate_and_list_are_unchanged(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     assert cli.main(["list"]) == 0
-    assert capsys.readouterr().out.strip() == "shop"
+    assert capsys.readouterr().out.split() == ["people_ops", "shop"]
     argv = ["generate", "--days", "1", "--daily-volume", "2", "--out", str(tmp_path / "g")]
     assert cli.main(argv) == 0
     assert (tmp_path / "g/warehouse/purchase_orders.csv").is_file()

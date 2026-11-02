@@ -1,7 +1,8 @@
 """``carto-ctl pki init`` and ``pki issue``: a CA per listener and the certificates it signs
 (spec 14.4; ADR 0031, 0032).
 
-Each listener named in ``--services`` (:data:`LISTENER_CLIENTS`: ``ingest-api``, ``edge-gateway``)
+Each listener named in ``--services`` (:data:`LISTENER_CLIENTS`: ``ingest-api``, ``edge-gateway``,
+``api``)
 gets its own CA. That CA signs the listener's server certificate and the client certificates of
 the services allowed to call it, and the listener trusts nothing else, so a caller meant for
 another listener is refused during the TLS handshake. Every certificate also names its service
@@ -77,12 +78,19 @@ __all__ = [
     "pki_issue",
 ]
 
-DEFAULT_SERVICES: Final[tuple[str, ...]] = ("edge-gateway", "ingest-api", "otel-collector", "api")
+DEFAULT_SERVICES: Final[tuple[str, ...]] = (
+    "edge-gateway",
+    "ingest-api",
+    "otel-collector",
+    "api",
+    "web",
+)
 DEFAULT_OUT: Final = Path("pki")
 MAX_DAYS: Final = 3650
 LISTENER_CLIENTS: Final[dict[str, tuple[str, ...]]] = {
     "ingest-api": ("edge-gateway",),
     "edge-gateway": ("otel-collector", "collector", "proxy", "api"),
+    "api": ("web",),
 }
 """Each listener and the roles its CA signs client certificates for (ADR 0031)."""
 _SERVICE_PATTERN: Final = re.compile(r"^[a-z][a-z0-9-]{0,62}$")

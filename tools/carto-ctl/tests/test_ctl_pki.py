@@ -124,6 +124,7 @@ def test_the_listener_table_matches_the_adr() -> None:
     assert LISTENER_CLIENTS == {
         "ingest-api": ("edge-gateway",),
         "edge-gateway": ("otel-collector", "collector", "proxy", "api"),
+        "api": ("web",),
     }
 
 

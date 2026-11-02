@@ -26,7 +26,9 @@ the candidate has been placed). When ``add`` seals a batch, the candidate as it 
 current record (whose event now starts the next batch) is committed after the append; when a
 flush seals the partial batch, the current candidate is committed. A source with nothing pending
 (say every record of a call was dropped by the pipeline) commits its candidate at the end of the
-call. So a record whose event sits in a partial batch never commits its cursor.
+call. So a record whose event sits in a partial batch never commits its cursor. A
+:class:`~carto_edge.pipeline.model.CursorCheckpoint` (ADR 0035) takes the place of such a record:
+it skips the pipeline and only becomes the candidate, so it is committed under the same rule.
 
 A batch the buffer refuses is lost from memory: a full buffer
 (:class:`~carto_edge.pipeline.buffer.BufferFullError`, reason ``buffer_full``) or any other
@@ -66,7 +68,7 @@ from carto_edge.connectors.base import Cursor
 from carto_edge.metrics import EdgeMetrics
 from carto_edge.pipeline.buffer import BufferFullError, DiskBuffer
 from carto_edge.pipeline.ingestor import BackpressureState, IngestOutcome
-from carto_edge.pipeline.model import PipelineResult, RawRecord
+from carto_edge.pipeline.model import CursorCheckpoint, PipelineResult, RawRecord, ReadItem
 from carto_edge.runtime import EdgeRuntime
 from carto_edge.state import CursorError, CursorStore
 from carto_schema.event import SCHEMA_VERSION, CanonicalEvent
@@ -240,6 +242,7 @@ class _Tally:
     records: Counter[str] = field(default_factory=Counter)
     events: Counter[str] = field(default_factory=Counter)
     dropped: Counter[tuple[str, str]] = field(default_factory=Counter)
+    out_of_range: Counter[tuple[str, str]] = field(default_factory=Counter)
 
 
 class Ingestor:
@@ -272,6 +275,8 @@ class Ingestor:
         self._cursors = cursors
         self._link = link
         self._metrics = metrics
+        if runtime.metrics is None:  # the runtime's housekeeping counts into the same registry
+            runtime.metrics = metrics
         self._clock = clock if clock is not None else _utc_now
         self._flush_seconds = link.batch_flush_seconds
         self._lock = threading.Lock()
@@ -282,24 +287,41 @@ class Ingestor:
 
     # -- IngestorLike -------------------------------------------------------------------------
 
-    def ingest(self, records: Iterable[RawRecord], *, durable: bool = False) -> IngestOutcome:
+    def ingest(self, records: Iterable[ReadItem], *, durable: bool = False) -> IngestOutcome:
         """Process ``records`` in order; full batches are durably buffered before this returns.
 
         ``durable`` (push receivers): also seal and append the partial batches of every source
         these records belong to, so the caller's acknowledgement covers only what is on disk; a
-        refused batch shows up as ``buffer_full`` in the outcome."""
+        refused batch shows up as ``buffer_full`` in the outcome. Checkpoints among the records
+        are placed in order without going through the pipeline (ADR 0035)."""
         outcome = IngestOutcome()
-        processed = [(record, self._runtime.pipeline.process(record)) for record in records]
-        if not processed:
+        items: list[tuple[ReadItem, PipelineResult | None]] = [
+            (
+                item,
+                None
+                if isinstance(item, CursorCheckpoint)
+                else self._runtime.pipeline.process(item),
+            )
+            for item in records
+        ]
+        if not items:
             return outcome
+        processed = [
+            (item, result)
+            for item, result in items
+            if isinstance(item, RawRecord) and result is not None
+        ]
         outcome.vault_entries = self._runtime.write_vault_entries(
             result for _record, result in processed
         )
         tally = _Tally()
         with self._lock:
             reported: set[str] = set()
-            for record, result in processed:
-                self._place(record, result, outcome, tally, reported)
+            for item, result in items:
+                if isinstance(item, CursorCheckpoint):
+                    self._place_checkpoint(item)
+                elif result is not None:
+                    self._place(item, result, outcome, tally, reported)
             if durable:
                 self._seal_touched(processed, outcome, tally, reported)
             for source_id in reported:
@@ -371,6 +393,8 @@ class Ingestor:
         label = source_id if known else UNKNOWN_SOURCE_LABEL
         outcome.records += 1
         tally.records[label] += 1
+        if result.out_of_range is not None:
+            tally.out_of_range[label, result.out_of_range] += 1
         if result.event is not None:
             outcome.events += 1
             tally.events[label] += 1
@@ -402,6 +426,17 @@ class Ingestor:
         if record.commit_cursor is not None:
             state.candidate = record.commit_cursor
             state.uses_cursor = True
+
+    def _place_checkpoint(self, checkpoint: CursorCheckpoint) -> None:
+        """A cursor with no record: it becomes the candidate unless the source lost a batch
+        (then the reader must restart from the committed cursor) or is unknown."""
+        if self._runtime.pipeline.source(checkpoint.source_id) is None:
+            return
+        state = self._state(checkpoint.source_id)
+        if state.lost:
+            return
+        state.candidate = checkpoint.cursor
+        state.uses_cursor = True
 
     def _store(
         self,
@@ -517,3 +552,7 @@ class Ingestor:
             self._metrics.inc("carto_edge_events_total", count, source_id=label)
         for (label, reason), count in tally.dropped.items():
             self._metrics.inc("carto_edge_dropped_total", count, source_id=label, reason=reason)
+        for (label, reason), count in tally.out_of_range.items():
+            self._metrics.inc(
+                "carto_edge_events_out_of_range_total", count, source_id=label, reason=reason
+            )

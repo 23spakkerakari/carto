@@ -38,7 +38,8 @@ The `redact` processor in `carto_common.logging` applies, in order, the rules do
    structlog's `ProcessorFormatter`, so records from uvicorn, httpx, database drivers and stray
    `logging.getLogger()` calls pass through the same redaction. Libraries that install their own
    handlers must be told not to (uvicorn: `log_config=None`).
-7. **Non-string scalars pass through.** Identifiers must be logged as strings or not at all;
+7. **Non-string scalars pass through** (amended by ADR 0040: numbers of four or more digits are
+   masked unless their key names a metric). Identifiers must be logged as strings or not at all;
    counts stay numbers. The Section 18.3 leak test catches violations.
 
 ## Alternatives

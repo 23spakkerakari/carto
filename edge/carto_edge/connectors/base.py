@@ -10,6 +10,10 @@ Spec 8.1 fixes the shape::
         async def read(self, cursor: Cursor | None) -> AsyncIterator[RawRecord]: ...
         async def backfill(self, start: datetime, end: datetime) -> AsyncIterator[RawRecord]: ...
 
+``read`` may also yield :class:`~carto_edge.pipeline.model.CursorCheckpoint` items between
+records (ADR 0035): a cursor with no record, committed once everything before it is durable, so
+a cursor moves across stretches of the source that held nothing.
+
 There is no write method anywhere in this package, and the Semgrep rule in ``tools/semgrep``
 fails CI on calls that could write (spec 2.3 invariant 1). A connector gets credentials only
 through :class:`SecretResolver` (spec 14.3: fetched at use, never stored or logged) and may
@@ -27,7 +31,7 @@ from typing import Any, ClassVar, Protocol, runtime_checkable
 from pydantic import BaseModel, ConfigDict
 
 from carto_edge.config import SourceConfig
-from carto_edge.pipeline.model import RawRecord
+from carto_edge.pipeline.model import RawRecord, ReadItem
 
 __all__ = [
     "ConnectorConfig",
@@ -139,7 +143,9 @@ class ConnectorContext:
 
 @runtime_checkable
 class ReadConnector(Protocol):
-    """Spec 8.1. ``read`` and ``backfill`` are async generators of :class:`RawRecord`."""
+    """Spec 8.1. ``read`` is an async generator of :class:`RawRecord` and, between records,
+    :class:`~carto_edge.pipeline.model.CursorCheckpoint` (ADR 0035); ``backfill`` yields records
+    only (it has no cursor)."""
 
     type: ClassVar[str]
     source: SourceConfig
@@ -148,7 +154,7 @@ class ReadConnector(Protocol):
 
     async def test(self) -> TestResult: ...
 
-    def read(self, cursor: Cursor | None) -> AsyncIterator[RawRecord]: ...
+    def read(self, cursor: Cursor | None) -> AsyncIterator[ReadItem]: ...
 
     def backfill(self, start: datetime, end: datetime) -> AsyncIterator[RawRecord]: ...
 

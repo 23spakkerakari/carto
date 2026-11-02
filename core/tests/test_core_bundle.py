@@ -1,10 +1,12 @@
-"""Bundle verification and loading (spec 8.1.1, ADR 0022, ADR 0015): a synthetic bundle built
-exactly as carto_schema.bundle describes verifies and streams; any tampering, extra file or
-bad line is refused without echoing content; loads are chunked, derived-id batches that are
-idempotent through the ledger; the CLI wraps both."""
+"""Bundle verification and loading (spec 8.1.1, ADR 0022, ADR 0034, ADR 0036): a synthetic
+bundle built exactly as carto_schema.bundle describes verifies and streams; any tampering,
+extra file or bad line is refused without echoing content; loads are chunked, derived-id
+batches that are idempotent through the ledger's claims and skip events outside the plausible
+range; the CLI wraps both."""
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 from collections.abc import Sequence
@@ -14,20 +16,26 @@ from pathlib import Path
 import pytest
 import zstandard
 
+import carto_core.bundle as bundle_module
 from carto_common.crypto import SigningKey, b64url_encode
 from carto_common.ids import derive_ulid
+from carto_common.settings import RetentionSettings
 from carto_core import cli
 from carto_core.bundle import (
     BundleError,
     LoadResult,
+    MetadataResult,
     VerifiedBundle,
     bundle_source_id,
     iter_events,
     load_bundle,
+    read_bundle_metadata,
+    record_bundle_metadata,
     verify_bundle,
 )
-from carto_core.db.clickhouse import WriteResult
-from carto_core.ingest.ledger import InMemoryBatchLedger, LedgerEntry
+from carto_core.db.clickhouse import WriterError, WriteResult
+from carto_core.ingest.ledger import ClaimState, InMemoryBatchLedger, LedgerEntry, LedgerError
+from carto_core.metadata import InMemoryMetadataStore
 from carto_schema.bundle import (
     DATA_FILES,
     EVENTS_FILE,
@@ -38,16 +46,21 @@ from carto_schema.bundle import (
     SIGNATURE_FILE,
     TEMPLATES_FILE,
     BundleCounts,
+    BundleField,
     BundleManifest,
     BundleSignature,
     BundleSourceSummary,
+    BundleTemplate,
     FileDigest,
+    ShapeShare,
 )
-from carto_schema.event import CanonicalEvent
+from carto_schema.event import CanonicalEvent, EventKind
 
 CREATED_AT = datetime(2026, 10, 8, 9, 30, 0, 250000, tzinfo=UTC)
 BUNDLE_ID = "01K71Y5B2XQ0M4N8P3R6S9T1VW"
 BASE_MS = 1_790_000_000_000
+LOAD_NOW = datetime(2026, 10, 8, 10, 0, tzinfo=UTC)
+"""The load clock: the events of BASE_MS (2026-09-21) are inside the plausible range."""
 
 
 class FakeWriter:
@@ -60,6 +73,11 @@ class FakeWriter:
 
     def ping(self) -> bool:
         return True
+
+
+@pytest.fixture(autouse=True)
+def _fixed_load_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(bundle_module, "_utcnow", lambda: LOAD_NOW)
 
 
 def _events(count: int, tenant_id: str = "default") -> list[CanonicalEvent]:
@@ -289,7 +307,7 @@ def test_blank_lines_and_crlf_are_tolerated(tmp_path: Path) -> None:
     assert list(iter_events(verify_bundle(path))) == events
 
 
-# --- loading (ADR 0015) ------------------------------------------------------------------------
+# --- loading (ADR 0034, 0036) ---------------------------------------------------------------
 
 
 def test_load_writes_chunks_with_derived_batch_ids(bundle: Path) -> None:
@@ -326,7 +344,7 @@ def test_an_interrupted_load_resumes_at_the_first_missing_chunk(bundle: Path) ->
     writer, ledger = FakeWriter(), InMemoryBatchLedger()
     created_at_ms = int(CREATED_AT.timestamp() * 1000)
     first = derive_ulid(created_at_ms, BUNDLE_ID, "0")
-    ledger.record(LedgerEntry("default", first, "bundle_x", 5, datetime.now(UTC)))
+    ledger.complete(LedgerEntry("default", first, "bundle_x", 5, LOAD_NOW), LOAD_NOW)
     result = load_bundle(verified, writer, ledger, chunk_size=5)
     assert result == LoadResult(events_written=7, chunks=3, duplicates=1)
     assert [len(batch) for batch in writer.batches] == [5, 2]
@@ -337,6 +355,62 @@ def test_default_chunk_size_is_the_ingest_batch_cap(bundle: Path) -> None:
     writer = FakeWriter()
     assert load_bundle(verified, writer, InMemoryBatchLedger()).chunks == 1
     assert len(writer.batches[0]) == 12
+
+
+def test_events_outside_the_plausible_range_are_skipped_and_counted(tmp_path: Path) -> None:
+    """ADR 0036: an event older than retention would be deleted on arrival, a future one is
+    refused by ingest-api; a bundle loads its recent part and reports the rest."""
+    events = _events(6)
+    old = LOAD_NOW - timedelta(days=40)
+    ahead = LOAD_NOW + timedelta(days=2)
+    events[1] = events[1].model_copy(update={"observed_at": old})
+    events[2] = events[2].model_copy(update={"observed_at": old})
+    events[4] = events[4].model_copy(update={"observed_at": ahead})
+    path = tmp_path / "ranged.carto"
+    _write_bundle(path, events)
+    writer, ledger = FakeWriter(), InMemoryBatchLedger()
+    result = load_bundle(verify_bundle(path), writer, ledger, chunk_size=4)
+    assert result == LoadResult(events_written=3, chunks=2, duplicates=0, too_old=2, future=1)
+    assert [[event.event_id for event in batch] for batch in writer.batches] == [
+        [events[0].event_id, events[3].event_id],
+        [events[5].event_id],
+    ]
+    assert [entry.event_count for entry in ledger.entries] == [4, 2], "chunks cut before"
+
+
+def test_the_load_range_follows_the_configured_retention(bundle: Path) -> None:
+    writer = FakeWriter()
+    result = load_bundle(
+        verify_bundle(bundle),
+        writer,
+        InMemoryBatchLedger(),
+        retention=RetentionSettings(events_days=7),
+    )
+    assert result.too_old == 12 and result.events_written == 0
+    assert writer.batches == [[]]
+
+
+def test_a_chunk_another_load_is_writing_stops_the_load(bundle: Path) -> None:
+    verified = verify_bundle(bundle)
+    ledger = InMemoryBatchLedger()
+    created_at_ms = int(CREATED_AT.timestamp() * 1000)
+    first = derive_ulid(created_at_ms, BUNDLE_ID, "0")
+    entry = LedgerEntry("default", first, "bundle_x", 5, LOAD_NOW - timedelta(seconds=10))
+    assert ledger.claim(entry, LOAD_NOW - timedelta(days=1)).state is ClaimState.CLAIMED
+    with pytest.raises(LedgerError, match="chunk 0 is being loaded by another run"):
+        load_bundle(verified, FakeWriter(), ledger, chunk_size=5)
+
+
+def test_a_failed_chunk_write_releases_its_claim(bundle: Path) -> None:
+    class Failing(FakeWriter):
+        def write_events(self, events: Sequence[CanonicalEvent]) -> WriteResult:
+            raise WriterError("ClickHouse insert failed: DatabaseError")
+
+    ledger = InMemoryBatchLedger()
+    with pytest.raises(WriterError):
+        load_bundle(verify_bundle(bundle), Failing(), ledger, chunk_size=5)
+    assert ledger.rows == ()
+    assert load_bundle(verify_bundle(bundle), FakeWriter(), ledger, chunk_size=5).chunks == 3
 
 
 @pytest.mark.parametrize("size", [0, -1, 5001])
@@ -362,11 +436,14 @@ def test_cli_verify_bundle(bundle: Path, capsys: pytest.CaptureFixture[str]) -> 
 def test_cli_load_bundle_is_idempotent(
     bundle: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    writer, ledger = FakeWriter(), InMemoryBatchLedger()
-    monkeypatch.setattr(cli, "_open_stores", lambda _settings: (writer, ledger))
+    writer, ledger, metadata = FakeWriter(), InMemoryBatchLedger(), InMemoryMetadataStore()
+    monkeypatch.setattr(
+        cli, "_open_stores", lambda _settings: contextlib.nullcontext((writer, ledger, metadata))
+    )
     assert cli.main(["load-bundle", "--bundle", str(bundle), "--chunk-size", "5"]) == 0
     first = capsys.readouterr().out
     assert "12 events written" in first and "3 chunks" in first
+    assert "0 templates and 0 fields recorded" in first, "the fixture bundle lists none"
     assert cli.main(["load-bundle", "--bundle", str(bundle), "--chunk-size", "5"]) == 0
     second = capsys.readouterr().out
     assert "0 events written" in second and "3 chunks already" in second
@@ -383,3 +460,109 @@ def test_cli_load_bundle_rejects_a_tampered_bundle_before_opening_stores(
     _flip_byte(bundle / MANIFEST_MD_FILE)
     assert cli.main(["load-bundle", "--bundle", str(bundle)]) == 1
     assert "rejected" in capsys.readouterr().err
+
+
+# --- templates.json and fields.json into the metadata store (ADR 0056) ---------------------------
+
+
+def _metadata_bundle(bundle: Path, tmp_path: Path) -> VerifiedBundle:
+    """A verified bundle whose data directory holds real templates and fields files. The
+    manifest is the fixture's: record_bundle_metadata trusts verify_bundle, which ran before."""
+    verified = verify_bundle(bundle)
+    data = tmp_path / "metadata.carto"
+    data.mkdir()
+    templates = [
+        BundleTemplate(
+            template_id="tpl_4f1c9a",
+            system_id="sys_warehouse",
+            template_text="INSERT purchase_orders",
+            kind=EventKind.ROW_CHANGE,
+            count=12,
+            first_seen=CREATED_AT - timedelta(days=2),
+            last_seen=CREATED_AT - timedelta(days=1),
+        )
+    ]
+    fields = [
+        BundleField(
+            field_ref="sys_warehouse/tpl_4f1c9a/po_num",
+            system_id="sys_warehouse",
+            template_id="tpl_4f1c9a",
+            path="po_num",
+            field_class="identifier",
+            policy="tokenize",
+            pinned=False,
+            count=12,
+            distinct_estimate=12,
+            null_rate=0.0,
+            top_shapes=[ShapeShare(shape="99-999", share=1.0)],
+            forms=["raw", "alnum"],
+        ),
+        BundleField(
+            field_ref="sys_warehouse/tpl_4f1c9a/customer_name",
+            system_id="sys_warehouse",
+            template_id="tpl_4f1c9a",
+            path="customer_name",
+            field_class="person_name",
+            policy="drop",
+            pinned=True,
+            reason="admin pin",
+            count=12,
+            distinct_estimate=11,
+            null_rate=0.0,
+            top_shapes=[],
+        ),
+    ]
+    (data / TEMPLATES_FILE).write_text(
+        json.dumps([json.loads(t.model_dump_json()) for t in templates]), encoding="utf-8"
+    )
+    (data / FIELDS_FILE).write_text(
+        json.dumps([json.loads(f.model_dump_json()) for f in fields]), encoding="utf-8"
+    )
+    return VerifiedBundle(manifest=verified.manifest, signature=verified.signature, path=data)
+
+
+def test_record_bundle_metadata_upserts_templates_and_fields(bundle: Path, tmp_path: Path) -> None:
+    verified = _metadata_bundle(bundle, tmp_path)
+    templates, fields = read_bundle_metadata(verified)
+    assert [t.template_id for t in templates] == ["tpl_4f1c9a"]
+    assert [f.path for f in fields] == ["po_num", "customer_name"]
+    store = InMemoryMetadataStore()
+    assert record_bundle_metadata(verified, store) == MetadataResult(templates=1, fields=2)
+    (template,) = store.list_templates("default")
+    assert (template.template_text, template.kind, template.count) == (
+        "INSERT purchase_orders",
+        "row_change",
+        12,
+    )
+    po_num = store.get_field("default", "sys_warehouse/tpl_4f1c9a/po_num")
+    assert po_num is not None
+    assert (po_num.field_class, po_num.policy, po_num.forms) == (
+        "identifier",
+        "tokenize",
+        ("raw", "alnum"),
+    )
+    assert po_num.shapes == (("99-999", 1.0),)
+    assert po_num.count == 12 and po_num.distinct_estimate == 0, "the profiler owns distinct"
+    name = store.get_field("default", "sys_warehouse/tpl_4f1c9a/customer_name")
+    assert name is not None and (name.policy, name.pinned) == ("drop", True)
+    assert po_num.first_seen == verified.manifest.created_at
+    # A re-run that wrote no events records fields again but never doubles the template count.
+    assert record_bundle_metadata(verified, store, templates=False) == MetadataResult(0, 2)
+    assert store.list_templates("default")[0].count == 12
+    assert record_bundle_metadata(verified, store).templates == 1
+    assert store.list_templates("default")[0].count == 24
+
+
+def test_bundle_metadata_files_must_be_the_contract(bundle: Path, tmp_path: Path) -> None:
+    verified = _metadata_bundle(bundle, tmp_path)
+    (verified.path / FIELDS_FILE).write_text(
+        json.dumps([{"field_ref": "x", "sample_values": ["SECRET-VALUE-4471"]}]), encoding="utf-8"
+    )
+    with pytest.raises(BundleError) as info:
+        read_bundle_metadata(verified)
+    assert FIELDS_FILE in str(info.value)
+    assert "SECRET-VALUE" not in str(info.value)
+    (verified.path / FIELDS_FILE).unlink()
+    (verified.path / TEMPLATES_FILE).unlink()
+    assert read_bundle_metadata(verified) == ([], [])
+    assert record_bundle_metadata(verified, InMemoryMetadataStore()) == MetadataResult(0, 0)

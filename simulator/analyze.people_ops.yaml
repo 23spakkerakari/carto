@@ -1,0 +1,246 @@
+# simulator/analyze.people_ops.yaml: offline analyzer configuration for simulator scenario C
+# ("people_ops", spec 19; plan M2 package H).
+#
+# Every source is an `upload` source whose paths are globs relative to `--input`, the simulator's
+# output directory:
+#
+#   carto-edge analyze --config simulator/analyze.people_ops.yaml --input sim-out/people_ops \
+#       --out sim-out/people_ops.carto --state-dir sim-out/people_ops.edge-state --locator-map
+#
+# Point it at the per-system directories only. ground_truth/ holds the synthetic PII and the
+# transaction mapping in clear and is never an input (simulator/README.md). Source and system
+# ids equal ground_truth/sources.json so the eval harness can resolve the locator map (ADR 0006).
+#
+# Parse hints follow simulator/README.md (scenario C): ISO 8601 UTC in the onboarding and LMS
+# logs; naive Europe/London time in the legacy onboarding log (timestamp key `time`, severity
+# `lvl`); naive America/New_York time in the HRIS, payroll and SKU row sources. No source runs a
+# skewed clock in scenario C. Credentials do not exist here: local files are read, nothing is
+# written.
+
+systems:
+  - id: sys_onboarding
+    name: Onboarding
+    owner_group: People Systems
+    criticality: high
+  - id: sys_onboarding_legacy
+    name: Onboarding (legacy)
+    owner_group: People Systems
+    criticality: medium
+  - id: sys_hris
+    name: HRIS
+    owner_group: HR Operations
+    criticality: high
+  - id: sys_payroll
+    name: Payroll
+    owner_group: Payroll
+    criticality: high
+  - id: sys_lms
+    name: Training LMS
+    owner_group: Learning and Development
+    criticality: medium
+  - id: sys_sku_sheets
+    name: Product sheets
+    owner_group: Product Data
+    criticality: medium
+  - id: sys_sku_master
+    name: SKU master
+    owner_group: Product Data
+    criticality: high
+
+sources:
+  # Main onboarding application log: one JSON object per line, one file per UTC day. Carries
+  # candidate_id with the work email ("onboarding started": the C12 bridge) and the name with
+  # the start date that HR keys into the HRIS (the C04 composite).
+  - id: src_onboarding_log
+    system: sys_onboarding
+    type: upload
+    config:
+      kind: log
+      paths: ["onboarding/onboarding-*.ndjson"]
+    parse:
+      format: ndjson
+      timestamp_field: ts
+      timestamp_format: iso8601
+      timezone: UTC
+      message_field: msg
+      severity_field: level
+
+  # The acquired company's onboarding log: logfmt with its own field names (cand_ref, applicant,
+  # mail, startDt as %d/%m/%Y), naive Europe/London time under the key `time`, severity `lvl`.
+  - id: src_legacy_log
+    system: sys_onboarding_legacy
+    type: upload
+    config:
+      kind: log
+      paths: ["onboarding_legacy/legacy-hires-*.log"]
+    parse:
+      format: logfmt
+      timestamp_field: time
+      timestamp_format: "%Y-%m-%d %H:%M:%S"
+      timezone: Europe/London
+      message_field: msg
+      severity_field: lvl
+
+  # HRIS employees table, exported as CSV with a header row (the SQL seed next to it is for a
+  # pilot's source database). Rows are `row_change` events keyed by the primary key, timestamped
+  # by created_at, with created_by as the actor: HR clerks, the manual-hop signal of spec 11.1.
+  - id: src_hris_db
+    system: sys_hris
+    type: upload
+    config:
+      kind: rows
+      paths: ["hris/employees.csv"]
+      table: employees
+      primary_key: id
+      timestamp_column: created_at
+      actor_column: created_by
+    parse:
+      format: csv
+      timestamp_field: created_at
+      timestamp_format: "%Y-%m-%d %H:%M:%S"
+      timezone: America/New_York
+      actor_field: created_by
+
+  # Payroll: one CSV export per weekday with the worker rows entered that day, keyed by
+  # worker_number; entered_at is the keying time and entered_by the payroll clerk. The week-3
+  # backlog shows as three missing daily files and one file that carries their rows.
+  - id: src_payroll_csv
+    system: sys_payroll
+    type: upload
+    config:
+      kind: rows
+      paths: ["payroll/payroll_*.csv"]
+      table: workers
+      primary_key: worker_number
+      timestamp_column: entered_at
+      actor_column: entered_by
+    parse:
+      format: csv
+      timestamp_field: entered_at
+      timestamp_format: "%Y-%m-%d %H:%M:%S"
+      timezone: America/New_York
+      actor_field: entered_by
+
+  # Training LMS log: one JSON object per line, one file per UTC day; the enrollment line carries
+  # the username with the work email it was derived from (the C11 bridge) and the provisioning
+  # service account as the actor.
+  - id: src_lms_log
+    system: sys_lms
+    type: upload
+    config:
+      kind: log
+      paths: ["lms/lms-*.ndjson"]
+    parse:
+      format: ndjson
+      timestamp_field: ts
+      timestamp_format: iso8601
+      timezone: UTC
+      message_field: msg
+      severity_field: level
+      actor_field: actor
+
+  # Product spreadsheet: the CSV exported every Friday with the week's new SKUs, keyed by
+  # legacy_sku and timestamped by added_at. No actor column exists in the sheet.
+  - id: src_sku_export_csv
+    system: sys_sku_sheets
+    type: upload
+    config:
+      kind: rows
+      paths: ["sku_sheets/sku_sheet_*.csv"]
+      table: sku_sheet
+      primary_key: legacy_sku
+      timestamp_column: added_at
+    parse:
+      format: csv
+      timestamp_field: added_at
+      timestamp_format: "%Y-%m-%d %H:%M:%S"
+      timezone: America/New_York
+
+  # SKU master table, exported as CSV; created_by is the product clerk who re-keyed the sheet.
+  - id: src_sku_master_db
+    system: sys_sku_master
+    type: upload
+    config:
+      kind: rows
+      paths: ["sku_master/sku_master.csv"]
+      table: sku_master
+      primary_key: id
+      timestamp_column: created_at
+      actor_column: created_by
+    parse:
+      format: csv
+      timestamp_field: created_at
+      timestamp_format: "%Y-%m-%d %H:%M:%S"
+      timezone: America/New_York
+      actor_field: created_by
+
+# Admin pins (spec 8.3). Names are PII and are tokenized whatever the classifier says; the pins
+# add the phonetic form (spec 8.4 `phonetic.k`) on the four name fields the composite links C04,
+# C05 and C08 of the ground truth use, so the linker can match a hand-keyed name without any
+# name leaving the edge in clear.
+field_policies:
+  - field: sys_onboarding/*/candidate_name
+    field_class: person_name
+    policy: tokenize
+    forms: ["phonetic"]
+    reason: "C04 composite link: the name HR reads from the onboarding export"
+  - field: sys_onboarding_legacy/*/applicant
+    field_class: person_name
+    policy: tokenize
+    forms: ["phonetic"]
+    reason: "C05 composite link: the legacy system's name field (no 'name' in the field name)"
+  - field: sys_hris/*/full_name
+    field_class: person_name
+    policy: tokenize
+    forms: ["phonetic"]
+    reason: "C04/C05/C08 composite links: keyed by HR clerks with typos; phonetic forms survive"
+  - field: sys_payroll/*/legal_name
+    field_class: person_name
+    policy: tokenize
+    forms: ["phonetic"]
+    reason: "C08 composite link: keyed by payroll clerks from the HRIS row"
+  # E-mail addresses are contact PII and dropped by default (spec 8.3 rule 2). The LMS derives
+  # its username from the work email, and the edge has no email-local-part form (spec 8.4), so
+  # the enrollment line carries the email itself and both ends are pinned to the `raw` form
+  # only: the exact links C09 and C10 join on identical tokens and no address leaves in clear.
+  - field: sys_onboarding/*/work_email
+    field_class: contact
+    policy: tokenize
+    forms: ["raw"]
+    reason: "C09 exact link: the LMS provisioner keys enrollments by this address"
+  - field: sys_onboarding_legacy/*/mail
+    field_class: contact
+    policy: tokenize
+    forms: ["raw"]
+    reason: "C10 exact link: the legacy system's work email field"
+  - field: sys_lms/*/user_email
+    field_class: contact
+    policy: tokenize
+    forms: ["raw"]
+    reason: "C09/C10 exact links: the address the username was derived from"
+  - field: sys_lms/*/username
+    field_class: contact
+    policy: tokenize
+    forms: ["raw"]
+    reason: "Derived from the work email (first.last.<marker>): PII whatever the detector says"
+  # Product descriptions are free text by shape (spec 8.3 rule 7 would keep only template
+  # constants), but they are the only field the SKU master shares with the sheet besides the
+  # price: the C14 composite joins on their `alnum` and phonetic forms. Pinned as identifiers
+  # with those two forms so they are tokenized, never kept, and never dropped.
+  - field: sys_sku_sheets/*/description
+    field_class: identifier
+    policy: tokenize
+    forms: ["alnum", "phonetic"]
+    reason: "C14 composite link: the sheet description a product clerk re-keys into the master"
+  - field: sys_sku_master/*/description
+    field_class: identifier
+    policy: tokenize
+    forms: ["alnum", "phonetic"]
+    reason: "C14 composite link: the re-keyed description (3% typos; phonetic forms survive)"
+  # Low-cardinality identifiers (ADR 0026, 0029): scenario C has no batch keys and every
+  # identifier field (candidate, employee, worker and SKU ids) has one value per record, so no
+  # pin of that kind is needed; the digit-run rule of ADR 0029 covers short runs anyway.
+
+# The analyzer opens no network connection; no private range needs to be allowed.
+network:
+  allowed_source_cidrs: []

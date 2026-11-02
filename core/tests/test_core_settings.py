@@ -37,13 +37,16 @@ def test_defaults_require_tls_and_listen_on_loopback() -> None:
     assert settings.clickhouse.password_file is None
     assert settings.postgres.host == "127.0.0.1"
     assert settings.postgres.port == 5432
-    assert settings.postgres.sslmode == "require"
+    # verify-full: encryption without checking the server name is no defence against a
+    # man in the middle; only the Compose stack sets "disable" on its internal network.
+    assert settings.postgres.sslmode == "verify-full"
     assert settings.postgres.user == "carto_ingest"
     assert settings.ingest.host == "127.0.0.1"
     assert settings.ingest.port == 8443
     assert settings.ingest.require_client_cert is True
     assert settings.ingest.max_body_bytes == 5 * MIB
-    assert settings.ingest.max_decompressed_bytes == 64 * MIB
+    assert settings.ingest.max_decompressed_bytes == 16 * MIB
+    assert settings.ingest.max_inflight_batches == 8
     assert settings.retention.events_days == 30
     assert settings.log_level == "info"
     assert settings.log_json is True

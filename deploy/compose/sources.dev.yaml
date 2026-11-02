@@ -87,7 +87,10 @@ sources:
       paths: ["/data/sim/warehouse/purchase_orders.ndjson"]
     parse:
       format: ndjson
-      timestamp_field: updated_at
+      # created_at is when the purchase order came into being; updated_at is its last status
+      # change, which for most rows is the nightly shipment and would move the PO timeline a
+      # day (simulator/analyze.shop.yaml says the same).
+      timestamp_field: created_at
       timestamp_format: "%Y-%m-%d %H:%M:%S"
       timezone: America/New_York
       actor_field: created_by

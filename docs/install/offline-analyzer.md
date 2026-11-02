@@ -76,7 +76,9 @@ Ids match `^[a-z][a-z0-9_]{0,63}$`; `criticality` is `low`, `medium` (default) o
       primary_key: id
     parse:
       format: csv
-      timestamp_field: updated_at
+      # The time the row came into being, not its last status change: a row whose updated_at
+      # is set by a nightly job would place every record on the night it shipped.
+      timestamp_field: created_at
       timestamp_format: "%Y-%m-%d %H:%M:%S"
       timezone: America/New_York
       actor_field: created_by
@@ -173,12 +175,21 @@ carto-edge analyze --config analyze.yaml --input ./exports --out bundle.carto
 | `--tenant-id ID` | `default` | Tenant key domain written into the bundle |
 | `--producer TEXT` | `carto-edge analyze <version>` | Free text recorded in the manifest |
 | `--locator-map` | off | Evaluation only; never on your data (below) |
+| `--as-of TIME` | the run time | Check event times against this ISO 8601 date or time with an offset, instead of now (below) |
 
 The run makes two passes (ADR 0017): the first reads everything to gather field statistics and
 templates, the second classifies every field with the statistics of the whole input and writes
 the events, so one bundle has one consistent decision per field. It prints counts and paths
 only, never a value. Exit codes: 0 the bundle was written, 1 the run failed (keys unusable, an
 input over the limits, a write failed), 2 a usage or configuration error.
+
+Event times must lie in a plausible range (ADR 0036): no older than event retention plus one
+day (`CARTO_RETENTION__EVENTS_DAYS`, default 30), no more than one day ahead. An older record is
+dropped with reason `too_old`, since core would delete it on arrival; a later one keeps its event
+with the time it was read, marked `observed_at_quality: ingest`, because a time in the future is
+almost always a misread date. The range is read against the run time. Exports analyzed long after
+they were taken lose their old part; to analyze them as of the day they were exported, pass
+`--as-of 2026-10-08` (the manifest notes it). `MANIFEST.md` and the summary give both counts.
 
 The analyzer also reads the `CARTO_` settings of the edge (`carto_edge.config.EdgeSettings`).
 Offline, the ones that matter are the classifier thresholds (`CARTO_CLASSIFY__DISTINCT_THRESHOLD`,
@@ -199,11 +210,14 @@ make analyze SCENARIO=shop
 
 ```sh
 uv run carto-edge analyze --config simulator/analyze.shop.yaml --input sim-out/shop \
-  --out sim-out/shop.carto --state-dir sim-out/shop.edge-state --locator-map
+  --out sim-out/shop.carto --state-dir sim-out/shop.edge-state --locator-map \
+  --as-of "$(uv run carto-sim as-of --out sim-out/shop)"
 ```
 
 It passes `--locator-map` because the simulator run is scored by the evaluation harness; a
-customer run never does.
+customer run never does. Simulator runs have fixed dates (from 2026-09-23 by default), so it
+passes `--as-of` with the start of the day after the run, which `carto-sim as-of` reads from the
+run's manifest. `make bench` and `make bench-gateway` do the same.
 
 ### From the container image
 
@@ -263,8 +277,9 @@ order number or e-mail address from your own data; `zstd` is the Zstandard comma
 There should be no match:
 
 ```sh
-zstd -dc bundle.carto/events.ndjson.zst | grep -c 'SO-0004471'
-grep -c 'SO-0004471' bundle.carto/fields.json bundle.carto/templates.json bundle.carto/MANIFEST.md
+# replace SO-0004828 with an order reference that exists in your own export
+zstd -dc bundle.carto/events.ndjson.zst | grep -c 'SO-0004828'
+grep -c 'SO-0004828' bundle.carto/fields.json bundle.carto/templates.json bundle.carto/MANIFEST.md
 ```
 
 Look hardest for identifiers that repeat across many records: a nightly batch number, a carrier
@@ -341,6 +356,44 @@ The signature key is generated for the run and discarded, so the signature prove
 not changed after it was written, not who wrote it. Origin comes from your hand-over: send the
 bundle over a channel you trust and, separately (by phone or a second channel), the
 `manifest_sha256` value from `signature.json` so we can confirm we received your bundle.
+
+## Map discovery over a bundle (M2)
+
+Loading a bundle gives core the events; discovery turns them into proposed links without an
+edge install. With the stack's databases reachable (`CARTO_` settings as for `load-bundle`):
+
+```
+carto-core discover --bundle customer.carto --out discovery/
+```
+
+verifies and loads the bundle (a bundle already loaded is skipped by the ledger), runs one full
+profile pass and one full link pass as of the bundle's last event, and writes `discovery/`:
+`engine_links.json` (every proposed link with its type, role, direction, score, both ends as
+system, template and field path, and the evidence features), `engine_entities.json` (the
+families) and `discover_summary.json` (counts, the settings in effect, the weights version).
+Nothing in these files is a token or a value. The same links appear in the console's
+Map > Review when the `api` and `web` services run.
+
+### The go/no-go gate (spec 21)
+
+On the review call, fill a CSV with the links the partner confirms by hand, independently of
+what the engine proposed, one row per link:
+
+```
+system_a,field_a,system_b,field_b
+sys_warehouse,po_num,sys_shipping,po_num
+sys_orders,merchant_ref,sys_payments,merchantRef
+```
+
+then
+
+```
+carto-core gate-report --predictions discovery/ --confirmed confirmed.csv --out gate.md
+```
+
+lists, for each confirmed link, the engine's top three proposals for `field_a` and whether
+`field_b` is among them, and ends with the share found. The gate asks for at least half; below
+that, stop and review with the founder before M3.
 
 ## Re-running
 

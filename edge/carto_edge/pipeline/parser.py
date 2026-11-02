@@ -43,9 +43,16 @@ from carto_edge.config import (
     RecordFormat,
     SourceConfig,
 )
-from carto_edge.pipeline.model import ParsedRecord, RawRecord
+from carto_edge.pipeline.model import FieldClass, ParsedRecord, RawRecord
 from carto_edge.pipeline.parse.access_log import AccessLogParser
-from carto_edge.pipeline.parse.common import flatten, key_signature, safe_path, utf8_len
+from carto_edge.pipeline.parse.common import (
+    SegmentPath,
+    clean_text,
+    flatten,
+    key_signature,
+    safe_path,
+    utf8_len,
+)
 from carto_edge.pipeline.parse.csv import CsvHeader, CsvParser, looks_like_csv_header
 from carto_edge.pipeline.parse.detect import FormatDetector
 from carto_edge.pipeline.parse.json import parse_json
@@ -103,6 +110,7 @@ class _Draft:
     level: str | None = None
     mine_message: str | None = None
     param_prefix: str = "msg."
+    structure: dict[str, SegmentPath] | None = None
 
 
 class RecordParser:
@@ -163,7 +171,9 @@ class RecordParser:
             get_logger(component="parser").warning(
                 "parse_internal_error",
                 source_id=raw.source_id,
-                locator_kind=raw.locator.partition(":")[0],
+                # The record kind, a fixed set: an upload locator starts with the customer's
+                # file name, which product logs never carry (spec 2.3 invariant 7).
+                record_kind=raw.kind.value,
                 error=type(exc).__name__,
             )
             return ParseFailure(REASON_INTERNAL)
@@ -177,7 +187,7 @@ class RecordParser:
             return self._parse_fields(raw)
         if text is None or not text.strip():
             return ParseFailure(REASON_EMPTY)
-        return self._parse_text(raw, text.rstrip("\r\n"))
+        return self._parse_text(raw, clean_text(text.rstrip("\r\n")))
 
     # -- records that arrive as fields --------------------------------------------------------
 
@@ -186,12 +196,12 @@ class RecordParser:
             return ParseFailure(REASON_EMPTY)
         flat = flatten(raw.fields)
         fields = flat.fields
-        message = raw.text.strip() if raw.text and raw.text.strip() else None
+        message = clean_text(raw.text.strip()) if raw.text and raw.text.strip() else None
         if message is None:
             message = self._take_message(fields)
         if not fields and message is None:
             return ParseFailure(REASON_EMPTY)
-        hint = raw.template_hint.strip() if raw.template_hint else ""
+        hint = clean_text(raw.template_hint.strip()) if raw.template_hint else ""
         draft = _Draft(
             fields=fields,
             template_text=hint or None,
@@ -199,6 +209,7 @@ class RecordParser:
             parse_format=FORMAT_FIELDS,
             notes=flat.notes,
             mine_message=message,
+            structure=flat.structure,
         )
         return self._finish(raw, draft)
 
@@ -249,6 +260,7 @@ class RecordParser:
                 parse_format=fmt.value,
                 notes=flat.notes,
                 mine_message=self._take_message(fields),
+                structure=flat.structure,
             )
         if fmt == RecordFormat.XML:
             xml = parse_xml(line)
@@ -260,6 +272,7 @@ class RecordParser:
                 top_keys=(),
                 parse_format=fmt.value,
                 notes=xml.notes,
+                structure=xml.structure,
             )
         if fmt == RecordFormat.LOGFMT:
             pairs = parse_logfmt(line)
@@ -334,14 +347,20 @@ class RecordParser:
         config = self._config
         system_id = raw.system_id
         top_keys: Sequence[str]
+        name_classes: dict[str, FieldClass] = {}
         if self._names is None:
             fields = _safe_fields(draft.fields)
             top_keys = tuple(safe_path(key) for key in draft.top_keys)
         else:
             gated = self._names.apply(
-                system_id, draft.fields, draft.top_keys, self._trusted_for(raw)
+                system_id,
+                draft.fields,
+                draft.top_keys,
+                self._trusted_for(raw),
+                structure=draft.structure,
+                record_id=f"{raw.source_id}:{raw.locator}",
             )
-            fields, top_keys = gated.fields, gated.top_keys
+            fields, top_keys, name_classes = gated.fields, gated.top_keys, gated.name_classes
         template_text = draft.template_text
         if draft.mine_message is not None:
             mined, params = self._templates.mine(system_id, draft.mine_message)
@@ -396,6 +415,7 @@ class RecordParser:
             actor_path=actor_path,
             parse_format=draft.parse_format,
             parse_notes=draft.notes,
+            name_classes=name_classes,
         )
 
     def _trusted_for(self, raw: RawRecord) -> frozenset[str]:

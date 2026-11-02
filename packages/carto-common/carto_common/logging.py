@@ -14,8 +14,9 @@ Rules, in the order :func:`redact` applies them to every event (key names first,
 1. **Secret-named keys** keep the key and replace the value with ``[REDACTED]``, whatever its
    type. The name is lower-cased and split into segments on ``_``, ``-``, ``.``, whitespace,
    camelCase and letter-digit boundaries. The key matches when any segment is one of
-   ``password``, ``passwd``, ``secret``, ``token``, ``apikey``, ``authorization``, ``cookie``,
-   ``session``, ``bearer`` or ``credential`` (singular or plural), or when two adjacent segments
+   ``password``, ``passwd``, ``passphrase``, ``pass``, ``pwd``, ``secret``, ``token``,
+   ``apikey``, ``authorization``, ``auth``, ``cookie``, ``session``, ``bearer``, ``credential``,
+   ``signature`` or ``sig`` (singular or plural), or when two adjacent segments
    are ``api key``, ``private key``, ``client secret`` or ``access key``, unless the last
    segment is a qualifier naming a count, a reference or a property rather than the value
    itself (:data:`SECRET_KEY_QUALIFIERS`: ``count``, ``ref``, ``name``, ``type``, ``ttl`` and
@@ -37,7 +38,8 @@ Rules, in the order :func:`redact` applies them to every event (key names first,
    characters of ``[A-Za-z0-9+/=_-]`` with at least three of the classes upper, lower, digit
    and other, and Shannon entropy of at least 3.5 bits per character) -> ``[HIGH_ENTROPY]``; a
    secret word followed by ``=`` or ``:`` and a value in free text (``password=hunter2``,
-   ``Authorization: Basic ...``, ``?token=...&``) -> the value becomes ``[REDACTED]`` unless an
+   ``Authorization: Basic ...``, ``?token=...&``, ``{"password": "..."}``, ``;PWD=...;``) -> the
+   value becomes ``[REDACTED]`` unless an
    earlier rule already masked it (``token=[JWT]`` and ``secret=[HIGH_ENTROPY]`` stay); lower-case
    hex runs of eight or more characters holding both a letter and a digit (UUIDs, content hashes,
    the simulator's ``mk<8 hex>`` leak markers of spec 18.3) -> their shape; and
@@ -53,11 +55,18 @@ Rules, in the order :func:`redact` applies them to every event (key names first,
    ``event_id``, spec 5.4, which operators grep for) inside a token are kept as they are, so
    ``user:1234:t1.<token>`` logs as ``AAAA:9999:[TOKEN]`` and
    ``event_id=01ARZ3NDEKTSV4RRFFQ69G5FAV`` stays readable.
-4. Non-string scalars (``None``, ``bool``, ``int``, ``float``) pass through untouched. Dates and
-   times are rendered ISO 8601 (which the identifier rule exempts), ``bytes`` are decoded and
-   masked as text, enums contribute their value, pydantic models and dataclasses are walked like
-   mappings, sets and tuples become lists, and any other object is ``str()``-ed and masked, so
-   the JSON renderer never falls back to ``repr`` on something the processor has not inspected.
+4. **Numbers** (``int`` and ``float``, not ``bool``) are values until their key says otherwise
+   (ADR 0040). A number whose decimal text holds four or more digits, leading zeros not counted,
+   logs as its shape (``customer_id=48812213`` -> ``"99999999"``, ``total=207.81`` ->
+   ``"999.99"``) unless the last segment of its own key is a metric qualifier
+   (:data:`METRIC_KEY_QUALIFIERS`: ``count``, ``ms``, ``seconds``, ``bytes``, ``port``,
+   ``events``, ``version`` and the like). The qualifier covers the number directly under the
+   key only, never the items of a list. Smaller numbers, ``None`` and ``bool`` pass through.
+5. Other types: dates and times are rendered ISO 8601 (which the identifier rule exempts),
+   ``bytes`` are decoded and masked as text, enums contribute their value, pydantic models and
+   dataclasses are walked like mappings, sets and tuples become lists, and any other object is
+   ``str()``-ed and masked, so the JSON renderer never falls back to ``repr`` on something the
+   processor has not inspected.
    Two keys that mask to the same shape stay two keys: the second becomes ``<shape>#2``.
 
 The walk is bounded to :data:`MAX_DEPTH` nested containers. Anything deeper, and any top-level
@@ -74,6 +83,7 @@ character classes is hidden only when its key, URL position or ``key=value`` con
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import datetime as dt
 import enum
@@ -82,9 +92,12 @@ import logging
 import math
 import re
 import sys
+import threading
+import warnings
 from collections import Counter
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from collections.abc import Set as AbstractSet
+from types import TracebackType
 from typing import Any, Final, TextIO, cast
 
 import structlog
@@ -104,6 +117,7 @@ __all__ = [
     "JWT_MASK",
     "MASKS",
     "MAX_DEPTH",
+    "METRIC_KEY_QUALIFIERS",
     "PEM_MASK",
     "QUIET_LIBRARY_LOGGERS",
     "REDACTED",
@@ -112,10 +126,12 @@ __all__ = [
     "SECRET_KEY_QUALIFIERS",
     "SECRET_KEY_WORDS",
     "TOKEN_MASK",
+    "WARNINGS_LOGGER",
     "configure_logging",
     "get_logger",
     "identifier_shape",
     "is_drop_key",
+    "is_metric_key",
     "is_secret_key",
     "mask_string",
     "redact",
@@ -166,6 +182,12 @@ _SECRET_WORDS: Final = (
     "session",
     "bearer",
     "credential",
+    "pwd",
+    "passphrase",
+    "pass",
+    "auth",
+    "signature",
+    "sig",
 )
 SECRET_KEY_WORDS: Final = frozenset(_SECRET_WORDS) | frozenset(f"{word}s" for word in _SECRET_WORDS)
 """Key segments that mark a key as holding a secret (spec 8.3 name hints plus session ids)."""
@@ -194,6 +216,7 @@ SECRET_KEY_QUALIFIERS: Final = frozenset(
         "expires",
         "expiry",
         "ttl",
+        "scheme",
     }
 )
 """Last segments that make a secret-named key describe the secret rather than hold it."""
@@ -212,6 +235,49 @@ DROP_KEYS: Final = frozenset(
     }
 )
 """Normalised key names whose values are never logged (spec 14.12: no bodies, no raw values)."""
+
+METRIC_KEY_QUALIFIERS: Final = frozenset(
+    {
+        # counts and tallies of the product's own objects
+        "count",
+        "counts",
+        "attempt",
+        "attempts",
+        "retries",
+        "rows",
+        "records",
+        "events",
+        "batches",
+        "samples",
+        # units
+        "bytes",
+        "ms",
+        "seconds",
+        "second",
+        "days",
+        # sizes and limits
+        "depth",
+        "size",
+        "len",
+        "length",
+        "limit",
+        # process and network
+        "port",
+        "status",
+        "pid",
+        "version",
+        "versions",
+    }
+)
+"""Last key segments that make a number a metric the operator needs in clear (rule 4, ADR 0040).
+
+A number under any other key is a value and is masked once it has four or more digits: order
+totals, customer numbers and card numbers are numbers too. ``total`` and ``num`` are not here on
+purpose (``total=207.81`` is an amount, ``order_num=4471`` an identifier); a count is logged as
+``*_count``."""
+
+NUMBER_MIN_DIGITS: Final = 4
+"""Digits (leading zeros not counted) from which a number under a non-metric key is masked."""
 
 HIGH_ENTROPY_MIN_LENGTH: Final = 32
 HIGH_ENTROPY_MIN_CLASSES: Final = 3
@@ -236,14 +302,22 @@ _CARTO_TOKEN: Final = re.compile(r"t[0-9]{1,4}\.[A-Za-z0-9_-]{22}")
 _AWS_KEY: Final = re.compile(r"(?:AKIA|ASIA)[0-9A-Z]{16}")
 # scheme://user:password@host -> the password only; the user name helps the operator.
 _URL_USERINFO: Final = re.compile(r"(?<=://)([^/\s@:]+):([^/\s@]+)(?=@)")
-# password=..., api-key: ..., Authorization: Basic ..., ?token=...&: the value after the secret
-# word, up to whitespace or a separator (or a whole quoted string). "token_count=3" and
-# "secret_ref=vault://x" do not match because "_" follows the word, not "=" or ":"; a value that
-# an earlier rule already turned into a mask ("token=[JWT]") keeps the more specific mask.
+# password=..., api-key: ..., Authorization: Basic ..., ?token=...&, {"password": "..."},
+# ;PWD={...};: the value after the secret word, up to whitespace or a separator (or a whole
+# quoted or braced string). The word may be closed by a quote, escaped or not, before the
+# separator, so JSON objects and Python reprs match. "token_count=3" and "secret_ref=vault://x"
+# do not match because "_" follows the word, not "=" or ":". The short words pwd, pass, auth and
+# sig must start a word or a camelCase hump ("dbPass=", not "bypass=" or "oauth="). A value that
+# an earlier rule already turned into a mask ("token=[JWT]") keeps the more specific mask. Every
+# quantifier is either bounded or stops at a fixed character, so the scan stays linear on
+# attacker-written text (spec 2.3 invariant 8).
 _SECRET_ASSIGNMENT: Final = re.compile(
-    r"(?i)((?:api|private|access)[\s_.-]?key|client[\s_.-]?secret|password|passwd|secret|token"
-    r"|authorization|cookie|session|bearer|credentials?)(\s*[=:]\s*)(?!\[[A-Z_]+\])"
-    r"""(?:(?:basic|bearer|digest)\s+)?(?:"[^"\n]*"|'[^'\n]*'|[^\s,;&]+)"""
+    r"(?i)((?:api|private|access)[\s_.-]?key|client[\s_.-]?secret|password|passwd|passphrase"
+    r"|secret|token|authorization|cookie|session|bearer|credentials?|signature"
+    r"|(?<![A-Za-z])(?:pwd|pass|auth|sig)|(?-i:(?<=[a-z0-9])(?:P(?i:wd|ass)|A(?i:uth)|S(?i:ig))))"
+    r"""(\\?["']?[ \t]{0,16}[=:][ \t]{0,16}|[ \t]{1,16}(?=\\?["']))(?!\\?["']?\[[A-Z_]+\])"""
+    r"""(?:(?:basic|bearer|digest)[ \t]{1,16})?"""
+    r"""(?:\\"[^"\n]*\\"|"[^"\n]*"|'[^'\n]*'|\{[^}\n]*\}|[^\s,;&]+)"""
 )
 # The look-behind stops a DSN user name (postgres://carto@db.internal) from reading as a mailbox.
 _EMAIL: Final = re.compile(r"(?<![\w.%+/-])[\w.%+-]+@[\w.-]+\.[A-Za-z]{2,}(?![\w-])")
@@ -294,6 +368,12 @@ def is_secret_key(name: str) -> bool:
     if any(segment in SECRET_KEY_WORDS for segment in segments):
         return True
     return any(pair in SECRET_KEY_PAIRS for pair in itertools.pairwise(segments))
+
+
+def is_metric_key(name: str) -> bool:
+    """True when the key's last segment names a metric, so its number is logged as is (rule 4)."""
+    segments = _key_segments(name)
+    return bool(segments) and segments[-1] in METRIC_KEY_QUALIFIERS
 
 
 def is_drop_key(name: str) -> bool:
@@ -417,12 +497,30 @@ def _unique_key(taken: Mapping[str, object], masked: str) -> str:
     return f"{masked}#{suffix}"
 
 
+def _mask_number(value: float, *, metric: bool) -> object:
+    """``value`` as a plain number, or its shape when it is not a metric and holds
+    :data:`NUMBER_MIN_DIGITS` or more digits (rule 4)."""
+    value = int(value) if isinstance(value, int) else float(value)  # drops IntEnum and the like
+    if metric or (
+        isinstance(value, int)
+        and -(10 ** (NUMBER_MIN_DIGITS - 1)) < value < 10 ** (NUMBER_MIN_DIGITS - 1)
+    ):
+        return value
+    try:
+        text = repr(value)
+    except ValueError:  # an int past the interpreter's digit limit is certainly not a metric
+        return REDACTION_ERROR
+    if sum(char.isdecimal() for char in text.lstrip("-0.")) < NUMBER_MIN_DIGITS:
+        return value
+    return identifier_shape(text)
+
+
 def _walk_field(name: str, value: object, depth: int) -> object:
     if is_drop_key(name):
         return DROPPED
     if is_secret_key(name):
         return REDACTED
-    return _walk(value, depth)
+    return _walk(value, depth, metric=is_metric_key(name))
 
 
 def _walk_mapping(mapping: Mapping[Any, Any], depth: int) -> dict[str, object]:
@@ -433,12 +531,19 @@ def _walk_mapping(mapping: Mapping[Any, Any], depth: int) -> dict[str, object]:
     return out
 
 
-def _walk(value: object, depth: int) -> object:
-    """Return the loggable form of ``value`` nested inside ``depth`` containers (rules 3, 4)."""
+def _walk(value: object, depth: int, *, metric: bool = False) -> object:
+    """Return the loggable form of ``value`` nested inside ``depth`` containers (rules 3 to 5).
+
+    ``metric`` is true when ``value`` sits directly under a key naming a metric (rule 4).
+    """
     if depth > MAX_DEPTH:
         return REDACTION_ERROR
-    if value is None or isinstance(value, int | float):
+    if value is None or isinstance(value, bool):
         return value
+    if isinstance(value, enum.Enum):
+        return _walk(value.value, depth, metric=metric)
+    if isinstance(value, int | float):
+        return _mask_number(value, metric=metric)
     if isinstance(value, str):
         return mask_string(value)
     if isinstance(value, bytes | bytearray | memoryview):
@@ -446,9 +551,7 @@ def _walk(value: object, depth: int) -> object:
     if isinstance(value, dt.date | dt.time):
         return value.isoformat()
     if isinstance(value, dt.timedelta):
-        return value.total_seconds()
-    if isinstance(value, enum.Enum):
-        return _walk(value.value, depth)
+        return _mask_number(value.total_seconds(), metric=metric)
     if isinstance(value, BaseModel):
         return _walk_mapping(value.model_dump(), depth)
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
@@ -463,9 +566,10 @@ def _walk(value: object, depth: int) -> object:
 def redact(logger: WrappedLogger, method_name: str, event_dict: EventDict) -> EventDict:
     """structlog processor enforcing spec 2.3 invariant 7 on every event (see module docs).
 
-    Returns a new event dict holding only JSON-native values: ``None``, ``bool``, ``int``,
-    ``float``, masked ``str``, ``list`` and ``dict`` with masked ``str`` keys. Never raises: a
-    key whose value cannot be walked is logged as ``[REDACTION_ERROR]``.
+    Returns a new event dict holding only JSON-native values: ``None``, ``bool``, ``int`` and
+    ``float`` (small, or under a metric key), masked ``str``, ``list`` and ``dict`` with masked
+    ``str`` keys. Never raises: a key whose value cannot be walked is logged as
+    ``[REDACTION_ERROR]``.
     """
     del logger, method_name
     redacted: dict[str, Any] = {}
@@ -513,6 +617,109 @@ class _RootHandler(logging.StreamHandler[TextIO]):
         super().emit(record)
 
 
+_HOOK_MARK: Final = "_carto_redacting_hook"
+WARNINGS_LOGGER: Final = "py.warnings"
+"""Logger name of Python warnings, as ``logging.captureWarnings`` uses."""
+
+_ExcInfo = tuple[type[BaseException], BaseException, TracebackType | None]
+
+
+def _log_exception(event: str, exc_info: _ExcInfo, **fields: object) -> None:
+    """Log ``exc_info`` at CRITICAL through the processor chain; never raise from a hook."""
+    with contextlib.suppress(Exception):  # never fall back to printing the raw traceback
+        get_logger().critical(event, exc_info=exc_info, **fields)
+
+
+def _show_warning(
+    message: Warning | str,
+    category: type[Warning],
+    filename: str,
+    lineno: int,
+    file: TextIO | None = None,
+    line: str | None = None,
+) -> None:
+    """``warnings.showwarning`` replacement: the warning goes to the root logger, redacted."""
+    del file, line  # the source line adds nothing an operator needs; files are never written
+    logging.getLogger(WARNINGS_LOGGER).warning(
+        "%s:%s: %s: %s", filename, lineno, category.__name__, message
+    )
+
+
+def _is_ours(hook: object) -> bool:
+    return bool(getattr(hook, _HOOK_MARK, False))
+
+
+def _sys_hook(
+    previous: Callable[[type[BaseException], BaseException, TracebackType | None], object] | None,
+) -> Callable[[type[BaseException], BaseException, TracebackType | None], None]:
+    def hook(kind: type[BaseException], value: BaseException, tb: TracebackType | None) -> None:
+        _log_exception("uncaught exception", (kind, value, tb))
+        if previous is not None:
+            previous(kind, value, tb)
+
+    setattr(hook, _HOOK_MARK, True)
+    return hook
+
+
+def _thread_hook(
+    previous: Callable[[threading.ExceptHookArgs], object] | None,
+) -> Callable[[threading.ExceptHookArgs], None]:
+    def hook(args: threading.ExceptHookArgs) -> None:
+        if args.exc_value is not None:
+            thread = args.thread.name if args.thread is not None else None
+            _log_exception(
+                "uncaught exception in thread",
+                (args.exc_type, args.exc_value, args.exc_traceback),
+                thread=thread,
+            )
+        if previous is not None:
+            previous(args)
+
+    setattr(hook, _HOOK_MARK, True)
+    return hook
+
+
+def _unraisable_hook(
+    previous: Callable[[Any], object] | None,
+) -> Callable[[Any], None]:
+    def hook(args: Any) -> None:
+        if args.exc_value is not None:
+            _log_exception(
+                "unraisable exception",
+                (args.exc_type, args.exc_value, args.exc_traceback),
+                detail=args.err_msg,
+                object_type=type(args.object).__name__,
+            )
+        if previous is not None:
+            previous(args)
+
+    setattr(hook, _HOOK_MARK, True)
+    return hook
+
+
+def _install_hooks() -> None:
+    """Route warnings and uncaught exceptions through :func:`redact` (spec 2.3 invariant 7).
+
+    The interpreter's defaults print the raw message and traceback to stderr, so they are
+    replaced, never called. A hook someone else installed before (a test runner's) is kept and
+    called after logging. Installing twice changes nothing.
+    """
+    warnings.showwarning = _show_warning
+    if not _is_ours(sys.excepthook):
+        previous = None if sys.excepthook is sys.__excepthook__ else sys.excepthook
+        sys.excepthook = _sys_hook(previous)
+    if not _is_ours(threading.excepthook):
+        previous_thread = (
+            None if threading.excepthook is threading.__excepthook__ else threading.excepthook
+        )
+        threading.excepthook = _thread_hook(previous_thread)
+    if not _is_ours(sys.unraisablehook):
+        previous_unraisable = (
+            None if sys.unraisablehook is sys.__unraisablehook__ else sys.unraisablehook
+        )
+        sys.unraisablehook = _unraisable_hook(previous_unraisable)
+
+
 def configure_logging(
     service: str,
     level: str = "INFO",
@@ -537,6 +744,11 @@ def configure_logging(
     configure their own handlers must be told not to (uvicorn: ``log_config=None``). The HTTP
     client loggers of :data:`QUIET_LIBRARY_LOGGERS` are held at WARNING because their INFO lines
     carry request URLs and query strings.
+
+    Python warnings are logged as WARNING records of the :data:`WARNINGS_LOGGER` logger, and
+    uncaught exceptions (main thread, other threads, and the "exception ignored" path of
+    ``sys.unraisablehook``) as CRITICAL events with their traceback, all through :func:`redact`
+    instead of the interpreter's raw stderr output (ADR 0040).
     """
     level_name = level.strip().lower()
     if level_name not in _LEVELS:
@@ -575,6 +787,7 @@ def configure_logging(
     root.setLevel(_LEVELS[level_name])
     for name in QUIET_LIBRARY_LOGGERS:
         logging.getLogger(name).setLevel(max(logging.WARNING, _LEVELS[level_name]))
+    _install_hooks()
 
 
 def get_logger(**initial_values: Any) -> FilteringBoundLogger:

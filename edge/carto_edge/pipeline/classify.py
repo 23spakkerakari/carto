@@ -806,8 +806,16 @@ class Classifier:
         self._paths.setdefault(ref, path)
         self._stats.observe(ref, value)
 
-    def decide(self, ref: str, path: str) -> FieldDecision:
-        """The current decision for a field; cached, see the module docstring."""
+    def decide(self, ref: str, path: str, *, name_class: FieldClass | None = None) -> FieldDecision:
+        """The current decision for a field; cached, see the module docstring.
+
+        ``name_class`` is the class the name gate read from a raw name it masked (ADR 0030
+        amendment): rules 1 and 2 apply it as if the path carried that name. Such a decision
+        belongs to one record, so it is neither cached nor cached from."""
+        if name_class is not None:
+            with self._lock:
+                self._paths.setdefault(ref, path)
+                return self._classify(ref, path, self._stats.get(ref), name_class)
         with self._lock:
             self._paths.setdefault(ref, path)
             stats = self._stats.get(ref)
@@ -856,13 +864,19 @@ class Classifier:
 
     # -- the rules ---------------------------------------------------------------------------
 
-    def _classify(self, ref: str, path: str, stats: FieldStats | None) -> FieldDecision:
+    def _classify(
+        self,
+        ref: str,
+        path: str,
+        stats: FieldStats | None,
+        name_class: FieldClass | None = None,
+    ) -> FieldDecision:
         samples: tuple[str, ...] = stats.samples if stats is not None else ()
         non_null = stats.non_null_count if stats is not None else 0
         settings = self._settings
 
         # Rule 1: secrets, before pins.
-        if is_secret_name(path):
+        if name_class is FieldClass.SECRET_LIKE or is_secret_name(path):
             return FieldDecision(
                 FieldClass.SECRET_LIKE,
                 Policy.DROP,
@@ -882,8 +896,9 @@ class Classifier:
         if pin is not None:
             return self._pinned(pin, non_null)
 
-        # Rule 2: PII by name, then by detector.
-        pii_class = pii_class_by_name(path)
+        # Rule 2: PII by name (of the path, or of the raw name the gate masked), then by
+        # detector.
+        pii_class = name_class if name_class is not None else pii_class_by_name(path)
         if pii_class is not None:
             return FieldDecision(pii_class, Policy.DROP, reason="pii:name", samples_seen=non_null)
         verdict = self._verdict(ref, samples, non_null)

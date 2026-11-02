@@ -8,15 +8,15 @@ bottom. Each row names the mitigation and the automated check that proves it.
 | 1 | Stolen connector credentials used to read customer systems | Secret manager references, least privilege, read-only verification, rotation, egress policies | Secrets never present in DB, API responses or logs (tests) | M1 |
 | 2 | Core database exfiltration | Core holds tokens, shapes and low-cardinality attributes only | Leak test (Section 18.3) | M1 |
 | 3 | Dictionary attack on tokens through search | Rate limits, audit, self-alert on unusual search volume per user, key never leaves edge | Rate-limit and audit tests | M3 |
-| 4 | Malicious log content causing XSS | Text-only rendering, strict CSP | Playwright XSS corpus | M2 |
-| 5 | Prompt injection through log content | Data fencing, no tools, schema-validated output, human confirmation | Injection corpus yields only schema-valid suggestions | M2 |
+| 4 | Malicious log content causing XSS | Text-only rendering (React escaping, ESLint sink rules, no Markdown or auto-linking of customer strings), strict CSP in the build and on the web proxy | Playwright XSS corpus (`web/e2e/xss.spec.ts`), CSP watch (`web/e2e/csp.spec.ts`), build check | M2 (built 2026-10-18) |
+| 5 | Prompt injection through log content | Payloads built from metadata tables only, nonce-fenced as data, no tools, strict output schema with enumerated label types, invalid output discarded and counted, suggestions shown as "Suggested" until confirmed, egress allowlist, audit per call | Injection corpus yields only schema-valid suggestions (`core/tests/test_core_llm_injection.py`), egress tests, provider conformance | M2 (built 2026-10-18, ADR 0054) |
 | 6 | SSRF via connector or channel URLs | DNS resolution checks, IP pinning, allowlists | SSRF suite (metadata IPs, rebinding, redirects) | M1 |
 | 7 | ReDoS, XXE, zip bombs | RE2, defusedxml, archive limits | Payload fixtures | M1 |
 | 8 | Insider bulk-revealing values | Separate grant, step-up auth, rate limits, audit, alert on bulk reveal | Authz and rate tests | M3 |
 | 9 | Supply chain compromise | Signed images, SBOM, pinned dependencies, scanners, CODEOWNERS | CI gates | M0 (lockfile with hashes, scanners, SBOM signing, CODEOWNERS, Renovate); images from M1 |
 | 10 | Log flood or denial of service | Backpressure, per-source quotas, buffer caps, flood sampling that keeps errors | Load tests | M1 |
-| 11 | Audit tampering | Hash chain, INSERT-only grants, external anchoring | `audit verify` test | M6 |
-| 12 | Session hijack, CSRF | Cookie flags, CSRF tokens, short sessions, step-up | Security tests, ZAP | M6 |
+| 11 | Audit tampering | Hash chain, INSERT-only grants, external anchoring | `audit verify` test | M1 edge (hourly anchor, ADR 0033); M2 core chain, append-only trigger, `carto-core audit-verify` (ADR 0051); external anchoring of the core log M6 |
+| 12 | Session hijack, CSRF | Cookie flags, CSRF tokens, short sessions, step-up | Security tests, ZAP | M2 cookie flags, idle and absolute timeouts, synchronizer token, login rate limit (`core/tests/test_core_api_auth_flow.py`, `test_core_api_security_headers.py`); step-up use and ZAP in M6 |
 | 13 | Accidental write to a source system | No write paths, read-only sessions, grant checks, Semgrep rule | Read-only tests | M0 (Semgrep rule with self-test); connectors M1 |
 | 14 | PHI leaking into chat or email | `include_identifiers` off by default, UI warning | Notification content tests | M4 |
 | 15 | Loss of tokenization key | KMS-managed wrapping, documented backup and recovery | Restore drill | M6 |
@@ -49,7 +49,8 @@ step-up for reveal).
     AES-256-GCM per value, AAD tenant plus token); the disk buffer (`buffer.sqlite`, batches
     already tokenized, up to 20 GiB); connector credentials, referenced by `secret_ref` and
     resolved at use (`vault://` against Vault KV v2; `local://` against the KMS-wrapped
-    `secrets.sqlite`); the edge audit file (`audit.ndjson`, hash-chained; ADR 0014); the internal
+    `secrets.sqlite`); the edge audit file (`audit.ndjson`, hash-chained; ADR 0014; anchored
+    hourly and at shutdown in the product log and optionally the customer's syslog, ADR 0033); the internal
     service keys, each in its own Compose volume mounted only by its service (ADR 0031), and the
     listener CA keys in the separate `pki-ca` volume that only the `pki-init` job mounts; the analyzer's state directory, as
     sensitive as an installed edge (ADR 0025).
@@ -57,6 +58,33 @@ step-up for reveal).
     terminates HTTPS, admits only `POST /webhooks/<source id>` with per-IP rate and connection
     limits and a 1 MiB body cap, and forwards with the `proxy` role, so a webhook sender reaches
     no other route and is still authenticated by its HMAC signature at the gateway.
+- **M2 (2026-10-18):** the map: profiler, linker, composite matcher, the console API and web
+  app, the worker and the optional LLM gateway (plan M2, ADRs 0046 to 0057).
+  - *Assets added:* the customer's integration architecture as metadata in PostgreSQL
+    (`fields`, `field_sketches`, `key_links` with their evidence, `entities`), sessions
+    (`sessions`, keyed by the SHA-256 of the cookie value, never the value), the core audit
+    chain (`audit_log`, append-only by trigger, INSERT and SELECT only for the application
+    roles), the OIDC client secret and, when enabled, the LLM provider credential (files only,
+    `api_key_file`), and the per-service database passwords (`carto_ingest`, `carto_app`,
+    `carto_worker`).
+  - *Trust boundary, users to API (spec 5.2):* one origin (`web` nginx) terminates TLS and is
+    the only holder of a client certificate for the `api` listener (role `web`, ADR 0052);
+    login is OIDC with PKCE, sessions are server-side behind the `__Host-` cookie, every
+    mutation needs the CSRF header and `If-Match`, and every route declares one permission
+    (`require`), which the authorization matrix test derives from the committed OpenAPI
+    document and checks as every role and unauthenticated. `reveal` is granted to nobody in
+    M2. Rate limits are per process; a multi-replica limiter is an M6 item.
+  - *Trust boundary, core to the LLM endpoint:* the gateway is off by default; the client
+    refuses any host but the configured endpoint (and ignores proxy variables); payloads are
+    built from metadata only and a test proves they carry no token, no identifier attribute
+    and nothing from `events`; the per-call audit holds the payload hash, never the payload.
+  - *What a compromised core database yields:* tokens, shapes, counts, lags, field paths,
+    template text and the names reviewers gave things; no raw value (unchanged from M1; the
+    sketches hold 64-bit hashes of tokens, not tokens).
+  - *Residual risks noted:* the development identity provider (Dex, static passwords) exists
+    only in the Compose `dev` profile and CI; the client IP in audit rows is the socket peer
+    (proxy headers untrusted) until the ingress forwarding is decided in M6; proposals are not
+    audited (they are engine output), decisions and linker-made transitions are.
     `proxy-otlp` passes TLS through, so collectors on customer hosts authenticate to the gateway
     with their own `collector` certificates; a stolen collector key reaches `/v1/logs` and health
     on the gateway only. Both are off unless their Compose profile is enabled.

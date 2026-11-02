@@ -2,8 +2,9 @@
 
 Scores engine output against simulator ground truth and reports the spec Section 18.4 metrics.
 In M0 there is no engine yet, so the harness scores the empty prediction (every metric n/a or
-zero) and the ground truth against itself (every metric perfect); from M2 on, engine runs hand
-it a prediction directory. Nothing here touches real customer data (spec 0.1 item 7).
+zero) and the ground truth against itself (every metric perfect). From M2 on the harness also
+drives the engine end to end (`--engine`, below) or scores a prediction directory an engine run
+handed it. Nothing here touches real customer data (spec 0.1 item 7).
 
 ## Run it
 
@@ -11,10 +12,89 @@ it a prediction directory. Nothing here touches real customer data (spec 0.1 ite
 make eval SCENARIO=shop                      # writes eval/reports/shop.json, shop.md, history.ndjson
 uv run carto-eval run --scenario shop --days 14 --seed 1 --sim-out sim-out/shop --out eval/reports \
     [--predictions DIR] [--regenerate] [--tolerance 2] [--enforce-targets] [--enforce-regressions] \
-    [--daily-volume 800]
+    [--daily-volume 800] [--engine memory|stores] [--reuse-bundle] [--config FILE]
 uv run carto-eval self-check --sim-out sim-out/shop [--scenario shop] [--days 14] [--seed 1] \
     [--daily-volume 800]
+make eval-engine SCENARIO=shop DAYS=14 ENGINE=memory   # the M2 path, no Docker needed
+make eval-engine SCENARIO=people_ops DAYS=28           # scenario C needs 28 days; the caller passes DAYS
+make fit-weights                                       # eval/weights/fitted.json (ADR 0049)
+make bench-linker                                      # spec 17 scale, measured not gating
 ```
+
+## The engine path (M2, `--engine`)
+
+`carto-eval run --engine memory|stores` runs the whole map-discovery path instead of reading
+`--predictions` (`carto_eval/driver.py`; plan M2 package I; ADR 0006, 0049):
+
+1. simulate when `<sim-out>/ground_truth` is missing (the usual rules about mismatched
+   parameters apply);
+2. run the offline analyzer in process with `simulator/analyze.<scenario>.yaml`, the eval-only
+   locator map and the run's reference time (`carto-sim as-of`) into `<sim-out>.carto`, state
+   directory next to it; a previous bundle is replaced unless `--reuse-bundle` is given and it
+   still verifies (the state directory is kept, so a re-analysis tokenizes identically);
+3. discover: `memory` loads the bundle into the in-memory event store with the in-memory
+   repositories and runs `carto_core.discover.discover` (one full profile pass, one full link
+   pass with the composite matcher, at the run's reference time); `stores` runs
+   `carto_core.discover.run_discover` against the ClickHouse and PostgreSQL named by the
+   `CARTO_` settings. Either writes `engine_links.json`, `engine_entities.json` and
+   `discover_summary.json` under `<out>/<scenario>.engine`, and the driver reads nothing else
+   from the engine;
+4. map engine fields (`system_id/template_id/path`) to truth fields
+   (`system_id/source_id/field`) through the source that carries each template (the bundle's
+   events joined to the locator map) and the flattened path (`carto_eval/mapping.py`; the pure
+   path rules live in `carto_core.fieldpaths`, shared with `carto-core gate-report`): a dotted
+   path flattens to the leaf name the truth uses unless the truth field itself is dotted, a
+   map entry `parent.0.key` or a masked tail `parent.*` names `parent` (ADR 0030), CSV column
+   names stand as emitted, case is preserved, a masked name (`*`, `*~1`) cannot be mapped;
+5. apply the acceptance policy (ADR 0049 item 2) and write `<out>/<scenario>.predictions` with
+   the reference writer, score with the usual `score()`, write `<out>/<scenario>.json` and
+   `.md` (the Markdown gains the policy statement, a "Field mapping" section and an "Engine
+   run" section), `<out>/<scenario>.mapping.json` (the mapping report and the discover summary
+   with the settings in effect) and the history line.
+
+The policy, stated in every report: the product keeps auto-accept off; in an eval run every
+engine proposal at or above `LinkerSettings.proposal_threshold` whose role is `transaction`,
+exact or bridge, counts as accepted for family building, so entity purity measures the engine
+and not a simulated reviewer. Families are connected components over fields
+(system, source, field), whatever forms the links use, as the engine's are
+(`KeyLink.is_usable_for_families`); each member is reported once, as `raw` when a link reaches
+it as `raw` and else in the form most of its links use; a bridge of role `batch` or
+`association` (a file to its shipments) joins no family (spec 9.6, 9.7). Composite links count
+only toward the composite metrics; association role links are reported but join no family; an
+exact link whose role is `batch` is reported as a batch key link (truth type `batch`). Two more
+rules come from the truth's vocabulary: the truth knows no templates, so an engine link between
+two templates' copies of one source field is counted (`same_field_pairs`) and not scored, and a
+second link of the same field pair from another template is a `template_duplicate`; and the
+truth names one form pair per link, so per field pair the engine link with the most `raw` ends
+(then the highest score) stands as the prediction and the rest are counted as `form_variants`
+(zero since the linker itself proposes one link per field pair). The field-mapping section
+lists every truth link field
+no engine field reached (a naming mismatch), every truth link field reached but touched by no
+prediction (a miss), every tokenized engine field the truth does not name, and every engine
+field that could not be mapped, so nothing is silently scored as a miss.
+
+`carto-eval fit-weights` (plan M2 decision 4) runs the analyze, load, profile, candidate and
+verify steps on the named scenarios, labels every verified candidate by truth after mapping
+(exact and bridge field pairs are positives; a pair of one field with itself is left out), fits
+`sklearn.linear_model.LogisticRegression(class_weight="balanced", C=1.0, max_iter=1000)` on
+`carto_core.linker.score.feature_vector` and writes a `Weights` file
+(`fitted-<date>-<sha8 of the samples>`) that `CARTO_LINKER__WEIGHTS_FILE` can point at; it
+prints precision and recall at the proposal threshold on the training samples. scikit-learn is
+an eval-only dependency; a test greps `core/` for it.
+
+`carto-eval bench-linker` builds 50 systems x 20 candidate fields with real sketches, times LSH
+candidate generation and a capped verification against the in-memory store, and prints both
+times with the per-pair cost extrapolated to the candidate cap (spec 17; ADR 0048). It is
+informative, not a gate.
+
+`carto-core discover --out DIR [--bundle PATH] [--as-of TIME]` and `carto-core gate-report
+--predictions DIR --confirmed links.csv` are the engine-side pieces: the first runs the same
+discovery over the deployment stores (loading the bundle first when given; the reference time
+defaults to the bundle's last observation plus one second, else the store's latest write) and
+writes the same three files; the second lists, for each link the partner confirmed by hand
+(`system_a,field_a,system_b,field_b`), the engine's top 3 proposals by score x affected volume
+for either field and whether the confirmed partner is among them, ending with the share found
+(the M2 gate asks for at least half).
 
 `run` generates the scenario with `carto_simulator.api.generate` when `--sim-out` holds no
 `ground_truth/` or when `--regenerate` is given, and never otherwise, because generating empties
@@ -228,7 +308,11 @@ part of the ground truth but never used, copied or written by the harness.
 
 ## Tests
 
-`uv run pytest eval/tests` (file prefix `test_eval_`). Metric tests use tiny hand-built inputs
+`uv run pytest eval/tests` (file prefix `test_eval_`). `test_eval_driver.py` runs the engine
+path in memory on shop (3 days, 200 orders a day) and people_ops (3 days) through the real
+analyzer with the regex PII detector; `test_eval_mapping.py` covers the path rules and the
+policy on hand-built parts; `test_eval_fit_weights.py` fits on a small shop run, checks the
+file with `load_weights` and greps `core/` for scikit-learn. Metric tests use tiny hand-built inputs
 with the expected numbers derived in comments; the CLI tests generate a two-day scenario with 30
 orders a day in a temporary directory, score the empty prediction (n/a or zero everywhere), run the
 self-check (perfect), score a written-out perfect prediction, and check the history, the regression

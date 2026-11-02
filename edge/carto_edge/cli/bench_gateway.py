@@ -30,6 +30,7 @@ import time
 from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Final
 
@@ -199,9 +200,12 @@ def bench_gateway(
     seconds: float,
     max_records: int,
     detector: PiiDetector | None = None,
+    as_of: datetime | None = None,
 ) -> GatewayBenchResult:
     """Run the gateway benchmark; raises :class:`~carto_edge.cli.analyze.AnalyzeError` with the
-    exit code. ``detector`` replaces the configured PII detector (tests only)."""
+    exit code. ``detector`` replaces the configured PII detector (tests only);
+    ``as_of`` is the time event times are checked against (ADR 0036, ``--as-of``), by default
+    the wall clock."""
     if seconds <= 0 or max_records < 1:
         msg = "--seconds must be positive and --max-records at least 1"
         raise AnalyzeError(msg, EXIT_USAGE)
@@ -221,7 +225,12 @@ def bench_gateway(
             raise AnalyzeError(msg, EXIT_USAGE) from exc
         try:
             runtime = build_runtime(
-                settings, sources_file, mode="gateway", detector=detector, init_local_keys=True
+                settings,
+                sources_file,
+                mode="gateway",
+                detector=detector,
+                init_local_keys=True,
+                range_clock=(lambda: as_of) if as_of is not None else None,
             )
         except KeyManagementError as exc:
             msg = f"keys unusable: {describe(exc)}"

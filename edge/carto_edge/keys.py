@@ -6,11 +6,14 @@ customer's KMS (:class:`carto_common.crypto.LocalKms` for Compose pilots, Vault 
 with ``carto-ctl key init``::
 
     local-kms.key          32 raw bytes, mode 0600 (LocalKms master key; kms.provider=local only)
-    tenant-key.json        WrappedKey of the ACTIVE tenant key
+    tenant-key.v<n>.json   WrappedKey of tenant key version n (the active one and the previous
+                           ones still inside the overlap window)
                            context {"tenant_id": ..., "purpose": "tokenization", "version": "<n>"}
-    tenant-key.v<n>.json   WrappedKey of a previous version still inside the overlap window
+    tenant-key.json        Version 1 as ``key init`` writes it (the layout before ADR 0042); read
+                           for its version until the first rotation copies it to
+                           tenant-key.v<n>.json and removes it
     rotation.json          {"active_version": n, "previous": [{"version": m, "retire_at": iso}],
-                            "overlap_days": d}
+                            "overlap_days": d}: the one commit point of a rotation
     vault-data-key.json    WrappedKey of the reveal vault data key
                            context {"tenant_id": ..., "purpose": "reveal-vault"}
     assertion-public.key   core's Ed25519 public key (base64url text) for internal assertions
@@ -18,8 +21,15 @@ with ``carto-ctl key init``::
 Rotation (spec 8.4): a new version is the active version plus one; the old active key stays in
 the keyring as a previous version until ``retire_at`` (now plus the overlap, default 30 days
 and at least the event retention) so new events are tokenized under both. Previous keys past
-``retire_at`` are ignored with a warning on load and removed on the next rotation. File writes
-go through a temporary file and ``os.replace`` so a crash leaves either the old or the new file.
+``retire_at`` are ignored with a warning on load and removed on the next rotation.
+
+Crash consistency (ADR 0042): ``rotation.json`` is the single commit point. A rotation first
+writes the new key as ``tenant-key.v<n+1>.json`` (and, once, copies a legacy ``tenant-key.json``
+to its versioned name), then replaces ``rotation.json``; only then are superseded files removed.
+Loads resolve every key file by the version ``rotation.json`` names, so a crash at any step
+leaves the old keyring or the new one, never a mismatch: a key file no state names is ignored
+and overwritten by the next rotation. Every file is written to a temporary file created 0600,
+fsynced, renamed and its directory fsynced (:func:`carto_common.crypto.write_private_file`).
 
 When the KMS key itself rotates, :meth:`KeyManager.rewrap` unwraps every wrapped key file under
 ``keys/`` (tenant keys of every version, the vault data key, the local secret store data key)
@@ -33,6 +43,7 @@ fingerprints and dates only (spec 2.3 invariant 7).
 
 from __future__ import annotations
 
+import contextlib
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -49,7 +60,9 @@ from carto_common.crypto import (
     VaultTransitKms,
     VerifyKey,
     WrappedKey,
+    fsync_directory,
     generate_key,
+    write_private_file,
 )
 from carto_common.logging import get_logger
 from carto_edge.config import EdgeSettings
@@ -69,6 +82,7 @@ __all__ = [
     "RotationState",
     "build_kms",
     "previous_key_file",
+    "versioned_key_file",
 ]
 
 LOCAL_KMS_KEY_FILE: Final = "local-kms.key"
@@ -130,16 +144,17 @@ class RotationState(BaseModel):
         _write_atomic(path, self.model_dump_json(indent=2) + "\n")
 
 
-def previous_key_file(keys_dir: Path, version: int) -> Path:
-    """``tenant-key.v<n>.json``."""
+def versioned_key_file(keys_dir: Path, version: int) -> Path:
+    """``tenant-key.v<n>.json``: tenant key version ``n``, active or previous."""
     return keys_dir / f"tenant-key.v{version}.json"
 
 
+previous_key_file = versioned_key_file
+"""The name before every version, the active one included, had a versioned file."""
+
+
 def _write_atomic(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".tmp")
-    temporary.write_text(text, encoding="utf-8", newline="\n")
-    temporary.replace(path)
+    write_private_file(path, text.encode("utf-8"))
 
 
 def _write_wrapped(path: Path, wrapped: WrappedKey) -> None:
@@ -289,16 +304,30 @@ class KeyManager:
             raise KeyManagementError(msg)
         return RotationState.read(self._rotation_file)
 
-    def _read_active(self, rotation: RotationState) -> WrappedKey:
-        wrapped = WrappedKey.read(self._tenant_key_file)
-        if wrapped.context.get("version") != str(rotation.active_version):
+    def _key_path(self, version: int) -> Path:
+        """The file holding ``version``: its versioned file, else the legacy
+        ``tenant-key.json`` when that is the version it holds."""
+        versioned = versioned_key_file(self.keys_dir, version)
+        if versioned.is_file() or not self._tenant_key_file.is_file():
+            return versioned
+        return self._tenant_key_file
+
+    def _read_version(self, version: int) -> WrappedKey:
+        path = self._key_path(version)
+        if not path.is_file():
+            msg = f"key file for version {version} is missing ({path.name}); restore keys/"
+            raise KeyManagementError(msg)
+        wrapped = WrappedKey.read(path)
+        if wrapped.context.get("version") != str(version):
             msg = (
-                f"active key file {self._tenant_key_file} carries version "
-                f"{wrapped.context.get('version')!r} but {ROTATION_FILE} names version "
-                f"{rotation.active_version}"
+                f"key file {path} carries version {wrapped.context.get('version')!r} but "
+                f"{ROTATION_FILE} names version {version}"
             )
             raise KeyManagementError(msg)
         return wrapped
+
+    def _read_active(self, rotation: RotationState) -> WrappedKey:
+        return self._read_version(rotation.active_version)
 
     def load_keyring(self) -> Keyring:
         """The active key plus every previous version whose ``retire_at`` is still ahead.
@@ -319,7 +348,7 @@ class KeyManager:
                     retire_at=entry.retire_at.isoformat(),
                 )
                 continue
-            wrapped = WrappedKey.read(previous_key_file(self.keys_dir, entry.version))
+            wrapped = self._read_version(entry.version)
             previous.append(TokenKey(entry.version, kms.unwrap(wrapped)))
         return Keyring(active=active, previous=tuple(previous))
 
@@ -330,9 +359,10 @@ class KeyManager:
     def rotate(self, overlap_days: int | None = None) -> Keyring:
         """Create the next key version; the old active key stays live for ``overlap_days``.
 
-        Order of writes: the old active key under its ``tenant-key.v<n>.json`` name, the new
-        active key, then the rotation state, each atomically. Previous versions already past
-        ``retire_at`` are dropped from the state and their files removed.
+        Order (module docstring): a legacy ``tenant-key.json`` copied to its versioned name
+        once, the new key as ``tenant-key.v<n+1>.json``, then ``rotation.json`` (the commit),
+        then the files nothing names any more are removed: previous versions past
+        ``retire_at`` and the legacy file.
         """
         rotation = self._read_rotation()
         old_wrapped = self._read_active(rotation)
@@ -345,14 +375,10 @@ class KeyManager:
         new_version = rotation.active_version + 1
         new_wrapped = kms.wrap(generate_key(), self._tokenization_context(new_version))
 
-        _write_wrapped(previous_key_file(self.keys_dir, rotation.active_version), old_wrapped)
-        _write_wrapped(self._tenant_key_file, new_wrapped)
-        kept: list[PreviousKey] = []
-        for entry in rotation.previous:
-            if entry.retire_at > now:
-                kept.append(entry)
-            else:
-                previous_key_file(self.keys_dir, entry.version).unlink(missing_ok=True)
+        self._migrate_legacy(rotation)
+        _write_wrapped(versioned_key_file(self.keys_dir, new_version), new_wrapped)
+        kept = [entry for entry in rotation.previous if entry.retire_at > now]
+        retired = [entry.version for entry in rotation.previous if entry.retire_at <= now]
         previous = [
             PreviousKey(version=rotation.active_version, retire_at=now + timedelta(days=overlap)),
             *kept,
@@ -360,6 +386,8 @@ class KeyManager:
         RotationState(active_version=new_version, previous=previous, overlap_days=overlap).write(
             self._rotation_file
         )
+        self._remove_superseded(retired)
+        del old_wrapped
         log.info(
             "keys.rotated",
             active_version=new_version,
@@ -368,6 +396,43 @@ class KeyManager:
             fingerprint=new_wrapped.fingerprint,
         )
         return self.load_keyring()
+
+    def _migrate_legacy(self, rotation: RotationState) -> None:
+        """Copy a legacy ``tenant-key.json`` to the versioned name of the version it holds,
+        for every version the state still names, before the commit."""
+        legacy = self._tenant_key_file
+        if not legacy.is_file():
+            return
+        wrapped = WrappedKey.read(legacy)
+        version_text = wrapped.context.get("version", "")
+        named = {rotation.active_version, *(entry.version for entry in rotation.previous)}
+        if not version_text.isdecimal() or int(version_text) not in named:
+            return
+        target = versioned_key_file(self.keys_dir, int(version_text))
+        if not target.is_file():
+            _write_wrapped(target, wrapped)
+
+    def _remove_superseded(self, retired: list[int]) -> None:
+        """After the commit: files of retired versions and a legacy ``tenant-key.json`` whose
+        version now has its own file. Failures leave harmless files behind."""
+        doomed = [versioned_key_file(self.keys_dir, version) for version in retired]
+        legacy = self._tenant_key_file
+        if legacy.is_file():
+            with contextlib.suppress(CryptoError):
+                version_text = WrappedKey.read(legacy).context.get("version", "")
+                if (
+                    version_text.isdecimal()
+                    and versioned_key_file(self.keys_dir, int(version_text)).is_file()
+                ):
+                    doomed.append(legacy)
+        removed = False
+        for path in doomed:
+            with contextlib.suppress(OSError):
+                path.unlink(missing_ok=True)
+                removed = True
+        if removed:
+            with contextlib.suppress(OSError):
+                fsync_directory(self.keys_dir)
 
     # -----------------------------------------------------------------------------------------
     # rewrap (the KMS key rotates; the tenant key does not)
@@ -414,6 +479,7 @@ class KeyManager:
             raise KeyManagementError(msg) from exc
         for staging, path in staged:
             staging.replace(path)
+        fsync_directory(self.keys_dir)
         self._kms = new_kms
         log.info(
             "keys.rewrapped",
@@ -475,10 +541,11 @@ class KeyManager:
             rotation = self._read_rotation()
             active_version = rotation.active_version
             overlap_days = rotation.overlap_days
-            if self._tenant_key_file.is_file():
-                active_fingerprint = WrappedKey.read(self._tenant_key_file).fingerprint
+            active_path = self._key_path(rotation.active_version)
+            if active_path.is_file():
+                active_fingerprint = WrappedKey.read(active_path).fingerprint
             for entry in rotation.previous:
-                path = previous_key_file(self.keys_dir, entry.version)
+                path = self._key_path(entry.version)
                 previous.append(
                     {
                         "version": entry.version,

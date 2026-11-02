@@ -24,6 +24,16 @@
   source to ``POST /internal/heartbeat``, so core's detector can tell "no data" from "nothing
   happened" (spec 8.1). The heartbeat's ``message`` is always empty: free text from a connector
   error could carry a value.
+- :class:`InventoryReporter` posts the edge's inventory (ADR 0050), one
+  :class:`~carto_schema.inventory.EdgeInventory` built from the sources file, to
+  ``POST /internal/inventory``: on start and then only when the file's sha256 changes (checked
+  every round; the file is parsed again on a change, and the running pipeline picks the change up
+  at its next restart). Connector configuration travels with every secret-bearing key removed
+  (:func:`strip_config`: a key naming a password, secret, token, key, credential or
+  authorization, and every nested structure, so a secret cannot hide where core would not look;
+  scalars and lists of strings stay) and the ``secret_ref`` name only. ``edge_id`` is the common
+  name of the edge's client certificate, else the host name (:func:`edge_id_for`). A failed send
+  is retried the next round.
 
 Nothing here logs a request or response body (spec 2.3 invariant 7, 14.12): log lines carry
 batch ids, source ids, event counts, status codes and exception type names.
@@ -31,27 +41,43 @@ batch ids, source ids, event counts, status codes and exception type names.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import random
+import re
+import socket
 import ssl
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Final
+from pathlib import Path
+from typing import Any, Final
 
 import httpx
+from cryptography.x509.oid import NameOID
 
 from carto_common.ids import new_ulid
 from carto_common.logging import get_logger
-from carto_edge.config import CoreLinkSettings, SourcesFile
+from carto_common.pki import PkiError, load_certificate
+from carto_edge.config import ConfigError, CoreLinkSettings, SourcesFile, load_sources_file
 from carto_edge.metrics import EdgeMetrics
 from carto_edge.net.http import USER_AGENT, build_ssl_context
 from carto_edge.net.retry import backoff_delay
+from carto_edge.pipeline.batch import PULL_SOURCE_TYPES
 from carto_edge.pipeline.buffer import BufferedBatch, DiskBuffer
 from carto_schema.event import SCHEMA_VERSION
 from carto_schema.ingest import SourceHeartbeat, SourceStatus
+from carto_schema.inventory import (
+    MAX_CONFIG_KEYS,
+    MAX_CONFIG_VALUE_LEN,
+    EdgeInventory,
+    InventoryFieldPolicy,
+    InventorySource,
+    InventorySystem,
+)
 
 __all__ = [
     "BACKOFF_BASE_SECONDS",
@@ -59,19 +85,36 @@ __all__ = [
     "HEARTBEAT_PATH",
     "IDLE_WAIT_SECONDS",
     "INGEST_PATH",
+    "INVENTORY_PATH",
     "MAX_BACKOFF_ATTEMPT",
     "MIN_RETRY_WAIT_SECONDS",
     "PARK_STATUSES",
+    "SECRET_KEY_WORDS",
     "Forwarder",
     "Heartbeater",
+    "InventoryReporter",
     "SendReport",
     "SourceHealth",
     "SourceHealthState",
     "build_core_client",
+    "edge_id_for",
+    "strip_config",
 ]
 
 INGEST_PATH: Final = "/internal/ingest"
 HEARTBEAT_PATH: Final = "/internal/heartbeat"
+INVENTORY_PATH: Final = "/internal/inventory"
+SECRET_KEY_WORDS: Final[tuple[str, ...]] = (
+    "password",
+    "secret",
+    "token",
+    "key",
+    "credential",
+    "authorization",
+)
+"""A configuration key containing one of these (case-insensitive) never leaves the edge."""
+_EDGE_ID_ALLOWED: Final = re.compile(r"[^A-Za-z0-9._:-]")
+_MAX_EDGE_ID: Final = 128
 PARK_STATUSES: Final = frozenset({400, 413, 422})
 """Statuses after which core will never accept the batch as sent (spec 12, RFC 7807 problems)."""
 IDLE_WAIT_SECONDS: Final = 0.5
@@ -500,4 +543,226 @@ class Heartbeater:
                 self.send()
             except Exception as exc:  # the loop must survive a buffer or encoding fault
                 log.error("heartbeat.loop_error", error=type(exc).__name__)
+            stop.wait(interval_seconds)
+
+
+# ---------------------------------------------------------------------------------------------
+# Inventory (ADR 0050)
+# ---------------------------------------------------------------------------------------------
+
+
+def strip_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    """The connector configuration as core may see it (module docstring): secret-bearing keys
+    and every nested structure removed, scalars and lists of strings kept and bounded."""
+    out: dict[str, Any] = {}
+    for key, value in config.items():
+        name = str(key)
+        if any(word in name.lower() for word in SECRET_KEY_WORDS):
+            continue
+        if value is None or isinstance(value, bool | int | float):
+            out[name] = value
+        elif isinstance(value, str):
+            out[name] = value[:MAX_CONFIG_VALUE_LEN]
+        elif isinstance(value, list) and all(isinstance(item, str) for item in value):
+            out[name] = [item[:MAX_CONFIG_VALUE_LEN] for item in value]
+        # dicts, lists of dicts and mixed lists are dropped: a secret could hide inside them
+        if len(out) >= MAX_CONFIG_KEYS:
+            break
+    return out
+
+
+def _edge_id_text(value: str) -> str:
+    cleaned = _EDGE_ID_ALLOWED.sub("-", value.strip())[:_MAX_EDGE_ID]
+    return cleaned or "edge"
+
+
+def edge_id_for(link: CoreLinkSettings, *, hostname: Callable[[], str] = socket.gethostname) -> str:
+    """The common name of the edge's client certificate when ``core.cert_file`` is set and
+    readable, else the host name; always within the contract's character set."""
+    if link.cert_file is not None:
+        try:
+            certificate = load_certificate(Path(link.cert_file))
+            names = certificate.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
+        except (PkiError, OSError, ValueError):
+            names = []
+        if names:
+            return _edge_id_text(str(names[0].value))
+    try:
+        return _edge_id_text(hostname())
+    except OSError:
+        return "edge"
+
+
+def _schedule_text(
+    source_type: str, config: Mapping[str, Any], default_seconds: float | None
+) -> str | None:
+    if source_type not in PULL_SOURCE_TYPES:
+        return "push"
+    value = config.get("poll_seconds")
+    seconds: float | None = None
+    if (
+        isinstance(value, int | float)
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and value > 0
+    ):
+        seconds = float(value)
+    elif default_seconds is not None:
+        seconds = float(default_seconds)
+    return f"every {seconds:g} s" if seconds is not None else None
+
+
+class InventoryReporter:
+    """Posts the edge inventory on start and whenever the sources file changes (ADR 0050)."""
+
+    __slots__ = (
+        "_client",
+        "_clock",
+        "_default_poll",
+        "_edge_id",
+        "_last_sent",
+        "_metrics",
+        "_sources",
+        "_sources_path",
+        "_tenant_id",
+    )
+
+    def __init__(
+        self,
+        client: httpx.Client,
+        tenant_id: str,
+        sources: SourcesFile,
+        *,
+        metrics: EdgeMetrics,
+        edge_id: str,
+        sources_path: Path | None = None,
+        default_poll_seconds: float | None = None,
+        clock: Clock | None = None,
+    ) -> None:
+        self._client = client
+        self._tenant_id = tenant_id
+        self._sources = sources
+        self._sources_path = sources_path
+        self._metrics = metrics
+        self._edge_id = _edge_id_text(edge_id)
+        self._default_poll = default_poll_seconds
+        self._clock = clock if clock is not None else _utc_now
+        self._last_sent: str | None = None
+        metrics.counter("carto_edge_inventories_total", "Edge inventories accepted by core.")
+
+    def __repr__(self) -> str:
+        return f"InventoryReporter(edge_id={self._edge_id!r}, sources={len(self._sources.sources)})"
+
+    @property
+    def edge_id(self) -> str:
+        return self._edge_id
+
+    def current_sha256(self) -> str:
+        """The sha256 of the sources file bytes, or of the canonical model when there is no
+        file (the file could not be read: the last known content stands in)."""
+        if self._sources_path is not None:
+            try:
+                return hashlib.sha256(self._sources_path.read_bytes()).hexdigest()
+            except OSError:
+                log.warning("inventory.sources_file_unreadable")
+        canonical = json.dumps(self._sources.model_dump(mode="json"), sort_keys=True)
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def _refresh(self) -> None:
+        """Parse the file again after a change; an invalid file keeps the last good model."""
+        if self._sources_path is None:
+            return
+        try:
+            self._sources = load_sources_file(self._sources_path)
+        except ConfigError as exc:
+            log.warning("inventory.sources_file_invalid", error=type(exc).__name__)
+
+    def build(self, sha256: str | None = None) -> EdgeInventory:
+        """The inventory as it would be sent now, secrets stripped."""
+        sources = self._sources
+        return EdgeInventory(
+            schema_version=SCHEMA_VERSION,
+            tenant_id=self._tenant_id,
+            edge_id=self._edge_id,
+            sent_at=self._clock(),
+            sources_file_sha256=sha256 if sha256 is not None else self.current_sha256(),
+            systems=[
+                InventorySystem(
+                    id=system.id,
+                    name=system.name,
+                    owner_group=system.owner_group,
+                    criticality=system.criticality,
+                )
+                for system in sources.systems
+            ],
+            sources=[
+                InventorySource(
+                    id=source.id,
+                    system_id=source.system,
+                    type=source.type.value,
+                    enabled=source.enabled,
+                    config=strip_config(source.config),
+                    secret_ref=str(source.secret_ref) if source.secret_ref is not None else None,
+                    backfill_days=source.backfill_days,
+                    schedule=_schedule_text(source.type.value, source.config, self._default_poll),
+                    last_test=None,
+                    last_test_at=None,
+                )
+                for source in sources.sources
+            ],
+            field_policies=[
+                InventoryFieldPolicy(
+                    field=pin.field,
+                    field_class=pin.field_class,
+                    policy=pin.policy,
+                    forms=list(pin.forms or []),
+                    reason=pin.reason,
+                )
+                for pin in sources.field_policies
+            ],
+        )
+
+    def send(self) -> bool:
+        """Post the inventory once; True when core accepted it. Never raises for a failed
+        post: failures are logged by status or exception type and retried next round."""
+        sha256 = self.current_sha256()
+        if sha256 != self._last_sent:
+            self._refresh()
+        inventory = self.build(sha256)
+        try:
+            response = self._client.post(
+                INVENTORY_PATH,
+                content=inventory.model_dump_json().encode("utf-8"),
+                headers={"Content-Type": _JSON, "X-Request-Id": new_ulid()},
+            )
+        except httpx.HTTPError as exc:
+            log.warning("inventory.transport_error", error=type(exc).__name__)
+            return False
+        if 200 <= response.status_code < 300:
+            self._last_sent = sha256
+            self._metrics.inc("carto_edge_inventories_total")
+            log.info(
+                "inventory.sent",
+                edge_id=self._edge_id,
+                systems=len(inventory.systems),
+                sources=len(inventory.sources),
+                pins=len(inventory.field_policies),
+            )
+            return True
+        log.warning("inventory.refused", status=response.status_code)
+        return False
+
+    def send_if_changed(self) -> bool:
+        """Send when nothing was accepted yet or the sources file changed; True when sent."""
+        if self._last_sent is not None and self.current_sha256() == self._last_sent:
+            return False
+        return self.send()
+
+    def run(self, stop: threading.Event, interval_seconds: float) -> None:
+        """A send now, then a change check every ``interval_seconds`` until ``stop`` is set."""
+        while not stop.is_set():
+            try:
+                self.send_if_changed()
+            except Exception as exc:  # the loop must survive a file or encoding fault
+                log.error("inventory.loop_error", error=type(exc).__name__)
             stop.wait(interval_seconds)

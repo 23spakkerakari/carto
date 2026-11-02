@@ -68,11 +68,6 @@ from carto_simulator.scenarios.shop_model import (
     F4_DAY,
     F5_DAY,
     F5_START,
-    FIRST_CART_NUMBER,
-    FIRST_MERCHANT_NUMBER,
-    FIRST_ORDER_ID,
-    FIRST_PO_COUNTER,
-    FIRST_SHIPMENT_NUMBER,
     HOUR_WEIGHTS,
     N_AUTHORIZED,
     N_CARRIER_PICKUP,
@@ -122,6 +117,7 @@ from carto_simulator.scenarios.shop_model import (
     WAREHOUSE_CODES,
     WAREHOUSE_SKEW,
     WAREHOUSE_WEIGHTS,
+    CounterBases,
     DayParams,
     ExportedFile,
     FaultState,
@@ -146,6 +142,7 @@ class _ShopRun:
         self.request = request
         self.out_dir = out_dir
         self.rng = random.Random(request.seed)
+        self.counters = CounterBases.for_seed(request.seed)
         self.zone = clock.local_zone()
         self.start_day = request.start_date
         self.end_day = request.start_date + timedelta(days=request.days)
@@ -301,15 +298,15 @@ class _ShopRun:
         cardholder_pii = rng.random() < self.request.pii_density
         released_at = authorized_at + draw_ms(rng, 1, 10)
         txn_id = f"txn_{index:06d}"
-        order_id = FIRST_ORDER_ID + index - 1
+        order_id = self.counters.order + index - 1
         po = self.build_purchase_order(
             txn_id, order_id, total, person, order_created_at, authorized_at
         )
         return Transaction(
             txn_id=txn_id,
-            cart_id=f"c-{FIRST_CART_NUMBER + index - 1}",
+            cart_id=f"c-{self.counters.cart + index - 1}",
             order_id=order_id,
-            merchant_ref=f"X9-{FIRST_MERCHANT_NUMBER + index - 1:04d}",
+            merchant_ref=f"X9-{self.counters.merchant + index - 1}",
             cart_at=cart_at,
             checkout_at=checkout_at,
             channel=channel,
@@ -385,8 +382,8 @@ class _ShopRun:
         self.purchase_orders.sort(key=lambda po: (po.created_at, po.txn_id))
         rename_from = self.faults.f4_start
         for index, po in enumerate(self.purchase_orders):
-            po.row_id = index + 1
-            po.po_num = po_number(FIRST_PO_COUNTER + index)
+            po.row_id = self.counters.row + index
+            po.po_num = po_number(self.counters.po + index)
             po.renamed = rename_from is not None and po.created_at >= rename_from
             if po.picked_at is not None:
                 po.status = "PICKED"
@@ -510,7 +507,7 @@ class _ShopRun:
             shipped_at = po.shipped_at
             if shipped_at is None or po.file_name is None:
                 continue
-            po.shipment_no = f"SH-{FIRST_SHIPMENT_NUMBER + index:04d}"
+            po.shipment_no = f"SH-{self.counters.shipment + index}"
             batch_id = f"batch_{po.file_name.removesuffix('.csv')}"
             self.shipping.add(
                 Truth(N_SHIPMENT_CREATED, shipped_at, po.txn_id, batch_id, SERVICE),

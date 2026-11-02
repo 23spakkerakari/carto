@@ -39,9 +39,19 @@ import, lint or test it.
 
 ## Milestone status
 
-- M0 Foundations: built on branch `m0-foundations` on 2026-10-06 (docs/plans/M0.md); merge
-  after CI is green.
+- M0 Foundations: built on branch `m0-foundations` on 2026-10-06 (docs/plans/M0.md); on `main`.
 - M1 Edge pipeline and offline analyzer: built on branch `m1-edge-pipeline` on 2026-10-10
-  (docs/plans/M1.md, ADRs 0011 to 0032); CI green. Throughput met on the laptop's full gateway path
-  (ADR 0028); acceptance waits on the founder (reference-node run, questions in the demo note). Next, once accepted: M2 map discovery (write
-  docs/plans/M2.md first).
+  (docs/plans/M1.md, ADRs 0011 to 0032); merged to `main` on 2026-10-12 (PR #1). Throughput met
+  on the laptop's full gateway path (ADR 0028). Acceptance waits on the founder's reference-node
+  run and on the review fixes: branch `m1-review-fixes` (docs/plans/M1-review-fixes.md, ADRs
+  0033 to 0043), all six packages and `fix-e2` merged into it and CI green on 2026-10-15; its PR
+  to `main` is still to be opened. Items each ADR lists under Consequences as not built remain.
+- M2 Map discovery: built on branch `m2-map-discovery` on 2026-10-17 and 2026-10-18
+  (docs/plans/M2.md, ADRs 0046 to 0058): profiler, linker, composite links, console API and web
+  console, worker, LLM gateway, scenario C, eval driver, discover and gate report. Eval on
+  2026-10-19: scenario A meets every spec 18.4 target; scenario C meets four of five (exact and
+  bridge recall 0.80, two legacy links under the distinct floor at that volume; founder call in
+  the demo note). CI green on all eleven jobs on 2026-10-20 (pushed as `m2-map-discovery-built`
+  at 2cb3bd0 because the rebased milestone branch needs the user's force push). Acceptance
+  waits on that founder call and the partner gate; `fix-c2` is not merged into it yet. Next:
+  M3 trace (write docs/plans/M3.md first).

@@ -6,6 +6,10 @@ requires-python = ">=3.12"
 dependencies = [
   "pydantic>=2.9",
   "carto-simulator",
+  "carto-core",
+  "carto-edge",
+  "scikit-learn>=1.5",
+  "numpy>=2.0",
 ]
 
 [project.scripts]

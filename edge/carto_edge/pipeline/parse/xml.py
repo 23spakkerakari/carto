@@ -13,7 +13,7 @@ else maps to its path; one that also has attributes or children keeps its text u
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from xml.etree.ElementTree import Element, ParseError  # nosec B405 - parsing is defused below
 
 from defusedxml import DefusedXmlException
@@ -28,6 +28,7 @@ from carto_edge.pipeline.parse.common import (
     NOTE_DEPTH_LIMIT,
     NOTE_FIELD_LIMIT,
     NOTE_KEY_LIMIT,
+    SegmentPath,
 )
 
 __all__ = ["XmlRecord", "looks_like_xml", "parse_xml"]
@@ -35,11 +36,13 @@ __all__ = ["XmlRecord", "looks_like_xml", "parse_xml"]
 
 @dataclass(frozen=True, slots=True)
 class XmlRecord:
-    """The root element's local name, the flattened fields and the limit notes."""
+    """The root element's local name, the flattened fields and the limit notes; ``structure``
+    as in :class:`~carto_edge.pipeline.parse.common.Flattened` (XML names may contain dots)."""
 
     root: str
     fields: dict[str, str]
     notes: tuple[str, ...]
+    structure: dict[str, SegmentPath] = field(default_factory=dict)
 
 
 def looks_like_xml(text: str) -> bool:
@@ -58,30 +61,43 @@ def _join(prefix: str, key: str) -> str:
     return f"{prefix}.{key}" if prefix else key
 
 
-def _put(fields: dict[str, str], notes: set[str], path: str, value: str) -> None:
-    if len(path) > MAX_KEY_LEN:
-        notes.add(NOTE_KEY_LIMIT)
-        return
-    if len(fields) >= MAX_FIELDS and path not in fields:
-        notes.add(NOTE_FIELD_LIMIT)
-        return
-    fields[path] = value
+@dataclass(slots=True)
+class _Out:
+    fields: dict[str, str]
+    structure: dict[str, SegmentPath]
+    notes: set[str]
+
+    def put(self, path: str, segments: SegmentPath, value: str) -> None:
+        if len(path) > MAX_KEY_LEN:
+            self.notes.add(NOTE_KEY_LIMIT)
+            return
+        if len(self.fields) >= MAX_FIELDS and path not in self.fields:
+            self.notes.add(NOTE_FIELD_LIMIT)
+            return
+        self.fields[path] = value
+        if len(segments) > 1:
+            self.structure[path] = segments
+        else:
+            self.structure.pop(path, None)
 
 
-def _flatten_element(root: Element) -> tuple[dict[str, str], tuple[str, ...]]:
+def _flatten_element(root: Element) -> _Out:
     """Iterative walk of the tree with the common depth, array and field limits."""
-    fields: dict[str, str] = {}
-    notes: set[str] = set()
-    stack: list[tuple[str, int, Element]] = [("", 0, root)]
+    out = _Out(fields={}, structure={}, notes=set())
+    notes = out.notes
+    stack: list[tuple[str, SegmentPath, int, Element]] = [("", (), 0, root)]
     while stack:
-        prefix, depth, element = stack.pop()
+        prefix, segments, depth, element = stack.pop()
         for name, value in element.attrib.items():
-            _put(fields, notes, _join(prefix, f"@{_local_name(name)}"), value)
+            attribute = f"@{_local_name(name)}"
+            out.put(_join(prefix, attribute), (*segments, (attribute, False)), value)
         children = list(element)
         text = (element.text or "").strip()
         if text:
-            path = _join(prefix, "#text") if (children or element.attrib or not prefix) else prefix
-            _put(fields, notes, path, text)
+            if children or element.attrib or not prefix:
+                out.put(_join(prefix, "#text"), (*segments, ("#text", False)), text)
+            else:
+                out.put(prefix, segments, text)
         if not children:
             continue
         if depth >= MAX_DEPTH:
@@ -92,7 +108,7 @@ def _flatten_element(root: Element) -> tuple[dict[str, str], tuple[str, ...]]:
             name = _local_name(child.tag)
             counts[name] = counts.get(name, 0) + 1
         seen: dict[str, int] = {}
-        pending: list[tuple[str, int, Element]] = []
+        pending: list[tuple[str, SegmentPath, int, Element]] = []
         for child in children:
             name = _local_name(child.tag)
             index = seen.get(name, 0)
@@ -102,11 +118,13 @@ def _flatten_element(root: Element) -> tuple[dict[str, str], tuple[str, ...]]:
                     notes.add(NOTE_ARRAY_LIMIT)
                     continue
                 path = _join(prefix, f"{name}.{index}")
+                child_segments: SegmentPath = (*segments, (name, False), (str(index), True))
             else:
                 path = _join(prefix, name)
-            pending.append((path, depth + 1, child))
+                child_segments = (*segments, (name, False))
+            pending.append((path, child_segments, depth + 1, child))
         stack.extend(reversed(pending))
-    return fields, tuple(sorted(notes))
+    return out
 
 
 def parse_xml(text: str) -> XmlRecord | None:
@@ -119,5 +137,10 @@ def parse_xml(text: str) -> XmlRecord | None:
         return None
     if root is None:
         return None
-    fields, notes = _flatten_element(root)
-    return XmlRecord(root=_local_name(root.tag), fields=fields, notes=notes)
+    out = _flatten_element(root)
+    return XmlRecord(
+        root=_local_name(root.tag),
+        fields=out.fields,
+        notes=tuple(sorted(out.notes)),
+        structure=out.structure,
+    )

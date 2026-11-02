@@ -201,3 +201,21 @@ def test_repr_shows_no_key_material(vault: RevealVault) -> None:
     text = repr(vault)
     assert DATA_KEY.hex() not in text
     assert "acme" in text
+
+
+def test_a_later_sighting_extends_the_expiry_of_a_backfilled_entry(vault: RevealVault) -> None:
+    # A backfilled record (already past retention) arrives first, then a live one for the
+    # same value: the entry must follow the live record's retention, not stay expired.
+    token_text = raw_token("CUST-88210")
+    vault.put_many(entries("CUST-88210", expires_at=NOW - timedelta(days=10)))
+    assert vault.reveal([token_text], now=NOW) == {}
+    assert vault.put_many(entries("CUST-88210", expires_at=LATER)) == 1
+    assert vault.reveal([token_text], now=NOW) == {token_text: "CUST-88210"}
+    assert vault.count() == 1
+
+
+def test_an_earlier_expiry_never_shortens_an_entry(vault: RevealVault) -> None:
+    token_text = raw_token("CUST-88210")
+    vault.put_many(entries("CUST-88210", expires_at=LATER))
+    assert vault.put_many(entries("CUST-88210", expires_at=NOW - timedelta(days=10))) == 0
+    assert vault.reveal([token_text], now=NOW + timedelta(days=29)) == {token_text: "CUST-88210"}

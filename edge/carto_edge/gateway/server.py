@@ -12,8 +12,9 @@ helpers mirror ``carto_core.ingest.server`` rather than reuse it.
 :func:`run_gateway` refuses to start, before opening any store, when the sources file is
 missing or invalid or a listener file is missing (exit 2), or when the keys cannot be loaded
 (exit 1; ``carto-ctl key init`` creates them). Then it opens the disk buffer and the cursor
-store, builds the ingestor, the reveal service and, when ``core.url`` is set, the forwarder and
-heartbeater threads, runs the poll scheduler and a housekeeping loop (stale batches sealed
+store, builds the ingestor, the reveal service and, when ``core.url`` is set, the forwarder,
+heartbeater and inventory reporter threads (ADR 0050), runs the poll scheduler and a
+housekeeping loop (stale batches sealed
 every second, templates and field statistics persisted every ``gateway.stats_flush_seconds``)
 inside the application lifespan, and serves until signalled. Shutdown stops the tasks and
 threads, seals every partial batch into the buffer and closes the stores.
@@ -222,8 +223,10 @@ def _serve(settings: EdgeSettings, runtime: EdgeRuntime) -> int:
     from carto_edge.pipeline.forward import (  # noqa: PLC0415
         Forwarder,
         Heartbeater,
+        InventoryReporter,
         SourceHealth,
         build_core_client,
+        edge_id_for,
     )
     from carto_edge.state import CursorStore  # noqa: PLC0415
 
@@ -257,6 +260,23 @@ def _serve(settings: EdgeSettings, runtime: EdgeRuntime) -> int:
                     target=heartbeater.run,
                     args=(stop, core.heartbeat_seconds),
                     name="edge-heartbeater",
+                    daemon=True,
+                )
+            )
+            inventory = InventoryReporter(
+                client,
+                settings.tenant_id,
+                runtime.sources,
+                metrics=metrics,
+                edge_id=edge_id_for(core),
+                sources_path=settings.sources_file,
+                default_poll_seconds=settings.gateway.poll_seconds,
+            )
+            threads.append(
+                threading.Thread(
+                    target=inventory.run,
+                    args=(stop, core.heartbeat_seconds),
+                    name="edge-inventory",
                     daemon=True,
                 )
             )

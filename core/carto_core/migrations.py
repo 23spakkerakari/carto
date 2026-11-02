@@ -13,6 +13,11 @@ fixed table name; lookups use server-side query parameters (spec 14.7).
 PostgreSQL: Alembic scripts under ``core/migrations/postgres`` run through the Alembic API on an
 engine built from settings (``carto-core migrate``); the password never lands in ``alembic.ini``.
 
+``carto-core migrate`` runs both stores under :func:`migration_lock`, a PostgreSQL session
+advisory lock with a fixed key, so two migrate jobs started together (a Compose restart, two
+pods) never interleave. ClickHouse has no lock of its own; its ledger row is written right
+after each statement runs.
+
 The wheel carries both script directories as ``carto_core/_migrations`` (``core/pyproject.toml``),
 so the service images find them; a source checkout uses ``core/migrations``. A missing or empty
 directory is an error, never "up to date".
@@ -22,14 +27,19 @@ from __future__ import annotations
 
 import hashlib
 import re
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final, Protocol
 
+import sqlalchemy
 from alembic import command
 from alembic.config import Config
+from sqlalchemy.exc import SQLAlchemyError
+
+from carto_common.logging import get_logger
 
 if TYPE_CHECKING:
     from sqlalchemy import Engine
@@ -38,6 +48,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "CLICKHOUSE_MIGRATIONS_DIR",
+    "MIGRATION_LOCK_KEY",
     "MIGRATION_TABLE",
     "POSTGRES_MIGRATIONS_DIR",
     "TTL_TABLES",
@@ -48,6 +59,7 @@ __all__ = [
     "apply_retention",
     "current_ttl_days",
     "load_clickhouse_migrations",
+    "migration_lock",
     "render",
 ]
 
@@ -78,6 +90,11 @@ _TTL_PATTERN: Final = re.compile(
     r"TTL toDateTime\(observed_at\) \+ (?:toIntervalDay\((\d+)\)|INTERVAL (\d+) DAY)"
 )
 _MAX_MIGRATION_BYTES: Final = 256 * 1024
+
+MIGRATION_LOCK_KEY: Final = 0x636172746F6D6967
+"""The advisory lock key of ``carto-core migrate``: the ASCII bytes of ``cartomig``."""
+
+log = get_logger(component="migrations")
 
 
 class MigrationError(Exception):
@@ -229,6 +246,33 @@ def apply_retention(client: ClickHouseClientLike, retention: RetentionSettings) 
         )
         changed.append(table)
     return changed
+
+
+@contextmanager
+def migration_lock(engine: Engine) -> Iterator[None]:
+    """Hold the PostgreSQL session advisory lock :data:`MIGRATION_LOCK_KEY` for the block.
+
+    A second holder waits (and logs that it waits) until the first releases it. The lock lives
+    on its own autocommit connection, so no transaction stays open while it is held. It is
+    released explicitly, and the connection is discarded when the release fails: a pooled
+    connection would otherwise keep the lock.
+    """
+    parameters = {"key": MIGRATION_LOCK_KEY}
+    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
+        taken = connection.execute(
+            sqlalchemy.text("SELECT pg_try_advisory_lock(:key)"), parameters
+        ).scalar_one()
+        if not taken:
+            log.info("migration lock held by another migrate run, waiting")
+            connection.execute(sqlalchemy.text("SELECT pg_advisory_lock(:key)"), parameters)
+        try:
+            yield
+        finally:
+            try:
+                connection.execute(sqlalchemy.text("SELECT pg_advisory_unlock(:key)"), parameters)
+            except SQLAlchemyError:
+                connection.invalidate()
+                raise
 
 
 def alembic_config(directory: Path = POSTGRES_MIGRATIONS_DIR) -> Config:

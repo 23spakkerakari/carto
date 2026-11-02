@@ -65,7 +65,7 @@ APPENDIX_A: dict[str, tuple[dict[str, Any], str | None, type[Any]]] = {
                     "sql": (
                         "SELECT id, po_num, order_ref, status, warehouse_code, created_by, "
                         "updated_at FROM purchase_orders WHERE updated_at > :watermark "
-                        "ORDER BY updated_at LIMIT :batch"
+                        "AND updated_at <= :upper ORDER BY updated_at LIMIT :batch"
                     ),
                     "watermark_column": "updated_at",
                     "timestamp_column": "updated_at",

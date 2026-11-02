@@ -39,8 +39,12 @@ OPEN_ENDED_FAULT_SPAN = timedelta(days=1)
 
 FieldKey = tuple[str, str, str, str]
 """A field and a form as a plain tuple: system, source, field, form."""
+FieldOnlyKey = tuple[str, str, str]
+"""A field as a plain tuple: system, source, field (family members, spec 9.6)."""
 LinkPair = tuple[FieldKey, FieldKey]
 """The two ends of a link in sorted order, so direction does not matter."""
+FieldPair = tuple[FieldOnlyKey, FieldOnlyKey]
+"""The two fields of a link in sorted order, forms dropped (bridges)."""
 HopPair = tuple[str, str]
 
 
@@ -74,19 +78,40 @@ def field_key(ref: FieldRef, form: str) -> FieldKey:
     return (ref.system_id, ref.source_id, ref.field, form)
 
 
+def field_only_key(ref: FieldRef) -> FieldOnlyKey:
+    """The hashable identity of a field, whatever form a link used (entity purity)."""
+    return (ref.system_id, ref.source_id, ref.field)
+
+
 def link_pair(a: FieldRef, form_a: str, b: FieldRef, form_b: str) -> LinkPair:
     """The unordered pair of (field, form) ends of a link."""
     first, second = sorted((field_key(a, form_a), field_key(b, form_b)))
     return (first, second)
 
 
+def field_pair(a: FieldRef, b: FieldRef) -> FieldPair:
+    """The unordered pair of fields of a link, whatever forms it used (bridges)."""
+    first, second = sorted((field_only_key(a), field_only_key(b)))
+    return (first, second)
+
+
+def _fields_of(pair: LinkPair) -> FieldPair:
+    (sa, oa, fa, _form_a), (sb, ob, fb, _form_b) = pair
+    first, second = sorted(((sa, oa, fa), (sb, ob, fb)))
+    return (first, second)
+
+
 @dataclass(frozen=True, slots=True)
 class PrecisionRecall:
-    """Set overlap between what the truth holds and what was predicted."""
+    """Set overlap between what the truth holds and what was predicted. ``matched_expected``
+    is set when the two sides are keyed differently (bridges by field pair, other links by
+    field and form) and the number of expected items reached can differ from the number of
+    predictions that hit; it defaults to ``matched``."""
 
     matched: int
     predicted: int
     expected: int
+    matched_expected: int | None = None
 
     @property
     def precision(self) -> float | None:
@@ -95,8 +120,9 @@ class PrecisionRecall:
 
     @property
     def recall(self) -> float | None:
-        """Matched over expected; None when the truth holds nothing of the kind."""
-        return ratio(self.matched, self.expected)
+        """Expected items reached over expected; None when the truth holds nothing of the kind."""
+        reached = self.matched if self.matched_expected is None else self.matched_expected
+        return ratio(reached, self.expected)
 
 
 def _overlap(expected: AbstractSet[object], predicted: AbstractSet[object]) -> PrecisionRecall:
@@ -119,21 +145,61 @@ def link_precision_recall(
 
     A link is the unordered pair of its (field, form) ends, so a predicted link in the other
     direction still matches, and a composite link is compared on its primary pair only (the
-    components are evidence, spec 9.5). ``link_types`` filters both sides: a truth bridge scored
-    with ``{"exact", "bridge"}`` matches a predicted exact link with the same ends, because the
-    table does not separate the two. The role is not compared.
+    components are evidence, spec 9.5). A bridge is compared by its field pair without the
+    forms: it is a property of two fields carried by one record (spec 9.4), every form of the
+    field co-occurs the same way, and the engine stores one link per field pair, so a truth
+    bridge named with ``digits.0`` and a predicted bridge in ``raw`` are the same link. A
+    bridge on either side also matches a non-bridge link over the same field pair, and a
+    non-bridge matches a non-bridge on field and form. ``link_types`` filters both sides: a
+    truth bridge scored with ``{"exact", "bridge"}`` matches a predicted exact link with the
+    same ends, because the table does not separate the two. The role is not compared.
     """
-    expected = {
-        link_pair(link.a, link.form_a, link.b, link.form_b)
-        for link in truth_links
-        if link.link_type in link_types
-    }
-    predicted = {
-        link_pair(link.a, link.form_a, link.b, link.form_b)
-        for link in predicted_links
-        if link.link_type in link_types
-    }
-    return _overlap(expected, predicted)
+    expected_forms: set[LinkPair] = set()
+    expected_fields: set[FieldPair] = set()
+    for link in truth_links:
+        if link.link_type not in link_types:
+            continue
+        if link.link_type == "bridge":
+            expected_fields.add(field_pair(link.a, link.b))
+        else:
+            expected_forms.add(link_pair(link.a, link.form_a, link.b, link.form_b))
+    predicted_forms: set[LinkPair] = set()
+    predicted_fields: set[FieldPair] = set()
+    for prediction in predicted_links:
+        if prediction.link_type not in link_types:
+            continue
+        if prediction.link_type == "bridge":
+            predicted_fields.add(field_pair(prediction.a, prediction.b))
+        else:
+            predicted_forms.add(
+                link_pair(prediction.a, prediction.form_a, prediction.b, prediction.form_b)
+            )
+    predicted_form_fields = {_fields_of(pair) for pair in predicted_forms}
+    expected_form_fields = {_fields_of(pair) for pair in expected_forms}
+    reached = sum(
+        1
+        for pair in expected_forms
+        if pair in predicted_forms or _fields_of(pair) in predicted_fields
+    ) + sum(
+        1
+        for fields in expected_fields
+        if fields in predicted_fields or fields in predicted_form_fields
+    )
+    hits = sum(
+        1
+        for pair in predicted_forms
+        if pair in expected_forms or _fields_of(pair) in expected_fields
+    ) + sum(
+        1
+        for fields in predicted_fields
+        if fields in expected_fields or fields in expected_form_fields
+    )
+    return PrecisionRecall(
+        matched=hits,
+        predicted=len(predicted_forms) + len(predicted_fields),
+        expected=len(expected_forms) + len(expected_fields),
+        matched_expected=reached,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,19 +221,22 @@ def entity_purity(
 ) -> PurityResult:
     """18.4 "Entity family purity".
 
-    The purity of one predicted family is the largest share of its distinct (field, form)
-    members that belong to a single true entity; a member of no true entity counts in the size
-    and in no share. The metric is the size-weighted mean over predicted families: the sum of
-    the largest counts over the sum of the sizes. Families without members are ignored; no
-    family at all gives None.
+    The purity of one predicted family is the largest share of its distinct field members that
+    belong to a single true entity; a member of no true entity counts in the size and in no
+    share. Members are fields (system, source, field): spec 9.6 builds families over fields and
+    the form is how a link matched, not another member, so ``order_ref`` reached as ``raw`` by
+    one link and as ``digits.0`` by another is one member (changed 2026-10-18 with the M2
+    engine; the truth's forms are the ones its links use). The metric is the size-weighted mean
+    over predicted families: the sum of the largest counts over the sum of the sizes. Families
+    without members are ignored; no family at all gives None.
     """
-    owners: dict[FieldKey, set[str]] = {}
+    owners: dict[FieldOnlyKey, set[str]] = {}
     for entity in truth_entities:
         for member in entity.fields:
-            owners.setdefault(field_key(member.ref, member.form), set()).add(entity.entity_id)
+            owners.setdefault(field_only_key(member.ref), set()).add(entity.entity_id)
     families = members = pure_members = 0
     for family in predicted_entities:
-        distinct = {field_key(member.ref, member.form) for member in family.fields}
+        distinct = {field_only_key(member.ref) for member in family.fields}
         if not distinct:
             continue
         families += 1

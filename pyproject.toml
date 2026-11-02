@@ -147,6 +147,8 @@ module = [
   "opentelemetry.*",
   "google.protobuf.*",
   "defusedxml.*",
+  "authlib.*",
+  "sklearn.*",
 ]
 ignore_missing_imports = true
 

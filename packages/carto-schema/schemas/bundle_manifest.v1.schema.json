@@ -8,6 +8,20 @@
           "title": "Events",
           "type": "integer"
         },
+        "events_future": {
+          "default": 0,
+          "description": "Events whose time lay after the plausible range and became the ingest time (ADR 0036); also counted in events.",
+          "minimum": 0,
+          "title": "Events Future",
+          "type": "integer"
+        },
+        "events_too_old": {
+          "default": 0,
+          "description": "Records dropped because their time lay before the plausible range (ADR 0036); also counted in records_dropped.",
+          "minimum": 0,
+          "title": "Events Too Old",
+          "type": "integer"
+        },
         "fields_dropped": {
           "minimum": 0,
           "title": "Fields Dropped",

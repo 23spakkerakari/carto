@@ -28,7 +28,10 @@ see the same state volume and KMS.
   check) makes the exit status 1; the gateway's scheduler applies the same gate before polling.
 
 Every change (rotate, rewrap, secret set and delete) is written to the edge audit file (spec 2.3
-invariant 6) with the operating-system user as the actor. Exit codes: 0 success, 1 failure, 2
+invariant 6) with the operating-system user as the actor, before it is made: the audit file is
+opened first (a broken chain or an unwritable file stops the command with nothing changed), an
+``<action>.intent`` row is written, the change is applied, and ``<action>.done`` or
+``<action>.failed`` (with the exception type) follows. Exit codes: 0 success, 1 failure, 2
 usage. Nothing printed or logged carries key material, a secret value or a record value.
 """
 
@@ -36,15 +39,16 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import getpass
 import json
 import sys
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 from typing import Final, TextIO
 
 from carto_common.crypto import CryptoError, KeyWrapper, KmsProvider, LocalKms, WrappedKey
-from carto_edge.audit import EdgeAudit
+from carto_edge.audit import AuditChainError, EdgeAudit
 from carto_edge.config import ConfigError, EdgeSettings, SourceType, load_sources_file
 from carto_edge.connectors.base import ConnectorContext, ConnectorError, ReadConnector, TestResult
 from carto_edge.connectors.registry import build_connector
@@ -148,9 +152,36 @@ def _actor() -> str:
         return "cli:unknown"
 
 
-def _audit(settings: EdgeSettings, action: str, target: str, details: dict[str, object]) -> None:
-    with EdgeAudit(settings.audit_file) as audit:
-        audit.record(action, _actor(), target, details)
+class AuditUnavailableError(Exception):
+    """The audit file cannot be opened or written; the change was not made."""
+
+
+@contextlib.contextmanager
+def _audited(
+    settings: EdgeSettings, action: str, target: str, details: Mapping[str, object]
+) -> Iterator[dict[str, object]]:
+    """Audit a change around the ``with`` body (module docstring). The body fills the yielded
+    mapping with the outcome details. Raises :class:`AuditUnavailableError`, before the body
+    runs, when the intent row cannot be written."""
+    actor = _actor()
+    try:
+        audit = EdgeAudit(settings.audit_file)
+    except (AuditChainError, OSError) as exc:
+        msg = f"cannot open the audit file {settings.audit_file}: {exc}"
+        raise AuditUnavailableError(msg) from exc
+    with audit:
+        try:
+            audit.record(f"{action}.intent", actor, target, details)
+        except (AuditChainError, OSError) as exc:
+            msg = f"cannot write to the audit file {settings.audit_file}: {type(exc).__name__}"
+            raise AuditUnavailableError(msg) from exc
+        outcome: dict[str, object] = {}
+        try:
+            yield outcome
+        except BaseException as exc:
+            audit.record(f"{action}.failed", actor, target, {"error": type(exc).__name__})
+            raise
+        audit.record(f"{action}.done", actor, target, outcome)
 
 
 def _fail(err: TextIO, message: str) -> int:
@@ -183,17 +214,17 @@ def _key_rotate(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
     settings = _settings(args)
     manager = KeyManager(settings)
     try:
-        keyring = manager.rotate(args.overlap_days)
+        with _audited(
+            settings, "key.rotate", "tenant-key", {"overlap_days": args.overlap_days}
+        ) as outcome:
+            keyring = manager.rotate(args.overlap_days)
+            versions = [key.version for key in keyring.tokenization_keys()]
+            outcome.update(active_version=keyring.active.version, versions=versions)
         status = manager.status()
+    except AuditUnavailableError as exc:
+        return _fail(err, f"key rotation refused: {exc}")
     except (KeyManagementError, CryptoError) as exc:
         return _fail(err, f"key rotation failed: {exc}")
-    versions = [key.version for key in keyring.tokenization_keys()]
-    _audit(
-        settings,
-        "key.rotate",
-        "tenant-key",
-        {"active_version": keyring.active.version, "versions": versions},
-    )
     out.write(
         f"active version {keyring.active.version}; tokenizing under {versions}; "
         f"overlap {status['overlap_days']} days. Restart edge-gateway to load the new keyring.\n"
@@ -206,19 +237,17 @@ def _key_rewrap(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
     manager = KeyManager(settings)
     try:
         old_key_id = manager.kms.key_id
-        if settings.kms.provider == "local":
-            rewritten, new_key_id = _rewrap_local(manager, settings.local_kms_key_file)
-        else:
-            rewritten = manager.rewrap(manager.kms)
-            new_key_id = manager.kms.key_id
+        with _audited(settings, "key.rewrap", "keys", {"old": old_key_id}) as outcome:
+            if settings.kms.provider == "local":
+                rewritten, new_key_id = _rewrap_local(manager, settings.local_kms_key_file)
+            else:
+                rewritten = manager.rewrap(manager.kms)
+                new_key_id = manager.kms.key_id
+            outcome.update(files=[path.name for path in rewritten], new=new_key_id)
+    except AuditUnavailableError as exc:
+        return _fail(err, f"rewrap refused: {exc}")
     except (KeyManagementError, CryptoError, OSError) as exc:
         return _fail(err, f"rewrap failed: {exc}")
-    _audit(
-        settings,
-        "key.rewrap",
-        "keys",
-        {"files": [path.name for path in rewritten], "old": old_key_id, "new": new_key_id},
-    )
     out.write(f"re-wrapped {len(rewritten)} key files under {new_key_id}; tokens are unchanged.\n")
     if settings.kms.provider == "local":
         retired = settings.local_kms_key_file.with_name(
@@ -284,12 +313,17 @@ def _secret_set(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
         return _fail(err, f"cannot read the value: {type(exc).__name__}")
     if not value:
         return _usage(err, "the value is empty")
+    target = f"local://{args.name}"
     try:
-        with _open_store(settings) as store:
+        with (
+            _audited(settings, "secret.set", target, {"bytes": len(value.encode("utf-8"))}),
+            _open_store(settings) as store,
+        ):
             store.put(args.name, value)
+    except AuditUnavailableError as exc:
+        return _fail(err, f"secret set refused: {exc}")
     except (SecretError, KeyManagementError, CryptoError) as exc:
         return _fail(err, f"secret set failed: {exc}")
-    _audit(settings, "secret.set", f"local://{args.name}", {"bytes": len(value.encode("utf-8"))})
     out.write(f"stored local://{args.name}\n")
     return EXIT_OK
 
@@ -307,13 +341,18 @@ def _secret_list(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
 def _secret_delete(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
     settings = _settings(args)
     try:
-        with _open_store(settings) as store:
+        with (
+            _audited(settings, "secret.delete", f"local://{args.name}", {}) as outcome,
+            _open_store(settings) as store,
+        ):
             existed = store.delete(args.name)
+            outcome["existed"] = existed
+    except AuditUnavailableError as exc:
+        return _fail(err, f"secret delete refused: {exc}")
     except (SecretError, KeyManagementError, CryptoError) as exc:
         return _fail(err, f"secret delete failed: {exc}")
     if not existed:
         return _fail(err, f"no local secret named {args.name!r}")
-    _audit(settings, "secret.delete", f"local://{args.name}", {})
     out.write(f"deleted local://{args.name}\n")
     return EXIT_OK
 

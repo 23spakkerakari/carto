@@ -32,7 +32,7 @@
     },
     "CanonicalEvent": {
       "additionalProperties": false,
-      "description": "The canonical event the edge sends to core (spec 7.1).\n\nField order matches the JSON in the spec so ``model_dump_json()`` reproduces it key for key.\n``template_text`` must contain constants only; that is enforced at the edge (spec 8.3 rule 7),\nnot by this model, which can only bound its length.",
+      "description": "The canonical event the edge sends to core (spec 7.1).\n\nField order matches the JSON in the spec so ``model_dump_json()`` reproduces it key for key.\n``template_text`` must contain constants only; that is enforced at the edge (spec 8.3 rule 7).\nThis model bounds its length and refuses long digit runs, and refuses field names that look\nlike values, as a backstop.",
       "properties": {
         "actor": {
           "anyOf": [

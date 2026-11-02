@@ -30,6 +30,7 @@ FILE_NAMES = [
     "bundle_manifest.v1.schema.json",
     "bundle_signature.v1.schema.json",
     "canonical_event.v1.schema.json",
+    "edge_inventory.v1.schema.json",
     "ingest_batch.v1.schema.json",
     "source_heartbeat.v1.schema.json",
 ]
@@ -76,6 +77,7 @@ def test_schema_names_ids_and_headers() -> None:
         "urn:carto:schema:bundle_manifest:v1",
         "urn:carto:schema:bundle_signature:v1",
         "urn:carto:schema:canonical_event:v1",
+        "urn:carto:schema:edge_inventory:v1",
         "urn:carto:schema:ingest_batch:v1",
         "urn:carto:schema:source_heartbeat:v1",
     ]

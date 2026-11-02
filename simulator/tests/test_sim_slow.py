@@ -12,6 +12,7 @@ import pytest
 from carto_simulator.api import GenerationRequest, generate
 from carto_simulator.ground_truth import ActorKind, iter_events, read_ground_truth
 from carto_simulator.names import SERVICE_ACCOUNT
+from carto_simulator.scenarios.shop_model import CounterBases
 
 pytestmark = pytest.mark.slow
 
@@ -38,7 +39,7 @@ def test_clerk_and_typo_shares_on_a_14_day_run(tmp_path: Path) -> None:
     for row in clerk_rows:
         txn_id = txn_of[f"src_wms_db:purchase_orders:row:{row['id']}"]
         assert txn_id is not None
-        order_id = 4471 + int(txn_id.removeprefix("txn_")) - 1
+        order_id = CounterBases.for_seed(21).order + int(txn_id.removeprefix("txn_")) - 1
         if int(row["order_ref"][3:]) != order_id:
             typos += 1
     typo_share = typos / len(clerk_rows)

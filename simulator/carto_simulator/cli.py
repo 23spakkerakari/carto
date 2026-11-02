@@ -5,6 +5,7 @@
         [--pii-density 0.3]
     carto-sim live --scenario shop --days 2 --speed 60 --out /data/sim \\
         [--duration-seconds 3600] [the generate options]
+    carto-sim as-of --out sim-out/shop
     carto-sim list
 
 Exit codes: 0 on success (a live replay stopped with Ctrl-C or SIGTERM counts as success), 2 for
@@ -71,6 +72,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="stop after this much real time; default: replay everything",
     )
+    as_of = commands.add_parser(
+        "as-of",
+        help="print the time to analyze a batch run as of (carto-edge analyze --as-of, ADR 0036)",
+    )
+    as_of.add_argument("--out", type=Path, required=True, help="the run's output directory")
     commands.add_parser("list", help="print the known scenarios")
     return parser
 
@@ -183,6 +189,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if args.command == "live":
         return _live(args)
+    if args.command == "as-of":
+        try:
+            print(api.run_as_of(args.out).isoformat().replace("+00:00", "Z"))
+        except (OSError, ValueError):
+            print(f"carto-sim: no readable run manifest under {args.out}", file=sys.stderr)
+            return 2
+        return 0
     return _generate(args)
 
 

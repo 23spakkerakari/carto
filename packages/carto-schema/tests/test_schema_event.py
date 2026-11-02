@@ -301,25 +301,36 @@ def test_attribute_value_length_limit() -> None:
     assert ("string_too_long", ("attributes", "status")) in errors_of(info)
 
 
+def _names(count: int) -> list[str]:
+    """``count`` distinct field names without digit runs (``a.a``, ``a.b``, ...)."""
+    letters = "abcdefghijklmnopqrstuvwxyz"
+    return [
+        f"{letters[i // 676 % 26]}{letters[i // 26 % 26]}.{letters[i % 26]}" for i in range(count)
+    ]
+
+
 def test_attribute_count_limit() -> None:
     data = example_dict()
-    data["attributes"] = {f"k{i}": "v" for i in range(MAX_ATTRIBUTES)}
+    data["attributes"] = dict.fromkeys(_names(MAX_ATTRIBUTES), "v")
     CanonicalEvent.model_validate(data)
-    data["attributes"][f"k{MAX_ATTRIBUTES}"] = "v"
+    data["attributes"]["one_more"] = "v"
     with pytest.raises(ValidationError) as info:
         CanonicalEvent.model_validate(data)
     assert ("too_long", ("attributes",)) in errors_of(info)
 
 
-@pytest.mark.parametrize("key", ["", "k" * (MAX_ATTRIBUTE_KEY_LEN + 1)])
+@pytest.mark.parametrize("key", ["", ("k" * 63 + ".") * 2 + "kk"])
 def test_attribute_key_length_limits(key: str) -> None:
     data = example_dict()
-    data["attributes"] = {"k" * MAX_ATTRIBUTE_KEY_LEN: "v"}
+    longest = ("k" * 63 + ".") * 2  # two segments of 63 and a dot each: 128 characters
+    assert len(longest) == MAX_ATTRIBUTE_KEY_LEN
+    data["attributes"] = {longest: "v"}
     CanonicalEvent.model_validate(data)
     data["attributes"] = {key: "v"}
     with pytest.raises(ValidationError) as info:
         CanonicalEvent.model_validate(data)
-    assert errors_of(info)[0][1][:2] == ("attributes", key)
+    # The key is not part of the location: a rejected key may be a value (spec 2.3 #2).
+    assert errors_of(info) == [("value_error", ("attributes",))]
 
 
 def test_attribute_values_must_be_strings() -> None:
@@ -340,7 +351,7 @@ def test_template_text_length_limit() -> None:
 
 def test_dropped_fields_limits() -> None:
     data = example_dict()
-    data["dropped_fields"] = [f"f{i}" for i in range(MAX_DROPPED_FIELDS)]
+    data["dropped_fields"] = _names(MAX_DROPPED_FIELDS)
     CanonicalEvent.model_validate(data)
     data["dropped_fields"].append("one_more")
     with pytest.raises(ValidationError) as info:
@@ -464,12 +475,13 @@ def test_edge_ids_are_accepted(key: str, value: str) -> None:
 
 
 def test_identifier_field_limits() -> None:
-    ok = Identifier(field="f" * 256, form="raw", token=make_token(1), shape="A9" * 32, len=1)
+    longest = ".".join(["f" * 64] * 3 + ["f" * 61])  # 256 characters in 64-character segments
+    ok = Identifier(field=longest, form="raw", token=make_token(1), shape="A9" * 32, len=1)
     assert ok.len == 1
     assert len(ok.shape) == 64
     for bad in (
         {"field": ""},
-        {"field": "f" * 257},
+        {"field": longest + "f"},
         {"shape": ""},
         {"shape": "A9" * 33},
         {"shape": "SO-0004471"},
@@ -484,6 +496,85 @@ def test_identifier_field_limits() -> None:
     ):
         with pytest.raises(ValidationError):
             Identifier.model_validate({**identifier_dict(1), **bad})
+
+
+# -- names that carry values (spec 2.3 invariant 2, ADR 0027) ----------------------------------
+
+VALUE_NAMES = [
+    "customers.jane.doe@example.com.SO-0004471",  # an email address and an order number
+    "Alice Smith 4111111111111111",  # a card number in an attribute key
+    "ssn 078-05-1120",  # a social security number in a dropped field name
+    "orders.SO-0004471.status",  # a JSON map keyed by order number
+    "stock.SKU-123.qty",  # three digits are a value, not a name
+    "a" * 65,  # a segment longer than any field name: a value
+    "notes.x" + "y" * 64,
+    "user.jdoe@corp",  # @ after the first character
+]
+EDGE_NAMES = [
+    "status",
+    "payload.order.id",
+    "balances.0.key",  # a map entry the name gate numbered (ADR 0030)
+    "balances.19.value.amount",
+    "items.3.sku",  # an array index
+    "*",  # the mask for a value-like segment
+    "stock.*.qty",
+    "@id",  # an XML attribute
+    "order.@currency",
+    "param_0",
+    "msg.param_12",
+    "a" * 64,
+    "utf8_name",
+    "ipv4.addr",
+]
+
+
+@pytest.mark.parametrize("name", VALUE_NAMES)
+def test_names_that_carry_values_are_rejected_everywhere(name: str) -> None:
+    """Core's backstop for the edge's name masking: a field name, attribute key or dropped
+    field that looks like a value is refused, and the error does not repeat it."""
+    for data in (
+        {**example_dict(), "attributes": {name: "v"}},
+        {**example_dict(), "dropped_fields": [name]},
+        {**example_dict(), "identifiers": [{**identifier_dict(1), "field": name}]},
+    ):
+        with pytest.raises(ValidationError) as info:
+            CanonicalEvent.model_validate(data)
+        for piece in name.replace("@", ".").split("."):
+            if len(piece) >= 4:
+                assert piece not in str(info.value)
+                assert piece not in json.dumps(
+                    info.value.errors(include_input=False, include_context=False, include_url=False)
+                )
+
+
+@pytest.mark.parametrize("name", EDGE_NAMES)
+def test_names_the_edge_emits_are_accepted(name: str) -> None:
+    data = {
+        **example_dict(),
+        "attributes": {name: "v"},
+        "dropped_fields": [name],
+        "identifiers": [{**identifier_dict(1), "field": name}],
+    }
+    event = CanonicalEvent.model_validate(data)
+    assert event.dropped_fields == [name]
+
+
+@pytest.mark.parametrize(
+    "text", ["refund for order 0004471 issued", "card 4111111111111111", "id=123456"]
+)
+def test_template_text_with_a_long_digit_run_is_rejected(text: str) -> None:
+    with pytest.raises(ValidationError) as info:
+        CanonicalEvent.model_validate({**example_dict(), "template_text": text})
+    assert ("value_error", ("template_text",)) in errors_of(info)
+    assert text not in str(info.value)
+
+
+@pytest.mark.parametrize(
+    "text", ["GET /api/v1/orders/<*> HTTP/1.1 200", "retry 3 of 10000", "keys:a,b,c", ""]
+)
+def test_template_text_with_short_numbers_is_accepted(text: str) -> None:
+    event = CanonicalEvent.model_validate({**example_dict(), "template_text": text})
+    assert event.template_text == text
 
 
 def test_shape_must_be_a_shape() -> None:

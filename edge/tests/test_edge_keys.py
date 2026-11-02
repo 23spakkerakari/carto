@@ -37,6 +37,7 @@ from carto_edge.keys import (
     RotationState,
     build_kms,
     previous_key_file,
+    versioned_key_file,
 )
 
 NOW = datetime(2026, 10, 8, 12, 0, tzinfo=UTC)
@@ -167,8 +168,9 @@ def test_rotate_creates_version_two_and_keeps_one_in_overlap(
     assert keyring.previous[0].token("id", "SO-0004471") == old_token
     assert keyring.active.token("id", "SO-0004471") != old_token
 
-    active = WrappedKey.read(settings.tenant_key_file)
+    active = WrappedKey.read(versioned_key_file(settings.keys_dir, 2))
     assert active.context["version"] == "2"
+    assert not settings.tenant_key_file.exists()  # the legacy name is migrated away
     previous = WrappedKey.read(previous_key_file(settings.keys_dir, 1))
     assert previous_key_file(settings.keys_dir, 1) == settings.keys_dir / "tenant-key.v1.json"
     assert previous.context["version"] == "1"
@@ -449,7 +451,7 @@ def test_rewrap_moves_every_wrapped_key_to_the_new_kms_and_keeps_tokens(tmp_path
     previous_token = before.previous[0].token("id", "SO-0004471")
     vault_key = manager.vault_data_key()
     names = [path.name for path in manager.wrapped_key_files()]
-    assert names == ["tenant-key.json", "tenant-key.v1.json", "vault-data-key.json"]
+    assert names == ["tenant-key.v1.json", "tenant-key.v2.json", "vault-data-key.json"]
 
     new_kms = LocalKms.create(tmp_path / "new-master.key")
     rewritten = manager.rewrap(new_kms)
@@ -492,3 +494,108 @@ def test_rewrap_failure_leaves_the_old_files_untouched(tmp_path: Path) -> None:
     assert {path.name: path.read_bytes() for path in manager.wrapped_key_files()} == originals
     assert not list(settings.keys_dir.glob("*.rewrap"))
     assert manager.load_keyring().active.version == 1
+
+
+# ---------------------------------------------------------------------------------------------
+# Crash consistency: rotation.json is the one commit point (ADR 0042)
+# ---------------------------------------------------------------------------------------------
+
+
+class _PowerCutError(Exception):
+    pass
+
+
+def _cut_power_at(monkeypatch: pytest.MonkeyPatch, name: str) -> None:
+    """Fail the atomic replace that would install ``name``."""
+    real_replace = os.replace
+
+    def replace(src: str | os.PathLike[str], dst: str | os.PathLike[str]) -> None:
+        if Path(dst).name == name:
+            raise _PowerCutError(name)
+        real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", replace)
+
+
+@pytest.mark.parametrize("cut_at", ["tenant-key.v1.json", "tenant-key.v2.json", ROTATION_FILE])
+def test_a_crash_during_rotation_leaves_the_old_keyring_and_rotation_retries(
+    settings: EdgeSettings,
+    manager: KeyManager,
+    clock: FakeClock,
+    monkeypatch: pytest.MonkeyPatch,
+    cut_at: str,
+) -> None:
+    before = manager.load_keyring()
+    with monkeypatch.context() as patched:
+        _cut_power_at(patched, cut_at)
+        with pytest.raises(_PowerCutError):
+            manager.rotate(overlap_days=10)
+    after_crash = KeyManager(settings, clock=clock).load_keyring()
+    assert after_crash == before
+    assert not list(settings.keys_dir.glob("*.tmp"))
+    rotated = KeyManager(settings, clock=clock).rotate(overlap_days=10)
+    assert rotated.active.version == 2
+    assert rotated.previous[0].material == before.active.material
+    assert KeyManager(settings, clock=clock).load_keyring() == rotated
+
+
+def test_a_crash_after_the_commit_loads_the_new_keyring(
+    settings: EdgeSettings, manager: KeyManager, clock: FakeClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with monkeypatch.context() as patched:  # the power goes right after the commit
+        patched.setattr(KeyManager, "_remove_superseded", lambda _self, _retired: None)
+        rotated = manager.rotate(overlap_days=10)
+    assert settings.tenant_key_file.exists()  # the legacy file survived the cut
+    assert KeyManager(settings, clock=clock).load_keyring() == rotated
+    status = KeyManager(settings, clock=clock).status()
+    assert status["active_version"] == 2
+    again = KeyManager(settings, clock=clock).rotate(overlap_days=10)
+    assert again.active.version == 3
+    assert not settings.tenant_key_file.exists()
+
+
+def test_the_legacy_single_file_layout_still_loads(
+    settings: EdgeSettings, manager: KeyManager
+) -> None:
+    assert settings.tenant_key_file.exists()
+    assert not versioned_key_file(settings.keys_dir, 1).exists()
+    assert manager.load_keyring().active.version == 1
+    assert manager.status()["active_fingerprint"] is not None
+
+
+def test_a_key_file_with_the_wrong_version_is_refused(
+    settings: EdgeSettings, manager: KeyManager
+) -> None:
+    manager.rotate(overlap_days=10)
+    one = versioned_key_file(settings.keys_dir, 1)
+    two = versioned_key_file(settings.keys_dir, 2)
+    one.write_bytes(two.read_bytes())
+    with pytest.raises(KeyManagementError, match="version"):
+        manager.load_keyring()
+
+
+def test_key_files_are_fsynced_with_their_directory(
+    settings: EdgeSettings, manager: KeyManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    synced: list[int] = []
+    real_fsync = os.fsync
+
+    def fsync(descriptor: int) -> None:
+        synced.append(descriptor)
+        real_fsync(descriptor)
+
+    directories: list[Path] = []
+    monkeypatch.setattr(os, "fsync", fsync)
+    monkeypatch.setattr("carto_common.crypto.fsync_directory", directories.append)
+    monkeypatch.setattr("carto_edge.keys.fsync_directory", directories.append)
+    manager.rotate(overlap_days=10)
+    # the migrated v1, the new v2 and rotation.json: one file fsync and one directory sync each
+    assert len(synced) >= 3
+    assert directories.count(settings.keys_dir) >= 3
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX permission bits")
+def test_rotated_key_files_are_owner_only(settings: EdgeSettings, manager: KeyManager) -> None:
+    manager.rotate(overlap_days=10)
+    for path in settings.keys_dir.glob("*.json"):
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600, path.name

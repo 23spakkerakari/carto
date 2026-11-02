@@ -2,9 +2,13 @@
 # networks; only the reverse proxy publishes a port", 14.6 container hardening).
 #
 # M1 services: PostgreSQL, ClickHouse, ingest-api, edge-gateway, the OpenTelemetry Collector and
-# the simulator in live mode for `make dev`. The reverse proxy, api, web and the workers join in
-# later milestones. Passwords come from Docker secrets (files under ./secrets, never from the
-# environment); keys live in the edge state volume wrapped by the local KMS (ADR 0012).
+# the simulator in live mode for `make dev`. M2 adds the console: `api` (spec 12), `worker` (the
+# profiler and linker jobs, spec 5.3), `web` (nginx serving the console and proxying /api/ to
+# `api` over mutual TLS, the one origin of ADR 0052; it publishes CARTO_WEB_PORT) and, under the
+# `dev` profile only, `dex` as the identity provider (ADR 0052). Passwords come from Docker
+# secrets (files under ./secrets, never from the environment); keys live in the edge state
+# volume wrapped by the local KMS (ADR 0012). Each core process connects as its own database
+# role (postgres/init-roles.sh, spec 14.4): carto_ingest, carto_app, carto_worker.
 #
 # One-shot jobs run in this order on every `up` and are idempotent:
 #   volumes-init  chowns the named volumes to the carto uid (a new volume is root-owned)
@@ -20,6 +24,9 @@
 #                                              collectors holding a `carto-ctl pki issue` cert
 #   proxy-webhooks  --profile push-webhooks   HTTPS on CARTO_WEBHOOK_PORT (8443), certificate in
 #                                              ./proxy-tls, forwarded to the gateway as `proxy`
+#
+# Every service has mem_limit, cpus and pids_limit (spec 14.6, 2.3 invariant 8), sized for the
+# pilot VM of spec 5.5; ClickHouse reads its cgroup limit and keeps its own memory under it.
 #
 # First run:   make dev
 # Tear down:   docker compose -f deploy/compose/compose.yaml down -v
@@ -58,6 +65,8 @@ volumes:
   pki-edge-gateway:
   pki-otel-collector:
   pki-proxy:
+  pki-api:
+  pki-web:
   pki-ca:
   sim-data:
   otel-queue:
@@ -67,19 +76,32 @@ secrets:
     file: ./secrets/pg_password
   ch_password:
     file: ./secrets/ch_password
+  pg_ingest_password:
+    file: ./secrets/pg_ingest_password
+  pg_app_password:
+    file: ./secrets/pg_app_password
+  pg_worker_password:
+    file: ./secrets/pg_worker_password
+  oidc_client_secret:
+    file: ./secrets/oidc_client_secret
 
 services:
   postgres:
     image: postgres:16.6-bookworm
+    mem_limit: 1g
+    cpus: 1.0
+    pids_limit: 256
     <<: [*hardening, *db-capabilities]
     networks: [core]
     environment:
       POSTGRES_DB: carto
       POSTGRES_USER: carto
       POSTGRES_PASSWORD_FILE: /run/secrets/pg_password
-    secrets: [pg_password]
+    secrets: [pg_password, pg_ingest_password, pg_app_password, pg_worker_password]
     volumes:
       - pg-data:/var/lib/postgresql/data
+      # Creates the per-service roles on first start only (an initialized volume skips it).
+      - ./postgres/init-roles.sh:/docker-entrypoint-initdb.d/10-roles.sh:ro
     tmpfs: ["/tmp:size=64m", "/run/postgresql:size=16m"]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U carto -d carto"]
@@ -89,6 +111,9 @@ services:
 
   clickhouse:
     image: clickhouse/clickhouse-server:24.8
+    mem_limit: 4g
+    cpus: 2.0
+    pids_limit: 2048
     <<: [*hardening, *db-capabilities]
     # The image's init step (create the database) stops its temporary server, which runs as the
     # clickhouse uid, from the root entrypoint: that signal needs KILL on top of the db set.
@@ -119,6 +144,9 @@ services:
 
   volumes-init:
     image: carto-ctl:dev
+    mem_limit: 64m
+    cpus: 0.25
+    pids_limit: 32
     build:
       context: ../..
       dockerfile: deploy/docker/base.Dockerfile
@@ -134,12 +162,15 @@ services:
     command:
       - >-
         chown 10001:10001 /mnt/pki-ingest-api /mnt/pki-edge-gateway /mnt/pki-otel-collector
-        /mnt/pki-proxy /mnt/pki-ca /mnt/edge-state /mnt/sim-data /mnt/otel-queue
+        /mnt/pki-proxy /mnt/pki-api /mnt/pki-web /mnt/pki-ca /mnt/edge-state /mnt/sim-data
+        /mnt/otel-queue
     volumes:
       - pki-ingest-api:/mnt/pki-ingest-api
       - pki-edge-gateway:/mnt/pki-edge-gateway
       - pki-otel-collector:/mnt/pki-otel-collector
       - pki-proxy:/mnt/pki-proxy
+      - pki-api:/mnt/pki-api
+      - pki-web:/mnt/pki-web
       - pki-ca:/mnt/pki-ca
       - edge-state:/mnt/edge-state
       - sim-data:/mnt/sim-data
@@ -148,6 +179,9 @@ services:
 
   pki-init:
     image: carto-ctl:dev
+    mem_limit: 256m
+    cpus: 0.5
+    pids_limit: 64
     <<: *hardening
     restart: "no"
     network_mode: none
@@ -158,6 +192,8 @@ services:
       - pki-edge-gateway:/etc/carto/pki/edge-gateway
       - pki-otel-collector:/etc/carto/pki/otel-collector
       - pki-proxy:/etc/carto/pki/proxy
+      - pki-api:/etc/carto/pki/api
+      - pki-web:/etc/carto/pki/web
       - pki-ca:/etc/carto/pki-ca
     command:
       - pki
@@ -167,11 +203,14 @@ services:
       - --ca-key-dir
       - /etc/carto/pki-ca
       - --services
-      - ingest-api,edge-gateway,otel-collector,proxy
+      - ingest-api,edge-gateway,otel-collector,proxy,api,web
       - --if-missing
 
   migrate:
     image: carto-core:dev
+    mem_limit: 512m
+    cpus: 1.0
+    pids_limit: 128
     build:
       context: ../..
       dockerfile: deploy/docker/base.Dockerfile
@@ -199,6 +238,9 @@ services:
 
   ingest-api:
     image: carto-core:dev
+    mem_limit: 1g
+    cpus: 2.0
+    pids_limit: 256
     <<: *hardening
     networks: [core, edge]
     depends_on:
@@ -206,13 +248,15 @@ services:
       pki-init: { condition: service_completed_successfully }
     environment:
       <<: *core-env
+      CARTO_POSTGRES__USER: carto_ingest
+      CARTO_POSTGRES__PASSWORD_FILE: /run/secrets/pg_ingest_password
       CARTO_INGEST__HOST: 0.0.0.0
       CARTO_INGEST__PORT: "8443"
       # Its own listener CA signs its server certificate and the edge gateway's client one.
       CARTO_INGEST__TLS_CERT_FILE: /etc/carto/pki/listener.crt
       CARTO_INGEST__TLS_KEY_FILE: /etc/carto/pki/listener.key
       CARTO_INGEST__CLIENT_CA_FILE: /etc/carto/pki/listener-ca.crt
-    secrets: [pg_password, ch_password]
+    secrets: [pg_ingest_password, ch_password]
     volumes:
       - pki-ingest-api:/etc/carto/pki:ro
     command: ["ingest-api"]
@@ -224,8 +268,125 @@ services:
       retries: 8
       start_period: 20s
 
+  api:
+    image: carto-core:dev
+    mem_limit: 1g
+    cpus: 1.0
+    pids_limit: 256
+    <<: *hardening
+    networks: [core]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      pki-init: { condition: service_completed_successfully }
+    environment:
+      <<: *core-env
+      CARTO_POSTGRES__USER: carto_app
+      CARTO_POSTGRES__PASSWORD_FILE: /run/secrets/pg_app_password
+      CARTO_API__HOST: 0.0.0.0
+      CARTO_API__PORT: "8443"
+      # The console origin (what the browser uses); the web service publishes this port.
+      CARTO_API__PUBLIC_URL: https://localhost:${CARTO_WEB_PORT:-8080}
+      # Its own listener CA signs its server certificate and the web proxy's client one.
+      CARTO_API__TLS_CERT_FILE: /etc/carto/pki/listener.crt
+      CARTO_API__TLS_KEY_FILE: /etc/carto/pki/listener.key
+      # Login through the identity provider named in .env; the dev profile runs Dex under the
+      # console origin (/dex) and the api reaches it over the core network (ADR 0052).
+      CARTO_API__OIDC__ISSUER: ${CARTO_OIDC_ISSUER:-https://localhost:8080/dex}
+      CARTO_API__OIDC__BACKCHANNEL_URL: ${CARTO_OIDC_BACKCHANNEL_URL:-http://dex:5556/dex}
+      CARTO_API__OIDC__ALLOW_HTTP_ISSUER: ${CARTO_OIDC_ALLOW_HTTP:-true}
+      CARTO_API__OIDC__CLIENT_ID: ${CARTO_OIDC_CLIENT_ID:-carto-console}
+      CARTO_API__OIDC__CLIENT_SECRET_FILE: /run/secrets/oidc_client_secret
+      # Dex's static users carry no groups, so the dev stack binds roles by the email claim;
+      # a customer provider uses its groups claim (the default) and its own group names.
+      CARTO_API__OIDC__GROUPS_CLAIM: ${CARTO_OIDC_GROUPS_CLAIM:-email}
+      CARTO_API__OIDC__SCOPES: ${CARTO_OIDC_SCOPES:-openid profile email}
+      CARTO_API__BOOTSTRAP_GROUP_ROLES: ${CARTO_OIDC_GROUP_ROLES:-{"admin@carto.local":"admin","engineer@carto.local":"integration_engineer","viewer@carto.local":"business_viewer","auditor@carto.local":"auditor"}}
+      CARTO_API__CLIENT_CA_FILE: /etc/carto/pki/listener-ca.crt
+      CARTO_API__REQUIRE_CLIENT_CERT: "true"
+    secrets: [pg_app_password, ch_password, oidc_client_secret]
+    volumes:
+      - pki-api:/etc/carto/pki:ro
+    command: ["api"]
+    healthcheck:
+      test: ["CMD", "carto-core", "healthcheck", "--url", "https://localhost:8443/api/v1/healthz", "--listener", "api"]
+      interval: 15s
+      timeout: 10s
+      retries: 8
+      start_period: 20s
+
+  worker:
+    image: carto-core:dev
+    mem_limit: 2g
+    cpus: 2.0
+    pids_limit: 256
+    <<: *hardening
+    networks: [core]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+    environment:
+      <<: *core-env
+      CARTO_POSTGRES__USER: carto_worker
+      CARTO_POSTGRES__PASSWORD_FILE: /run/secrets/pg_worker_password
+    secrets: [pg_worker_password, ch_password]
+    command: ["worker"]
+
+  web:
+    image: carto-web:dev
+    mem_limit: 128m
+    cpus: 0.5
+    pids_limit: 64
+    build:
+      context: ../../web
+      dockerfile: deploy/Dockerfile
+    <<: *hardening
+    tmpfs: ["/tmp:size=64m", "/var/cache/nginx:size=32m"]
+    # The console origin: the one published port besides the push proxies (spec 14.5).
+    networks: [core, ingress]
+    ports:
+      - "${CARTO_WEB_PORT:-8080}:8443"
+    depends_on:
+      api: { condition: service_healthy }
+    volumes:
+      - ./proxy-tls:/etc/carto/proxy-tls:ro
+      - pki-web:/etc/carto/pki:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/healthz >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 8
+
+  dex:
+    image: ghcr.io/dexidp/dex:v2.41.1
+    mem_limit: 128m
+    cpus: 0.5
+    pids_limit: 64
+    <<: *hardening
+    user: "10001:10001"
+    networks: [core]
+    environment:
+      CARTO_DEX_ISSUER: ${CARTO_OIDC_ISSUER:-https://localhost:8080/dex}
+      CARTO_DEX_REDIRECT_URI: https://localhost:${CARTO_WEB_PORT:-8080}/api/v1/auth/callback
+      CARTO_DEX_CLIENT_SECRET_FILE: /run/secrets/oidc_client_secret
+    secrets: [oidc_client_secret]
+    volumes:
+      - ./dex/config.yaml:/etc/dex/config.yaml:ro
+    # The issuer and redirect URI are substituted into a copy of the config at start (Dex does
+    # not expand placeholders itself); the client secret reaches Dex through secretEnv.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        sed -e "s|\$${CARTO_DEX_ISSUER}|$${CARTO_DEX_ISSUER}|g"
+        -e "s|\$${CARTO_DEX_REDIRECT_URI}|$${CARTO_DEX_REDIRECT_URI}|g"
+        /etc/dex/config.yaml > /tmp/config.yaml &&
+        CARTO_DEX_CLIENT_SECRET="$$(tr -d '\r\n' < /run/secrets/oidc_client_secret)"
+        exec dex serve /tmp/config.yaml
+    profiles: ["dev"]
+
   key-init:
     image: carto-ctl:dev
+    mem_limit: 256m
+    cpus: 0.5
+    pids_limit: 64
     <<: *hardening
     restart: "no"
     network_mode: none
@@ -246,6 +407,9 @@ services:
 
   edge-gateway:
     image: carto-edge:dev
+    mem_limit: 2g
+    cpus: 2.0
+    pids_limit: 256
     build:
       context: ../..
       dockerfile: deploy/docker/base.Dockerfile
@@ -278,6 +442,9 @@ services:
 
   otel-collector:
     image: otel/opentelemetry-collector-contrib:0.111.0
+    mem_limit: 512m
+    cpus: 1.0
+    pids_limit: 256
     <<: *hardening
     networks: [edge]
     depends_on:
@@ -293,6 +460,9 @@ services:
 
   proxy-otlp:
     image: nginxinc/nginx-unprivileged:1.30.4-alpine
+    mem_limit: 128m
+    cpus: 0.5
+    pids_limit: 64
     <<: *hardening
     profiles: ["push-otlp"]
     user: "10001:10001"
@@ -306,6 +476,9 @@ services:
 
   proxy-webhooks:
     image: nginxinc/nginx-unprivileged:1.30.4-alpine
+    mem_limit: 128m
+    cpus: 0.5
+    pids_limit: 64
     <<: *hardening
     profiles: ["push-webhooks"]
     user: "10001:10001"
@@ -322,6 +495,9 @@ services:
 
   simulator:
     image: carto-simulator:dev
+    mem_limit: 1g
+    cpus: 1.0
+    pids_limit: 128
     build:
       context: ../..
       dockerfile: deploy/docker/base.Dockerfile

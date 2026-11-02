@@ -14,9 +14,12 @@ import json
 import logging
 import re
 import sys
+import threading
+import warnings
 from collections.abc import Iterator, Mapping
 from datetime import UTC, date, datetime, time, timedelta
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 import pytest
@@ -34,6 +37,7 @@ from carto_common.logging import (
     HIGH_ENTROPY_MASK,
     JWT_MASK,
     MAX_DEPTH,
+    METRIC_KEY_QUALIFIERS,
     PEM_MASK,
     QUIET_LIBRARY_LOGGERS,
     REDACTED,
@@ -43,6 +47,7 @@ from carto_common.logging import (
     get_logger,
     identifier_shape,
     is_drop_key,
+    is_metric_key,
     is_secret_key,
     mask_string,
     redact,
@@ -105,9 +110,11 @@ def clean_structlog() -> Iterator[None]:
     root = logging.getLogger()
     handlers_before = list(root.handlers)
     level_before = root.level
+    hooks_before = (sys.excepthook, threading.excepthook, sys.unraisablehook, warnings.showwarning)
     structlog.reset_defaults()
     structlog.contextvars.clear_contextvars()
     yield
+    sys.excepthook, threading.excepthook, sys.unraisablehook, warnings.showwarning = hooks_before
     structlog.reset_defaults()
     structlog.contextvars.clear_contextvars()
     for handler in list(root.handlers):
@@ -179,6 +186,21 @@ def clean_structlog() -> Iterator[None]:
         "credentials",
         "credential",
         "api_keys",
+        "pwd",
+        "PWD",
+        "db_pwd",
+        "passphrase",
+        "key_passphrase",
+        "pass",
+        "db_pass",
+        "dbPass",
+        "auth",
+        "AUTH",
+        "proxy_auth",
+        "signature",
+        "request_signature",
+        "sig",
+        "url_sig",
     ],
 )
 def test_secret_named_keys_are_redacted(key: str) -> None:
@@ -208,6 +230,14 @@ def test_secret_named_keys_are_redacted(key: str) -> None:
         "private_key_size",
         "key_prefix",
         "tokenCount",
+        "auth_scheme",
+        "signature_scheme",
+        "pass_count",
+        "bypass",
+        "compass",
+        "author",
+        "design",
+        "signing_key_id",
     ],
 )
 def test_keys_ending_in_a_qualifier_survive(key: str) -> None:
@@ -375,6 +405,34 @@ def test_urls_without_userinfo_survive(value: str) -> None:
         (f"auth_token={PLANTED}", f"auth_token={REDACTED}"),
         (f"token={CARTO_TOKEN}", f"token={TOKEN_MASK}"),  # the earlier, more specific mask stays
         (f"secret={HIGH_ENTROPY}", f"secret={HIGH_ENTROPY_MASK}"),
+        # quoted keys: JSON, Python reprs and escaped JSON inside a message
+        (f'{{"password": "{PLANTED}"}}', f'{{"password": {REDACTED}}}'),
+        (f"{{'password': '{PLANTED}'}}", f"{{'password': {REDACTED}}}"),
+        (f'{{"api_key":"{PLANTED}","n":1}}', f'{{"api_key":{REDACTED},"n":1}}'),
+        (f'{{\\"token\\": \\"{PLANTED}\\"}}', f'{{\\"token\\": {REDACTED}}}'),
+        (f'"secret" : "{PLANTED} with spaces"', f'"secret" : {REDACTED}'),
+        # ODBC and JDBC connection strings, braces included
+        (
+            f"Driver={{ODBC Driver 18}};Server=db;UID=sa;PWD={PLANTED}!;",
+            f"Driver={{ODBC Driver 18}};Server=db;UID=sa;PWD={REDACTED};",
+        ),
+        (f"Server=db;Pwd={{{PLANTED};x}};Db=a", f"Server=db;Pwd={REDACTED};Db=a"),
+        (f"jdbc:x://db;user=sa;password={PLANTED}", f"jdbc:x://db;user=sa;password={REDACTED}"),
+        # more secret words
+        (f"passphrase={PLANTED}", f"passphrase={REDACTED}"),
+        (f"pwd: {PLANTED}", f"pwd: {REDACTED}"),
+        (f"pass={PLANTED} next", f"pass={REDACTED} next"),
+        (f"auth={PLANTED}", f"auth={REDACTED}"),
+        (f"Proxy-Auth: {PLANTED}", f"Proxy-Auth: {REDACTED}"),
+        (f"GET /blob?sp=r&sig={PLANTED}&se=x", f"GET /blob?sp=r&sig={REDACTED}&se=x"),
+        (f"signature: {PLANTED}", f"signature: {REDACTED}"),
+        (f"dbPass={PLANTED}", f"dbPass={REDACTED}"),
+        # a quoted value right after the word, no separator
+        (
+            f'login failed for jsmith with secret "{PLANTED}"',
+            f"login failed for jsmith with secret {REDACTED}",
+        ),
+        (f"Password '{PLANTED} x' rejected", f"Password {REDACTED} rejected"),
     ],
 )
 def test_secret_assignments_in_free_text_are_masked(value: str, expected: str) -> None:
@@ -390,10 +448,37 @@ def test_secret_assignments_in_free_text_are_masked(value: str, expected: str) -
         "session timed out",
         "the password rule",
         "api_version=2",
+        "bypass=on",
+        "compass: north",
+        "oauth=enabled",
+        "author: Jane",
+        "design: flat",
+        "the tests pass, all 12",
+        "signal=ok",
     ],
 )
 def test_free_text_without_a_secret_value_survives(value: str) -> None:
     assert mask_string(value) == value
+
+
+@pytest.mark.parametrize(
+    ("unit", "times", "tail"),
+    [
+        ("password", 20_000, ""),
+        ('pass"', 20_000, ""),
+        ("Pass ", 20_000, "="),
+        ('password="', 1, "a"),
+        ("pwd={", 1, "a"),
+        ('token\\"', 20_000, ":"),
+        ("password: ", 20_000, ""),
+    ],
+)
+def test_secret_assignment_scan_stays_linear(unit: str, times: int, tail: str) -> None:
+    """Spec 2.3 invariant 8: an attacker-written log line cannot stall the processor."""
+    value = unit * times + (tail * 100_000 if tail == "a" else tail)
+    start = perf_counter()
+    mask_string(value)
+    assert perf_counter() - start < 5.0  # about 0.4 s on the laptop; generous for --cov
 
 
 @pytest.mark.parametrize(
@@ -557,13 +642,86 @@ def test_event_message_is_masked() -> None:
 # ---------------------------------------------------------------------------------------------
 
 
-def test_non_string_scalars_are_untouched() -> None:
-    out = _redact(count=4471, big=2**70, ratio=0.5, ok=True, nothing=None)
-    assert out["count"] == 4471
-    assert out["big"] == 2**70
+def test_small_numbers_booleans_and_none_are_untouched() -> None:
+    out = _redact(retries=3, ratio=0.5, took=0.0123, neg=-999, ok=True, nothing=None, amount=12.5)
+    assert out["retries"] == 3
     assert out["ratio"] == 0.5
+    assert out["took"] == 0.0123  # leading zeros are not digits of a value
+    assert out["neg"] == -999
     assert out["ok"] is True
     assert out["nothing"] is None
+    assert out["amount"] == 12.5
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "expected"),
+    [
+        ("customer_id", 48812213, "99999999"),
+        ("card", 4111111111111111, "9999999999999999"),
+        ("total", 207.81, "999.99"),  # an order total is a value, not a metric
+        ("order", 4471, "9999"),
+        ("phone", 15551234567, "99999999999"),
+        ("delta", -48812213, "-99999999"),
+        ("weight_kg", 1234.5, "9999.9"),
+        ("big", 2**70, "9" * len(str(2**70))),
+        ("amount", 4471.0, "9999.9"),
+        ("tiny", 1.2345e-20, "9.9999A-99"),
+    ],
+)
+def test_numbers_of_four_or_more_digits_are_masked_by_default(
+    key: str, value: float, expected: str
+) -> None:
+    out = _redact(**{key: value})
+    assert out[key] == expected
+    assert str(value) not in json.dumps(out)
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "count",
+        "total_count",
+        "events",
+        "records",
+        "rows",
+        "duration_ms",
+        "retry_in_seconds",
+        "events_per_second",
+        "overlap_days",
+        "bytes",
+        "queue_depth",
+        "batch_size",
+        "port",
+        "status",
+        "pid",
+        "attempts",
+        "policy_version",
+        "quarantine_samples",
+        "batches",
+        "max_len",
+    ],
+)
+def test_numbers_under_a_metric_key_survive(key: str) -> None:
+    assert is_metric_key(key)
+    out = _redact(**{key: 48812213}, nested={key: 4471.25})
+    assert out[key] == 48812213
+    assert out["nested"] == {key: 4471.25}
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["customer_id", "order", "total", "amount", "card", "id", "count_of_x", "batch", "level", ""],
+)
+def test_keys_that_do_not_end_in_a_metric_qualifier_are_not_metric_keys(key: str) -> None:
+    assert not is_metric_key(key)
+
+
+def test_metric_qualifier_does_not_cover_list_items_or_secret_keys() -> None:
+    out = _redact(events=[48812213, 3], count={"customer_id": 48812213}, token_count=48812213)
+    assert out["events"] == ["99999999", 3]  # a list of numbers is a list of values
+    assert out["count"] == {"customer_id": "99999999"}
+    assert out["token_count"] == 48812213  # a count of tokens, not a token (rule 1 qualifier)
+    assert {"count", "ms", "seconds", "bytes", "port", "version"} <= METRIC_KEY_QUALIFIERS
 
 
 def test_nested_structures_are_walked() -> None:
@@ -672,7 +830,7 @@ def test_other_object_types_are_converted_then_masked() -> None:
     assert out["took"] == 1.5
     assert out["path"].replace("\\", "/") == "AAAAAAA/AA-9999999.AAA"
     assert out["kind"] == "file arrival AA-9999999"
-    assert out["level"] == 4471
+    assert out["level"] == "9999"  # an IntEnum is its value, and "level" is not a metric
     assert out["source"] == "src_orders_log"
     assert out["connector"] == {"name": "orders", "password": REDACTED, "host": "AA-9999.AAAAAAAA"}
     assert out["cursor"] == {"source": "src_orders_log", "position": "AAAAAA.AAA:AAAA:9999"}
@@ -711,7 +869,13 @@ _leaf = st.one_of(
     st.text(max_size=16),
     _marker_text,
 )
-_keys = st.one_of(st.text(max_size=12), st.sampled_from(MARKERS))
+# Keys hold no digits so that a masked key still names the metric its original named; numbers
+# planted under metric keys and under value keys check both sides of the number rule.
+_keys = st.one_of(
+    st.text(max_size=12).filter(lambda key: not any(char.isdecimal() for char in key)),
+    st.sampled_from(MARKERS),
+    st.sampled_from(("count", "duration_ms", "customer_id", "total", "events")),
+)
 
 
 def _nested(depth: int) -> st.SearchStrategy[Any]:
@@ -721,19 +885,26 @@ def _nested(depth: int) -> st.SearchStrategy[Any]:
     return st.one_of(_leaf, st.lists(inner, max_size=4), st.dictionaries(_keys, inner, max_size=4))
 
 
-def _assert_no_marker(value: Any) -> None:
+def _digits(number: float) -> int:
+    return sum(char.isdecimal() for char in str(number).lstrip("-0."))
+
+
+def _assert_no_marker(value: Any, key: str = "") -> None:
     if isinstance(value, str):
         for marker in MARKERS:
             assert marker not in value
     elif isinstance(value, dict):
-        for key, item in value.items():
-            _assert_no_marker(key)
-            _assert_no_marker(item)
+        for name, item in value.items():
+            _assert_no_marker(name)
+            _assert_no_marker(item, name)
     elif isinstance(value, list):
         for item in value:
             _assert_no_marker(item)
     else:
         assert value is None or isinstance(value, bool | int | float)
+        if isinstance(value, int | float) and not isinstance(value, bool):
+            # numbers of four or more digits are values unless the key names a metric
+            assert _digits(value) < 4 or is_metric_key(key.split("#", maxsplit=1)[0])
 
 
 @given(event=st.dictionaries(_keys, _nested(5), max_size=6), message=_marker_text)
@@ -757,7 +928,15 @@ def test_configure_logging_json_end_to_end(clean_structlog: None) -> None:
     stream = io.StringIO()
     configure_logging("edge", level="INFO", stream=stream)
     log = get_logger(component="gateway")
-    log.info("login for SO-0004471", order_id="SO-0004471", count=4471, **{CREDENTIAL_KEY: PLANTED})
+    log.info(
+        "login for SO-0004471",
+        order_id="SO-0004471",
+        count=4471,
+        customer_id=48812213,
+        card=4111111111111111,
+        total=207.81,
+        **{CREDENTIAL_KEY: PLANTED},
+    )
     line = stream.getvalue()
     assert line.endswith("\n")
     data = json.loads(line)
@@ -767,6 +946,11 @@ def test_configure_logging_json_end_to_end(clean_structlog: None) -> None:
     assert data["event"] == "login for AA-9999999"
     assert data["order_id"] == "AA-9999999"
     assert data["count"] == 4471
+    assert data["customer_id"] == "99999999"
+    assert data["card"] == "9999999999999999"
+    assert data["total"] == "999.99"
+    for planted in ("48812213", "4111111111111111", "207.81"):
+        assert planted not in line
     assert data[CREDENTIAL_KEY] == REDACTED
     assert PLANTED not in line
     assert "SO-0004471" not in line
@@ -925,6 +1109,16 @@ def test_stdlib_exceptions_and_levels_follow_the_configuration(clean_structlog: 
     assert "SO-0004471" not in lines[0]
 
 
+def test_stdlib_records_with_quoted_secret_keys_are_redacted(clean_structlog: None) -> None:
+    stream = io.StringIO()
+    configure_logging("edge", stream=stream)
+    logging.getLogger("lib").warning("conn %s", {"password": PLANTED, "pwd": PLANTED})
+    logging.getLogger("lib").warning("dsn %s", f"Server=db;UID=sa;PWD={PLANTED};")
+    text = stream.getvalue()
+    assert text.count(REDACTED) == 3
+    assert PLANTED not in text
+
+
 def test_stdlib_console_output_is_redacted_too(clean_structlog: None) -> None:
     stream = io.StringIO()
     configure_logging("edge", json_output=False, stream=stream)
@@ -960,3 +1154,124 @@ def test_get_logger_default_configuration_covers_stdlib_too(
     data = json.loads(out.out)
     assert data["service"] == DEFAULT_SERVICE
     assert data["event"] == f"token={TOKEN_MASK}"
+
+
+# ---------------------------------------------------------------------------------------------
+# Warnings and uncaught exceptions go through the processor too
+# ---------------------------------------------------------------------------------------------
+
+LEAKY_MESSAGE = f"could not parse SO-0004471 with password={PLANTED}"
+
+
+@pytest.fixture
+def interpreter_default_hooks(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Start from the interpreter's own hooks, as a service process does (not pytest's)."""
+    monkeypatch.setattr(sys, "excepthook", sys.__excepthook__)
+    monkeypatch.setattr(threading, "excepthook", threading.__excepthook__)
+    monkeypatch.setattr(sys, "unraisablehook", sys.__unraisablehook__)
+
+
+def _assert_redacted_only(
+    stream: io.StringIO, captured: pytest.CaptureFixture[str]
+) -> dict[str, Any]:
+    out = captured.readouterr()
+    assert out.err == ""  # nothing bypasses the processor on its way to stderr
+    assert out.out == ""
+    text = stream.getvalue()
+    assert "SO-0004471" not in text
+    assert PLANTED not in text
+    data: dict[str, Any] = json.loads(text.splitlines()[-1])
+    return data
+
+
+def test_python_warnings_are_logged_through_redact(
+    clean_structlog: None, capsys: pytest.CaptureFixture[str]
+) -> None:
+    stream = io.StringIO()
+    configure_logging("edge", stream=stream)
+    with warnings.catch_warnings():
+        warnings.simplefilter("always")
+        warnings.warn(LEAKY_MESSAGE, UserWarning, stacklevel=1)
+    data = _assert_redacted_only(stream, capsys)
+    assert data["logger"] == "py.warnings"
+    assert data["level"] == "warning"
+    assert "UserWarning" in data["event"]
+    assert f"AA-9999999 with password={REDACTED}" in data["event"]
+
+
+def test_uncaught_exceptions_are_logged_through_redact(
+    clean_structlog: None, interpreter_default_hooks: None, capsys: pytest.CaptureFixture[str]
+) -> None:
+    stream = io.StringIO()
+    configure_logging("edge", stream=stream)
+    assert sys.excepthook is not sys.__excepthook__
+    try:
+        raise RuntimeError(LEAKY_MESSAGE)
+    except RuntimeError as exc:
+        sys.excepthook(type(exc), exc, exc.__traceback__)
+    data = _assert_redacted_only(stream, capsys)
+    assert data["level"] == "critical"
+    assert data["event"] == "uncaught exception"
+    assert "RuntimeError" in data["exception"]
+    assert "AA-9999999" in data["exception"]
+
+
+def test_uncaught_thread_exceptions_are_logged_through_redact(
+    clean_structlog: None, interpreter_default_hooks: None, capsys: pytest.CaptureFixture[str]
+) -> None:
+    stream = io.StringIO()
+    configure_logging("edge", stream=stream)
+
+    def work() -> None:
+        raise RuntimeError(LEAKY_MESSAGE)
+
+    worker = threading.Thread(target=work, name="SO-0004471-worker")
+    worker.start()
+    worker.join()
+    data = _assert_redacted_only(stream, capsys)
+    assert data["event"] == "uncaught exception in thread"
+    assert data["thread"] == "AA-9999999-AAAAAA"
+    assert "AA-9999999" in data["exception"]
+
+
+def test_unraisable_exceptions_are_logged_through_redact(
+    clean_structlog: None, interpreter_default_hooks: None, capsys: pytest.CaptureFixture[str]
+) -> None:
+    stream = io.StringIO()
+    configure_logging("edge", stream=stream)
+
+    class Leaky:
+        def __repr__(self) -> str:
+            return LEAKY_MESSAGE
+
+        def __del__(self) -> None:
+            raise RuntimeError(LEAKY_MESSAGE)
+
+    leaky = Leaky()
+    del leaky  # CPython runs __del__ here and hands its exception to sys.unraisablehook
+    data = _assert_redacted_only(stream, capsys)
+    assert data["event"] == "unraisable exception"
+    assert "object_type" in data
+    assert "AA-9999999" in data["exception"]
+
+
+def test_exception_hooks_chain_to_a_hook_someone_else_installed(
+    clean_structlog: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A test runner's hook (pytest's) still sees the exception; the interpreter's never does."""
+    seen: list[type[BaseException]] = []
+
+    def runner_hook(kind: type[BaseException], value: BaseException, tb: object) -> None:
+        del value, tb
+        seen.append(kind)
+
+    monkeypatch.setattr(sys, "excepthook", runner_hook)
+    stream = io.StringIO()
+    configure_logging("edge", stream=stream)
+    configure_logging("edge", stream=stream)  # idempotent: one log line, one chained call
+    try:
+        raise ValueError(LEAKY_MESSAGE)
+    except ValueError as exc:
+        sys.excepthook(type(exc), exc, exc.__traceback__)
+    assert seen == [ValueError]
+    assert len(stream.getvalue().splitlines()) == 1

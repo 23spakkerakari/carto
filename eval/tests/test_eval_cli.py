@@ -59,7 +59,7 @@ def test_run_with_empty_predictions_is_na_or_zero(
     assert report["counts"] == {
         "events": 4690,
         "transactions": 60,
-        "links": 10,
+        "links": 15,
         "entities": 3,
         "batches": 4,
         "faults": 1,

@@ -1,0 +1,2733 @@
+{
+  "components": {
+    "schemas": {
+      "AuditEntryView": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "maxLength": 64,
+            "title": "Action",
+            "type": "string"
+          },
+          "actor": {
+            "maxLength": 256,
+            "title": "Actor",
+            "type": "string"
+          },
+          "after": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "After"
+          },
+          "at": {
+            "title": "At",
+            "type": "string"
+          },
+          "before": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Before"
+          },
+          "id": {
+            "minimum": 1.0,
+            "title": "Id",
+            "type": "integer"
+          },
+          "reason": {
+            "default": "",
+            "maxLength": 512,
+            "title": "Reason",
+            "type": "string"
+          },
+          "request_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Request Id"
+          },
+          "row_hash": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Row Hash",
+            "type": "string"
+          },
+          "target": {
+            "maxLength": 512,
+            "title": "Target",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "at",
+          "actor",
+          "action",
+          "target",
+          "row_hash"
+        ],
+        "title": "AuditEntryView",
+        "type": "object"
+      },
+      "CompositeComponentView": {
+        "additionalProperties": false,
+        "properties": {
+          "a": {
+            "$ref": "#/components/schemas/LinkEnd"
+          },
+          "b": {
+            "$ref": "#/components/schemas/LinkEnd"
+          },
+          "m": {
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "M",
+            "type": "number"
+          },
+          "u": {
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "U",
+            "type": "number"
+          },
+          "weight": {
+            "title": "Weight",
+            "type": "number"
+          }
+        },
+        "required": [
+          "a",
+          "b",
+          "weight",
+          "m",
+          "u"
+        ],
+        "title": "CompositeComponentView",
+        "type": "object"
+      },
+      "DecisionRequest": {
+        "additionalProperties": false,
+        "description": "Body of ``POST /links/{id}/accept``, ``/reject`` and ``/association`` (spec 9.6).",
+        "properties": {
+          "note": {
+            "default": "",
+            "maxLength": 512,
+            "title": "Note",
+            "type": "string"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RejectReason"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "title": "DecisionRequest",
+        "type": "object"
+      },
+      "Direction": {
+        "description": "Spec 9.3 \"Direction\": which end's events come first.",
+        "enum": [
+          "a_to_b",
+          "b_to_a",
+          "undirected"
+        ],
+        "title": "Direction",
+        "type": "string"
+      },
+      "EntityFieldView": {
+        "additionalProperties": false,
+        "properties": {
+          "field_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Field Id",
+            "type": "string"
+          },
+          "form": {
+            "maxLength": 32,
+            "minLength": 1,
+            "title": "Form",
+            "type": "string"
+          },
+          "path": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Path",
+            "type": "string"
+          },
+          "system_id": {
+            "pattern": "^[a-z][a-z0-9_]{0,63}$",
+            "title": "System Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "field_id",
+          "form",
+          "system_id",
+          "path"
+        ],
+        "title": "EntityFieldView",
+        "type": "object"
+      },
+      "EntityPatch": {
+        "additionalProperties": false,
+        "description": "``PATCH /entities/{id}``: confirm or change the name and description.",
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "maxLength": 1024,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          }
+        },
+        "title": "EntityPatch",
+        "type": "object"
+      },
+      "EntityView": {
+        "additionalProperties": false,
+        "properties": {
+          "description": {
+            "default": "",
+            "maxLength": 1024,
+            "title": "Description",
+            "type": "string"
+          },
+          "etag": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Etag",
+            "type": "string"
+          },
+          "fields": {
+            "items": {
+              "$ref": "#/components/schemas/EntityFieldView"
+            },
+            "maxItems": 4096,
+            "title": "Fields",
+            "type": "array"
+          },
+          "id": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Id",
+            "type": "string"
+          },
+          "link_ids": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 4096,
+            "title": "Link Ids",
+            "type": "array"
+          },
+          "name": {
+            "maxLength": 128,
+            "title": "Name",
+            "type": "string"
+          },
+          "name_confirmed": {
+            "default": false,
+            "title": "Name Confirmed",
+            "type": "boolean"
+          },
+          "suggested_name": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Suggested Name"
+          },
+          "system_count": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "System Count",
+            "type": "integer"
+          },
+          "updated_at": {
+            "title": "Updated At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "fields",
+          "updated_at",
+          "etag"
+        ],
+        "title": "EntityView",
+        "type": "object"
+      },
+      "EvidenceView": {
+        "additionalProperties": false,
+        "description": "The spec 9.3 features, every one named as in the table, plus the bridge consistency and\nthe composite components. Counts and ratios only.",
+        "properties": {
+          "c_ab": {
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "C Ab",
+            "type": "number"
+          },
+          "c_ba": {
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "C Ba",
+            "type": "number"
+          },
+          "chance_ratio": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Chance Ratio"
+          },
+          "components": {
+            "items": {
+              "$ref": "#/components/schemas/CompositeComponentView"
+            },
+            "maxItems": 32,
+            "title": "Components",
+            "type": "array"
+          },
+          "concentration": {
+            "anyOf": [
+              {
+                "maximum": 1.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Concentration"
+          },
+          "domain_size": {
+            "anyOf": [
+              {
+                "minimum": 1.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Domain Size"
+          },
+          "fanout_ab_median": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fanout Ab Median"
+          },
+          "fanout_ab_p99": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fanout Ab P99"
+          },
+          "fanout_ba_median": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fanout Ba Median"
+          },
+          "fanout_ba_p99": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fanout Ba P99"
+          },
+          "lag_iqr_seconds": {
+            "anyOf": [
+              {
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lag Iqr Seconds"
+          },
+          "lag_median_seconds": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lag Median Seconds"
+          },
+          "lag_positive_share": {
+            "anyOf": [
+              {
+                "maximum": 1.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lag Positive Share"
+          },
+          "n_a": {
+            "minimum": 0.0,
+            "title": "N A",
+            "type": "integer"
+          },
+          "n_b": {
+            "minimum": 0.0,
+            "title": "N B",
+            "type": "integer"
+          },
+          "n_match": {
+            "minimum": 0.0,
+            "title": "N Match",
+            "type": "integer"
+          },
+          "pairing_consistency": {
+            "anyOf": [
+              {
+                "maximum": 1.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pairing Consistency"
+          },
+          "window_end": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Window End"
+          },
+          "window_start": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Window Start"
+          }
+        },
+        "required": [
+          "n_a",
+          "n_b",
+          "n_match",
+          "c_ab",
+          "c_ba"
+        ],
+        "title": "EvidenceView",
+        "type": "object"
+      },
+      "FieldView": {
+        "additionalProperties": false,
+        "description": "One field as the profiler knows it (spec 7.3 ``fields``). Shapes, never values.",
+        "properties": {
+          "count": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Count",
+            "type": "integer"
+          },
+          "distinct_estimate": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Distinct Estimate",
+            "type": "integer"
+          },
+          "field_class": {
+            "enum": [
+              "identifier",
+              "low_card_attribute",
+              "timestamp",
+              "amount",
+              "date",
+              "person_name",
+              "contact",
+              "government_id",
+              "financial",
+              "health",
+              "free_text",
+              "secret_like",
+              "unknown"
+            ],
+            "title": "Field Class",
+            "type": "string"
+          },
+          "first_seen": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "First Seen"
+          },
+          "forms": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 16,
+            "title": "Forms",
+            "type": "array"
+          },
+          "id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Id",
+            "type": "string"
+          },
+          "label": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Label"
+          },
+          "last_seen": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Seen"
+          },
+          "null_rate": {
+            "default": 0.0,
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Null Rate",
+            "type": "number"
+          },
+          "path": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Path",
+            "type": "string"
+          },
+          "pinned": {
+            "default": false,
+            "title": "Pinned",
+            "type": "boolean"
+          },
+          "policy": {
+            "enum": [
+              "keep",
+              "tokenize",
+              "drop"
+            ],
+            "title": "Policy",
+            "type": "string"
+          },
+          "quality": {
+            "anyOf": [
+              {
+                "maximum": 1.0,
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Quality"
+          },
+          "shapes": {
+            "items": {
+              "$ref": "#/components/schemas/ShapeShare"
+            },
+            "maxItems": 8,
+            "title": "Shapes",
+            "type": "array"
+          },
+          "suggested_label": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Suggested Label"
+          },
+          "system_id": {
+            "pattern": "^[a-z][a-z0-9_]{0,63}$",
+            "title": "System Id",
+            "type": "string"
+          },
+          "template_id": {
+            "pattern": "^[A-Za-z0-9_.:-]{1,64}$",
+            "title": "Template Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "system_id",
+          "template_id",
+          "path",
+          "field_class",
+          "policy"
+        ],
+        "title": "FieldView",
+        "type": "object"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "title": "Detail",
+            "type": "array"
+          }
+        },
+        "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "LinkEnd": {
+        "additionalProperties": false,
+        "description": "One end of a link: a field and the form of its tokens.",
+        "properties": {
+          "field_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Field Id",
+            "type": "string"
+          },
+          "form": {
+            "maxLength": 32,
+            "minLength": 1,
+            "title": "Form",
+            "type": "string"
+          },
+          "label": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Label"
+          },
+          "path": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Path",
+            "type": "string"
+          },
+          "system_id": {
+            "pattern": "^[a-z][a-z0-9_]{0,63}$",
+            "title": "System Id",
+            "type": "string"
+          },
+          "template_id": {
+            "pattern": "^[A-Za-z0-9_.:-]{1,64}$",
+            "title": "Template Id",
+            "type": "string"
+          },
+          "top_shape": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Top Shape"
+          }
+        },
+        "required": [
+          "field_id",
+          "system_id",
+          "template_id",
+          "path",
+          "form"
+        ],
+        "title": "LinkEnd",
+        "type": "object"
+      },
+      "LinkRole": {
+        "description": "What a link may be used for (spec 9.3 \"Link roles\").",
+        "enum": [
+          "transaction",
+          "association",
+          "batch"
+        ],
+        "title": "LinkRole",
+        "type": "string"
+      },
+      "LinkStatus": {
+        "description": "Review state of a link (spec 7.3 ``key_links.status``, 9.6).",
+        "enum": [
+          "proposed",
+          "accepted",
+          "rejected",
+          "auto_accepted",
+          "stale"
+        ],
+        "title": "LinkStatus",
+        "type": "string"
+      },
+      "LinkType": {
+        "description": "How two fields were found to identify the same record (spec 9.3 to 9.5).",
+        "enum": [
+          "exact",
+          "bridge",
+          "composite"
+        ],
+        "title": "LinkType",
+        "type": "string"
+      },
+      "LinkView": {
+        "additionalProperties": false,
+        "description": "One review-queue item (spec 9.6).",
+        "properties": {
+          "a": {
+            "$ref": "#/components/schemas/LinkEnd"
+          },
+          "affected_volume": {
+            "minimum": 0.0,
+            "title": "Affected Volume",
+            "type": "integer"
+          },
+          "ambiguous_merges": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Ambiguous Merges",
+            "type": "integer"
+          },
+          "b": {
+            "$ref": "#/components/schemas/LinkEnd"
+          },
+          "decided_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Decided At"
+          },
+          "decided_by": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Decided By"
+          },
+          "direction": {
+            "$ref": "#/components/schemas/Direction"
+          },
+          "entity_id": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Entity Id"
+          },
+          "etag": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Etag",
+            "type": "string"
+          },
+          "evidence": {
+            "$ref": "#/components/schemas/EvidenceView"
+          },
+          "first_proposed_at": {
+            "title": "First Proposed At",
+            "type": "string"
+          },
+          "id": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Id",
+            "type": "string"
+          },
+          "link_type": {
+            "$ref": "#/components/schemas/LinkType"
+          },
+          "reject_reason": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RejectReason"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "role": {
+            "$ref": "#/components/schemas/LinkRole"
+          },
+          "score": {
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Score",
+            "type": "number"
+          },
+          "sentence": {
+            "maxLength": 1024,
+            "title": "Sentence",
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/LinkStatus"
+          },
+          "updated_at": {
+            "title": "Updated At",
+            "type": "string"
+          },
+          "version": {
+            "minimum": 1.0,
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "a",
+          "b",
+          "link_type",
+          "role",
+          "direction",
+          "score",
+          "status",
+          "affected_volume",
+          "sentence",
+          "evidence",
+          "version",
+          "first_proposed_at",
+          "updated_at",
+          "etag"
+        ],
+        "title": "LinkView",
+        "type": "object"
+      },
+      "MeView": {
+        "additionalProperties": false,
+        "properties": {
+          "csrf_token": {
+            "maxLength": 128,
+            "minLength": 16,
+            "title": "Csrf Token",
+            "type": "string"
+          },
+          "display_name": {
+            "default": "",
+            "maxLength": 128,
+            "title": "Display Name",
+            "type": "string"
+          },
+          "permissions": {
+            "items": {
+              "$ref": "#/components/schemas/Permission"
+            },
+            "title": "Permissions",
+            "type": "array"
+          },
+          "roles": {
+            "items": {
+              "$ref": "#/components/schemas/Role"
+            },
+            "title": "Roles",
+            "type": "array"
+          },
+          "session_expires_at": {
+            "title": "Session Expires At",
+            "type": "string"
+          },
+          "subject": {
+            "maxLength": 256,
+            "minLength": 1,
+            "title": "Subject",
+            "type": "string"
+          }
+        },
+        "required": [
+          "subject",
+          "roles",
+          "permissions",
+          "csrf_token",
+          "session_expires_at"
+        ],
+        "title": "MeView",
+        "type": "object"
+      },
+      "Page_AuditEntryView_": {
+        "additionalProperties": false,
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/AuditEntryView"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "Page[AuditEntryView]",
+        "type": "object"
+      },
+      "Page_EntityView_": {
+        "additionalProperties": false,
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/EntityView"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "Page[EntityView]",
+        "type": "object"
+      },
+      "Page_FieldView_": {
+        "additionalProperties": false,
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/FieldView"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "Page[FieldView]",
+        "type": "object"
+      },
+      "Page_LinkView_": {
+        "additionalProperties": false,
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/LinkView"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "Page[LinkView]",
+        "type": "object"
+      },
+      "Page_SourceView_": {
+        "additionalProperties": false,
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/SourceView"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "Page[SourceView]",
+        "type": "object"
+      },
+      "Page_SystemView_": {
+        "additionalProperties": false,
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/SystemView"
+            },
+            "title": "Items",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "title": "Page[SystemView]",
+        "type": "object"
+      },
+      "Permission": {
+        "description": "The rows of the spec 14.2 table. Handlers ask for exactly one of these.",
+        "enum": [
+          "view",
+          "review_links",
+          "manage_expectations",
+          "ack_alerts",
+          "manage_sources",
+          "manage_admin",
+          "view_audit",
+          "reveal"
+        ],
+        "title": "Permission",
+        "type": "string"
+      },
+      "RejectReason": {
+        "description": "Spec 9.6: \"Reject (with reason: different meaning, coincidence, wrong direction)\".",
+        "enum": [
+          "different_meaning",
+          "coincidence",
+          "wrong_direction"
+        ],
+        "title": "RejectReason",
+        "type": "string"
+      },
+      "Role": {
+        "description": "Spec 14.2 roles. ``reveal`` is a separate grant, never a role.",
+        "enum": [
+          "admin",
+          "integration_engineer",
+          "business_viewer",
+          "auditor"
+        ],
+        "title": "Role",
+        "type": "string"
+      },
+      "ShapeShare": {
+        "additionalProperties": false,
+        "properties": {
+          "shape": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Shape",
+            "type": "string"
+          },
+          "share": {
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "title": "Share",
+            "type": "number"
+          }
+        },
+        "required": [
+          "shape",
+          "share"
+        ],
+        "title": "ShapeShare",
+        "type": "object"
+      },
+      "SourceHealthView": {
+        "additionalProperties": false,
+        "description": "The latest heartbeat of a source (spec 8.1 common requirements, 12 ``/health``).",
+        "properties": {
+          "buffer_depth": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Buffer Depth",
+            "type": "integer"
+          },
+          "error_count": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Error Count",
+            "type": "integer"
+          },
+          "lag_seconds": {
+            "default": 0.0,
+            "minimum": 0.0,
+            "title": "Lag Seconds",
+            "type": "number"
+          },
+          "last_success_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Success At"
+          },
+          "message": {
+            "default": "",
+            "maxLength": 1024,
+            "title": "Message",
+            "type": "string"
+          },
+          "oldest_buffered_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Oldest Buffered At"
+          },
+          "received_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Received At"
+          },
+          "status": {
+            "maxLength": 16,
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "title": "SourceHealthView",
+        "type": "object"
+      },
+      "SourceView": {
+        "additionalProperties": false,
+        "description": "A connector as the edge reported it: configuration without secrets (spec 14.3).",
+        "properties": {
+          "backfill_days": {
+            "anyOf": [
+              {
+                "maximum": 400.0,
+                "minimum": 0.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Backfill Days"
+          },
+          "config": {
+            "additionalProperties": true,
+            "description": "Connector configuration without secrets; the secret is named by secret_ref.",
+            "title": "Config",
+            "type": "object"
+          },
+          "enabled": {
+            "default": true,
+            "title": "Enabled",
+            "type": "boolean"
+          },
+          "health": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SourceHealthView"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "id": {
+            "maxLength": 64,
+            "title": "Id",
+            "type": "string"
+          },
+          "last_test": {
+            "anyOf": [
+              {
+                "maxLength": 1024,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Test"
+          },
+          "schedule": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Schedule"
+          },
+          "secret_ref": {
+            "anyOf": [
+              {
+                "maxLength": 1024,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Secret Ref"
+          },
+          "system_id": {
+            "pattern": "^[a-z][a-z0-9_]{0,63}$",
+            "title": "System Id",
+            "type": "string"
+          },
+          "type": {
+            "maxLength": 32,
+            "title": "Type",
+            "type": "string"
+          },
+          "updated_at": {
+            "title": "Updated At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "system_id",
+          "type",
+          "updated_at"
+        ],
+        "title": "SourceView",
+        "type": "object"
+      },
+      "SystemPatch": {
+        "additionalProperties": false,
+        "description": "``PATCH /systems/{id}``: only what a reviewer may rename (spec 12).",
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "maxLength": 1024,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          }
+        },
+        "title": "SystemPatch",
+        "type": "object"
+      },
+      "SystemView": {
+        "additionalProperties": false,
+        "properties": {
+          "criticality": {
+            "default": "medium",
+            "maxLength": 16,
+            "title": "Criticality",
+            "type": "string"
+          },
+          "description": {
+            "default": "",
+            "maxLength": 1024,
+            "title": "Description",
+            "type": "string"
+          },
+          "etag": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Etag",
+            "type": "string"
+          },
+          "id": {
+            "pattern": "^[a-z][a-z0-9_]{0,63}$",
+            "title": "Id",
+            "type": "string"
+          },
+          "name": {
+            "maxLength": 256,
+            "title": "Name",
+            "type": "string"
+          },
+          "owner_group": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Owner Group"
+          },
+          "source_count": {
+            "default": 0,
+            "minimum": 0.0,
+            "title": "Source Count",
+            "type": "integer"
+          },
+          "updated_at": {
+            "title": "Updated At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "updated_at",
+          "etag"
+        ],
+        "title": "SystemView",
+        "type": "object"
+      },
+      "ValidationError": {
+        "properties": {
+          "ctx": {
+            "title": "Context",
+            "type": "object"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "title": "Location",
+            "type": "array"
+          },
+          "msg": {
+            "title": "Message",
+            "type": "string"
+          },
+          "type": {
+            "title": "Error Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError",
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "title": "carto console API",
+    "version": "v1"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/api/v1/audit": {
+      "get": {
+        "operationId": "list_audit_api_v1_audit_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 256,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 500,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Limit"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_AuditEntryView_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Audit",
+        "tags": [
+          "admin"
+        ],
+        "x-carto-permission": "view_audit"
+      }
+    },
+    "/api/v1/auth/callback": {
+      "get": {
+        "description": "Finish the flow: code to ID token to session.",
+        "operationId": "callback_api_v1_auth_callback_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "code",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 4096,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Code"
+            }
+          },
+          {
+            "in": "query",
+            "name": "state",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 512,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "State"
+            }
+          },
+          {
+            "in": "query",
+            "name": "error",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 256,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Error"
+            }
+          }
+        ],
+        "responses": {
+          "302": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Callback",
+        "tags": [
+          "auth"
+        ],
+        "x-carto-permission": "public"
+      }
+    },
+    "/api/v1/auth/login": {
+      "get": {
+        "description": "Send the browser to the identity provider.",
+        "operationId": "login_api_v1_auth_login_get",
+        "responses": {
+          "302": {
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Login",
+        "tags": [
+          "auth"
+        ],
+        "x-carto-permission": "public"
+      }
+    },
+    "/api/v1/auth/logout": {
+      "post": {
+        "operationId": "logout_api_v1_auth_logout_post",
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Logout",
+        "tags": [
+          "auth"
+        ],
+        "x-carto-permission": "authenticated"
+      }
+    },
+    "/api/v1/entities": {
+      "get": {
+        "operationId": "list_entities_api_v1_entities_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 256,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 500,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Limit"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_EntityView_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Entities",
+        "tags": [
+          "entities"
+        ],
+        "x-carto-permission": "view"
+      }
+    },
+    "/api/v1/entities/{entity_id}": {
+      "get": {
+        "operationId": "get_entity_api_v1_entities__entity_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "entity_id",
+            "required": true,
+            "schema": {
+              "maxLength": 64,
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9_.:-]+$",
+              "title": "Entity Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EntityView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Entity",
+        "tags": [
+          "entities"
+        ],
+        "x-carto-permission": "view"
+      },
+      "patch": {
+        "operationId": "patch_entity_api_v1_entities__entity_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "entity_id",
+            "required": true,
+            "schema": {
+              "maxLength": 64,
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9_.:-]+$",
+              "title": "Entity Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EntityPatch"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EntityView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Patch Entity",
+        "tags": [
+          "entities"
+        ],
+        "x-carto-permission": "review_links"
+      }
+    },
+    "/api/v1/fields": {
+      "get": {
+        "operationId": "list_fields_api_v1_fields_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "system",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 64,
+                  "minLength": 1,
+                  "pattern": "^[a-z][a-z0-9_]*$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "System"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 256,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 500,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Limit"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_FieldView_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Fields",
+        "tags": [
+          "inventory"
+        ],
+        "x-carto-permission": "view"
+      }
+    },
+    "/api/v1/fields/{field_id}": {
+      "get": {
+        "operationId": "get_field_api_v1_fields__field_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "field_id",
+            "required": true,
+            "schema": {
+              "maxLength": 512,
+              "minLength": 1,
+              "title": "Field Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FieldView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Field",
+        "tags": [
+          "inventory"
+        ],
+        "x-carto-permission": "view"
+      }
+    },
+    "/api/v1/healthz": {
+      "get": {
+        "description": "The container healthcheck's probe (``carto-core healthcheck --listener api``).",
+        "operationId": "api_healthz_api_v1_healthz_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Api Healthz",
+        "x-carto-permission": "public"
+      }
+    },
+    "/api/v1/links": {
+      "get": {
+        "operationId": "list_links_api_v1_links_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/LinkStatus",
+              "default": "proposed"
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 256,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 500,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Limit"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_LinkView_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Links",
+        "tags": [
+          "links"
+        ],
+        "x-carto-permission": "view"
+      }
+    },
+    "/api/v1/links/{link_id}": {
+      "get": {
+        "operationId": "get_link_api_v1_links__link_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "link_id",
+            "required": true,
+            "schema": {
+              "maxLength": 64,
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9_.:-]+$",
+              "title": "Link Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LinkView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Link",
+        "tags": [
+          "links"
+        ],
+        "x-carto-permission": "view"
+      }
+    },
+    "/api/v1/links/{link_id}/accept": {
+      "post": {
+        "operationId": "accept_link_api_v1_links__link_id__accept_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "link_id",
+            "required": true,
+            "schema": {
+              "maxLength": 64,
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9_.:-]+$",
+              "title": "Link Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DecisionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LinkView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Accept Link",
+        "tags": [
+          "links"
+        ],
+        "x-carto-permission": "review_links"
+      }
+    },
+    "/api/v1/links/{link_id}/association": {
+      "post": {
+        "operationId": "mark_association_api_v1_links__link_id__association_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "link_id",
+            "required": true,
+            "schema": {
+              "maxLength": 64,
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9_.:-]+$",
+              "title": "Link Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DecisionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LinkView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Mark Association",
+        "tags": [
+          "links"
+        ],
+        "x-carto-permission": "review_links"
+      }
+    },
+    "/api/v1/links/{link_id}/reject": {
+      "post": {
+        "operationId": "reject_link_api_v1_links__link_id__reject_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "link_id",
+            "required": true,
+            "schema": {
+              "maxLength": 64,
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9_.:-]+$",
+              "title": "Link Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DecisionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LinkView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Reject Link",
+        "tags": [
+          "links"
+        ],
+        "x-carto-permission": "review_links"
+      }
+    },
+    "/api/v1/me": {
+      "get": {
+        "operationId": "me_api_v1_me_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MeView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Me",
+        "tags": [
+          "auth"
+        ],
+        "x-carto-permission": "authenticated"
+      }
+    },
+    "/api/v1/sources": {
+      "get": {
+        "operationId": "list_sources_api_v1_sources_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 256,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 500,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Limit"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_SourceView_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Sources",
+        "tags": [
+          "inventory"
+        ],
+        "x-carto-permission": "view"
+      }
+    },
+    "/api/v1/sources/{source_id}": {
+      "get": {
+        "operationId": "get_source_api_v1_sources__source_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "source_id",
+            "required": true,
+            "schema": {
+              "maxLength": 64,
+              "minLength": 1,
+              "pattern": "^[a-z][a-z0-9_]*$",
+              "title": "Source Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SourceView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Source",
+        "tags": [
+          "inventory"
+        ],
+        "x-carto-permission": "view"
+      }
+    },
+    "/api/v1/sources/{source_id}/health": {
+      "get": {
+        "operationId": "get_source_health_api_v1_sources__source_id__health_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "source_id",
+            "required": true,
+            "schema": {
+              "maxLength": 64,
+              "minLength": 1,
+              "pattern": "^[a-z][a-z0-9_]*$",
+              "title": "Source Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SourceHealthView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Source Health",
+        "tags": [
+          "inventory"
+        ],
+        "x-carto-permission": "view"
+      }
+    },
+    "/api/v1/systems": {
+      "get": {
+        "operationId": "list_systems_api_v1_systems_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 256,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Cursor"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maximum": 500,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Limit"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Page_SystemView_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Systems",
+        "tags": [
+          "inventory"
+        ],
+        "x-carto-permission": "view"
+      }
+    },
+    "/api/v1/systems/{system_id}": {
+      "get": {
+        "operationId": "get_system_api_v1_systems__system_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "system_id",
+            "required": true,
+            "schema": {
+              "maxLength": 64,
+              "minLength": 1,
+              "pattern": "^[a-z][a-z0-9_]*$",
+              "title": "System Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SystemView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get System",
+        "tags": [
+          "inventory"
+        ],
+        "x-carto-permission": "view"
+      },
+      "patch": {
+        "operationId": "patch_system_api_v1_systems__system_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "system_id",
+            "required": true,
+            "schema": {
+              "maxLength": 64,
+              "minLength": 1,
+              "pattern": "^[a-z][a-z0-9_]*$",
+              "title": "System Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SystemPatch"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SystemView"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Patch System",
+        "tags": [
+          "inventory"
+        ],
+        "x-carto-permission": "review_links"
+      }
+    },
+    "/healthz": {
+      "get": {
+        "operationId": "healthz_healthz_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Healthz",
+        "x-carto-permission": "public"
+      }
+    },
+    "/metrics": {
+      "get": {
+        "operationId": "metrics_text_metrics_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Metrics Text",
+        "x-carto-permission": "public"
+      }
+    },
+    "/readyz": {
+      "get": {
+        "operationId": "readyz_readyz_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Readyz",
+        "x-carto-permission": "public"
+      }
+    }
+  },
+  "servers": [
+    {
+      "url": "/"
+    }
+  ]
+}

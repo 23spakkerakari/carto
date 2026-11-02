@@ -1,0 +1,66 @@
+# Dex, the development identity provider of the Compose `dev` profile (ADR 0052, founder
+# decision 1 of 2026-10-12). It exists so that login, sessions, roles and the authorization
+# matrix run end to end on a laptop and in CI; a customer install points `api.oidc` at the
+# customer's own provider and never runs this service (docs/install/compose-pilot.md).
+#
+# The issuer is the console origin plus /dex: the web nginx proxies /dex/ to this service, so
+# the browser and the api see one origin (plan M2 decision 10). The api process reaches Dex
+# over the internal network through `api.oidc.backchannel_url` (http://dex:5556/dex).
+#
+# Four static users, one per spec 14.2 role, with the throwaway password "password" (the bcrypt
+# hash below is of that public string and protects nothing; docs/security-exceptions.md records
+# the semgrep exception). Dex never runs in a customer install.
+# The group claim names the role; `api.bootstrap_group_roles` maps the groups on first start.
+
+issuer: ${CARTO_DEX_ISSUER}
+
+storage:
+  type: memory
+
+web:
+  http: 0.0.0.0:5556
+
+telemetry:
+  http: 127.0.0.1:5558
+
+oauth2:
+  skipApprovalScreen: true
+  alwaysShowLoginScreen: false
+  responseTypes: ["code"]
+
+expiry:
+  idTokens: 15m
+  authRequests: 10m
+
+staticClients:
+  - id: carto-console
+    name: carto console
+    secretEnv: CARTO_DEX_CLIENT_SECRET
+    redirectURIs:
+      - ${CARTO_DEX_REDIRECT_URI}
+
+enablePasswordDB: true
+
+# Groups are attached to static passwords through the connector-less local flow; Dex emits them
+# in the `groups` claim when the client requests the `groups` scope.
+staticPasswords:
+  - email: admin@carto.local
+    # nosemgrep: generic.secrets.security.detected-bcrypt-hash.detected-bcrypt-hash
+    hash: "$2a$10$2b2cU8CPhOTaGrs1HRQuAueS7JTT5ZHsHSzYiFPm1leZck7Mc8T4W"
+    username: admin
+    userID: 08a8684b-db88-4b73-90a9-3cd1661f5466
+  - email: engineer@carto.local
+    # nosemgrep: generic.secrets.security.detected-bcrypt-hash.detected-bcrypt-hash
+    hash: "$2a$10$2b2cU8CPhOTaGrs1HRQuAueS7JTT5ZHsHSzYiFPm1leZck7Mc8T4W"
+    username: engineer
+    userID: 1f9a5d2e-0d4b-4f6c-9a3b-2c1d0e9f8a7b
+  - email: viewer@carto.local
+    # nosemgrep: generic.secrets.security.detected-bcrypt-hash.detected-bcrypt-hash
+    hash: "$2a$10$2b2cU8CPhOTaGrs1HRQuAueS7JTT5ZHsHSzYiFPm1leZck7Mc8T4W"
+    username: viewer
+    userID: 3c4d5e6f-7a8b-4c9d-8e0f-1a2b3c4d5e6f
+  - email: auditor@carto.local
+    # nosemgrep: generic.secrets.security.detected-bcrypt-hash.detected-bcrypt-hash
+    hash: "$2a$10$2b2cU8CPhOTaGrs1HRQuAueS7JTT5ZHsHSzYiFPm1leZck7Mc8T4W"
+    username: auditor
+    userID: 5e6f7a8b-9c0d-4e1f-a2b3-c4d5e6f7a8b9

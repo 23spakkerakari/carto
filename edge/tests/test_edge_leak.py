@@ -428,9 +428,12 @@ def test_leak_scenario_a_small_run(tmp_path: Path, restore_logging: None) -> Non
         assert response.status_code == 200, response.text
         report.json_document("ingest-api response", response.json())
     assert len(writer.events) == manifest.counts.events
+    stored_at = datetime.now(UTC)
     for event in writer.events:
-        report.text("clickhouse events row", _row_text(event_row(event)), event.kind.value)
-        for row in identifier_rows(event):
+        report.text(
+            "clickhouse events row", _row_text(event_row(event, stored_at)), event.kind.value
+        )
+        for row in identifier_rows(event, stored_at):
             report.text("clickhouse event_identifiers row", _row_text(row), event.kind.value)
 
     log_text = logs.getvalue()

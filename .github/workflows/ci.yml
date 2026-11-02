@@ -11,6 +11,12 @@ on:
 permissions:
   contents: read
 
+# Every step runs as bash -eo pipefail. Without it, `make leak | tee leak.log` reports tee's
+# status, so a failing leak test passed (docs/plans/M1-review-fixes.md, package B).
+defaults:
+  run:
+    shell: bash
+
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -49,15 +55,22 @@ jobs:
         run: uv run carto-schema check --dir packages/carto-schema/schemas
       - name: Simulator scenario A (14 days)
         run: make sim SCENARIO=shop DAYS=14 SEED=1
-      - name: Eval harness
+      - name: Eval harness (scoring self-check, M0 path)
         run: make eval SCENARIO=shop DAYS=14 SEED=1
+      - name: Eval with the engine, in memory (spec 18.4; analyzer, load, discover, map, score)
+        run: |
+          make eval-engine SCENARIO=shop DAYS=14 SEED=1 ENGINE=memory EVAL_OUT=eval/reports/engine
+          make sim SCENARIO=people_ops DAYS=28 SEED=1
+          make eval-engine SCENARIO=people_ops DAYS=28 SEED=1 ENGINE=memory EVAL_OUT=eval/reports/engine
       - name: Simulator output summary
         run: |
           echo "## Simulator output" >> "$GITHUB_STEP_SUMMARY"
-          du -sh sim-out/shop >> "$GITHUB_STEP_SUMMARY"
-          find sim-out/shop -type f | wc -l | xargs -I{} echo "{} files" >> "$GITHUB_STEP_SUMMARY"
-          echo "## Eval report" >> "$GITHUB_STEP_SUMMARY"
-          cat eval/reports/shop.md >> "$GITHUB_STEP_SUMMARY"
+          du -sh sim-out/shop sim-out/people_ops >> "$GITHUB_STEP_SUMMARY"
+          find sim-out/shop -type f | wc -l | xargs -I{} echo "{} files (shop)" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Eval report (engine, shop 14 days)" >> "$GITHUB_STEP_SUMMARY"
+          cat eval/reports/engine/shop.md >> "$GITHUB_STEP_SUMMARY"
+          echo "## Eval report (engine, people_ops 28 days)" >> "$GITHUB_STEP_SUMMARY"
+          cat eval/reports/engine/people_ops.md >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with:
           name: eval-report
@@ -68,6 +81,43 @@ jobs:
           name: coverage
           path: coverage.xml
           if-no-files-found: error
+
+  web:
+    name: web (lint, types, unit, build, e2e with axe and the XSS corpus)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: web/.nvmrc
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install the locked dependencies
+        run: npm ci
+      - name: Lint (ESLint with the spec 13 sink rules)
+        run: npm run lint
+      - name: Types (tsc, including the OpenAPI contract check)
+        run: npm run typecheck
+      - name: Format check
+        run: npm run format:check
+      - name: Unit tests (Vitest)
+        run: npm run test
+      - name: Production build and build check (no mock API, strict CSP)
+        run: npm run build
+      - name: Playwright browser
+        run: npx playwright install --with-deps chromium
+      - name: End-to-end tests with axe and the XSS corpus (threat 4)
+        run: npm run e2e
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-report
+          path: web/playwright-report/
+          if-no-files-found: ignore
 
   integration:
     name: integration (testcontainers, leak test, analyzer, bundle round trip)
@@ -149,8 +199,11 @@ jobs:
           cache-from: type=gha
       - name: Smoke test the images (run as non-root, print version)
         run: |
-          docker run --rm --read-only --cap-drop ALL --security-opt no-new-privileges carto-edge:ci --help | head -5
-          docker run --rm --read-only --cap-drop ALL --security-opt no-new-privileges carto-core:ci --help | head -5
+          # Capture first: under pipefail, head closing the pipe early fails the step.
+          edge_help="$(docker run --rm --read-only --cap-drop ALL --security-opt no-new-privileges carto-edge:ci --help)"
+          core_help="$(docker run --rm --read-only --cap-drop ALL --security-opt no-new-privileges carto-core:ci --help)"
+          sed -n 1,5p <<< "$edge_help"
+          sed -n 1,5p <<< "$core_help"
       - name: Trivy image scan
         uses: aquasecurity/trivy-action@v0.36.0
         with:
@@ -162,7 +215,7 @@ jobs:
           exit-code: "1"
 
   compose:
-    name: compose stack (simulator live replay, ingest to ClickHouse, push routes, live leak scan)
+    name: compose stack (simulator live replay, ingest to ClickHouse, console, push routes, live leak scan)
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
@@ -173,28 +226,34 @@ jobs:
       - uses: actions/checkout@v4
       - name: Build the service images
         run: make images
-      - name: Generate the database passwords
+      - name: Generate the database passwords and the dev secrets
         run: |
-          openssl rand -hex 24 > deploy/compose/secrets/pg_password
-          openssl rand -hex 24 > deploy/compose/secrets/ch_password
-      - name: Generate a throwaway certificate for the webhook proxy
+          for s in pg_password ch_password pg_ingest_password pg_app_password pg_worker_password oidc_client_secret; do
+            openssl rand -hex 24 | tr -d '\r\n' > "deploy/compose/secrets/$s"
+          done
+      - name: Generate a throwaway certificate for the webhook proxy and the console
         run: |
           openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 \
             -subj /CN=localhost -addext subjectAltName=DNS:localhost \
             -keyout deploy/compose/proxy-tls/tls.key -out deploy/compose/proxy-tls/tls.crt
-          # The proxy runs as uid 10001; a pilot chowns the key to it instead.
+          # The proxies run as uid 10001; a pilot chowns the key to it instead.
           chmod 644 deploy/compose/proxy-tls/tls.key
-      - name: Start the stack (one-shot jobs, databases, ingest-api, edge-gateway, collector)
+      - name: Start the stack (one-shot jobs, databases, ingest-api, api, worker, web, dex, edge-gateway, collector)
         run: |
-          $COMPOSE up -d
-          for i in $(seq 1 60); do
-            id=$($COMPOSE ps -q ingest-api)
-            health=$(docker inspect -f '{{.State.Health.Status}}' "$id" 2>/dev/null || echo starting)
-            echo "ingest-api: $health"
-            [ "$health" = healthy ] && break
-            sleep 5
-          done
-          [ "$health" = healthy ]
+          $COMPOSE --profile dev up -d --scale simulator=0
+          wait_healthy() {
+            for i in $(seq 1 60); do
+              id=$($COMPOSE ps -q "$1")
+              health=$(docker inspect -f '{{.State.Health.Status}}' "$id" 2>/dev/null || echo starting)
+              echo "$1: $health"
+              [ "$health" = healthy ] && return 0
+              sleep 5
+            done
+            return 1
+          }
+          wait_healthy ingest-api
+          wait_healthy api
+          wait_healthy web
           $COMPOSE ps -a
           for job in volumes-init pki-init key-init migrate; do
             code=$(docker inspect -f '{{.State.ExitCode}}' "$($COMPOSE ps -aq $job)")
@@ -207,6 +266,22 @@ jobs:
           for job in pki-init key-init migrate; do
             [ "$(docker inspect -f '{{.State.ExitCode}}' "$($COMPOSE ps -aq $job)")" = 0 ]
           done
+      - name: The console answers through the web proxy (ADR 0052)
+        run: |
+          curl -fsSk https://localhost:8080/healthz
+          # Unauthenticated API calls are refused, never served; metrics are never proxied.
+          code=$(curl -sk -o /dev/null -w '%{http_code}' https://localhost:8080/api/v1/me)
+          echo "GET /api/v1/me without a session: $code"; [ "$code" = 401 ]
+          code=$(curl -sk -o /dev/null -w '%{http_code}' https://localhost:8080/metrics)
+          echo "GET /metrics through the proxy: $code"; [ "$code" = 404 ]
+          curl -sk -D - -o /dev/null https://localhost:8080/ | tr -d '\r' | grep -i '^content-security-policy:' | grep -q "default-src 'self'"
+          # Login redirects to the dev identity provider under the console origin.
+          location=$(curl -sk -o /dev/null -w '%{redirect_url}' https://localhost:8080/api/v1/auth/login)
+          echo "login redirects to: $location"; echo "$location" | grep -q '^https://localhost:8080/dex/'
+          # The worker leases its recurring jobs and the audit chain verifies.
+          $COMPOSE run --rm --no-deps -T worker worker --once
+          $COMPOSE run --rm --no-deps -T api audit-verify
+          echo "console: proxy, auth redirect, worker once, audit chain ok" >> "$GITHUB_STEP_SUMMARY"
       - name: Replay one simulated day at high speed into the stack
         run: >
           $COMPOSE --profile dev run --rm -T simulator live --scenario shop --days 1
@@ -271,8 +346,8 @@ jobs:
           done
           $COMPOSE --profile dev run --rm -T --entrypoint cat simulator \
             /data/sim/ground_truth/markers.json > scan/markers.json
-          $COMPOSE logs --no-color --no-log-prefix ingest-api edge-gateway migrate \
-            proxy-webhooks proxy-otlp > scan/logs.txt
+          $COMPOSE --profile dev logs --no-color --no-log-prefix ingest-api edge-gateway migrate \
+            api worker web dex proxy-webhooks proxy-otlp > scan/logs.txt
           wc -c scan/*
       - name: Leak scan of everything core stored and every product log (spec 18.3)
         run: >
@@ -287,8 +362,8 @@ jobs:
           tail -n 400 compose.log
           python3 tools/ci/annotate.py tail compose-ps.txt --title "compose ps -a" --lines 40
           python3 tools/ci/annotate.py tail compose.log --title "compose logs (tail)" --lines 150
-          for svc in volumes-init pki-init key-init migrate ingest-api edge-gateway otel-collector \
-            proxy-webhooks proxy-otlp clickhouse; do
+          for svc in volumes-init pki-init key-init migrate ingest-api api worker web dex \
+            edge-gateway otel-collector proxy-webhooks proxy-otlp clickhouse postgres; do
             $COMPOSE logs --no-color --no-log-prefix --tail 40 "$svc" > "svc-$svc.log" 2>&1 || true
             python3 tools/ci/annotate.py tail "svc-$svc.log" --title "logs: $svc" --lines 40
           done

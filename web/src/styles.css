@@ -1,0 +1,190 @@
+@import 'tailwindcss';
+
+/* IBM Plex, self-hosted (OFL-1.1; scripts/copy-fonts.mjs). No font CDN: the CSP's default-src
+   'self' and the air-gapped install forbid one. System fallbacks keep the metrics close. */
+@font-face {
+  font-family: 'IBM Plex Sans';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('/fonts/plex-sans-400.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'IBM Plex Sans';
+  font-style: italic;
+  font-weight: 400;
+  font-display: swap;
+  src: url('/fonts/plex-sans-400i.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'IBM Plex Sans';
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url('/fonts/plex-sans-500.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'IBM Plex Sans';
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url('/fonts/plex-sans-600.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'IBM Plex Sans Condensed';
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url('/fonts/plex-sans-condensed-500.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'IBM Plex Sans Condensed';
+  font-style: normal;
+  font-weight: 600;
+  font-display: swap;
+  src: url('/fonts/plex-sans-condensed-600.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'IBM Plex Mono';
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url('/fonts/plex-mono-400.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'IBM Plex Mono';
+  font-style: normal;
+  font-weight: 500;
+  font-display: swap;
+  src: url('/fonts/plex-mono-500.woff2') format('woff2');
+}
+
+/* The drawing-office console: light only, monochrome chrome, colour reserved for state, one
+   highlighter for the current item and confirmed states, 2px radii, rules carry hierarchy. */
+@theme {
+  --font-sans: 'IBM Plex Sans', 'Helvetica Neue', Arial, sans-serif;
+  --font-cond: 'IBM Plex Sans Condensed', 'Arial Narrow', 'Helvetica Neue', Arial, sans-serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace;
+
+  --color-ink: #111111;
+  --color-ink-2: #444444;
+  --color-muted: #595959;
+  --color-paper: #ffffff;
+  --color-paper-2: #f4f4f2;
+  --color-hairline: #d6d6d2;
+  --color-hi: #f6de63;
+  --color-hi-2: #fbf0b4;
+  --color-ok: #2e7d32;
+  --color-warn: #b26a00;
+  --color-bad: #b3261e;
+  --color-idle: #8a8a8a;
+
+  --radius-*: initial;
+  --radius-sm: 2px;
+  --radius-md: 2px;
+  --radius-lg: 2px;
+  --radius-DEFAULT: 2px;
+
+  --text-2xs: 0.6875rem;
+  --text-2xs--line-height: 1rem;
+}
+
+@layer base {
+  html {
+    color-scheme: light only;
+    background: var(--color-paper);
+  }
+  body {
+    @apply bg-paper font-sans text-[14px] leading-5 text-ink antialiased;
+  }
+  :focus-visible {
+    outline: 2px solid var(--color-ink);
+    outline-offset: 1px;
+  }
+  dialog::backdrop {
+    background: rgb(17 17 17 / 0.35);
+  }
+  summary {
+    cursor: pointer;
+  }
+}
+
+@utility label-cond {
+  font-family: var(--font-cond);
+  font-weight: 600;
+  font-size: var(--text-2xs);
+  line-height: 1rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+@utility rule-2 {
+  border-top: 2px solid var(--color-ink);
+}
+
+@utility rule-15 {
+  border-bottom: 1.5px solid var(--color-ink);
+}
+
+@utility hairline {
+  border-bottom: 1px solid var(--color-hairline);
+}
+
+/* Ruled table: a 1.5px rule closes the header, hairlines between rows, no boxes. */
+@utility table-ruled {
+  width: 100%;
+  border-collapse: collapse;
+  & th {
+    font-family: var(--font-cond);
+    font-weight: 600;
+    font-size: var(--text-2xs);
+    line-height: 1rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    text-align: left;
+    padding: 0.375rem 0.5rem;
+    border-bottom: 1.5px solid var(--color-ink);
+    white-space: nowrap;
+    vertical-align: bottom;
+  }
+  & td {
+    padding: 0.4375rem 0.5rem;
+    border-bottom: 1px solid var(--color-hairline);
+    vertical-align: top;
+  }
+  & tr[aria-selected='true'] > td {
+    background: var(--color-hi);
+  }
+  & tbody tr:focus-visible {
+    outline: 2px solid var(--color-ink);
+    outline-offset: -2px;
+  }
+}
+
+/* Definition list ruled like a title block. */
+@utility dl-ruled {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  column-gap: 1rem;
+  & > dt {
+    font-family: var(--font-cond);
+    font-weight: 500;
+    font-size: var(--text-2xs);
+    line-height: 1rem;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--color-ink-2);
+    padding: 0.375rem 0;
+    border-bottom: 1px solid var(--color-hairline);
+  }
+  & > dd {
+    padding: 0.3125rem 0;
+    border-bottom: 1px solid var(--color-hairline);
+    overflow-wrap: anywhere;
+  }
+}
+
+@utility text-break {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}

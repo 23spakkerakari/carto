@@ -34,7 +34,7 @@ __all__ = [
 
 ROLE_URI_PREFIX: Final = "urn:carto:role:"
 ROLES: Final = frozenset(
-    {"edge-gateway", "ingest-api", "otel-collector", "collector", "proxy", "api"}
+    {"edge-gateway", "ingest-api", "otel-collector", "collector", "proxy", "api", "web"}
 )
 """Every role a certificate can carry (ADR 0031)."""
 ANY_ROLE: Final = "*"

@@ -1,10 +1,13 @@
 """Redaction of what leaves the edge in clear: template constants and kept attribute values.
 
 Spec 8.3: "Presidio runs on template constants as well, in case a constant contains PII."
-:func:`redact_template_text` runs the configured detector over a template's text and replaces
-every hit by ``<ENTITY_TYPE>`` (:func:`carto_edge.pipeline.pii.mask`); the count feeds
-``redaction.entities_masked`` in the canonical event (spec 7.1). Results are memoized per
-``(detector, text)`` in a bounded LRU because a template repeats for thousands of events.
+:func:`redact_template_text` replaces every whitespace token that looks like a secret
+(:func:`carto_edge.pipeline.pii.looks_like_secret`) by :data:`SECRET_MASK`, a second line of
+defence behind the masking before template mining, then runs the configured detector over the
+text and replaces every hit by ``<ENTITY_TYPE>`` (:func:`carto_edge.pipeline.pii.mask`); the
+count of both feeds ``redaction.entities_masked`` in the canonical event (spec 7.1). Results
+are memoized per ``(detector, text)`` in a bounded LRU because a template repeats for thousands
+of events.
 
 Spec 7.1: "attributes: only fields classified as low-cardinality and non-sensitive. Values
 truncated to 256 chars." :func:`truncate_attribute` is that cut and :func:`attribute_is_clean`
@@ -18,6 +21,7 @@ of values that travel in clear anyway, never the values of tokenized or dropped 
 
 from __future__ import annotations
 
+import re
 import threading
 from collections import OrderedDict
 from typing import Final, NamedTuple
@@ -27,6 +31,7 @@ from carto_edge.pipeline.pii import PiiDetector, looks_like_secret, mask, trunca
 __all__ = [
     "ATTRIBUTE_CACHE_SIZE",
     "MAX_ATTRIBUTE_LEN",
+    "SECRET_MASK",
     "TEMPLATE_CACHE_SIZE",
     "CacheInfo",
     "attribute_cache_clear",
@@ -46,6 +51,25 @@ TEMPLATE_CACHE_SIZE: Final = 4096
 
 ATTRIBUTE_CACHE_SIZE: Final = 65_536
 """Memoized attribute verdicts (one entry per distinct kept value and detector)."""
+
+
+SECRET_MASK: Final = "<SECRET>"  # noqa: S105
+"""What a secret-shaped token of a template text becomes."""
+
+_TOKEN: Final = re.compile(r"\S+")
+
+
+def _mask_secret_tokens(text: str) -> tuple[str, int]:
+    count = 0
+
+    def replace(match: re.Match[str]) -> str:
+        nonlocal count
+        if looks_like_secret(match.group(0)):
+            count += 1
+            return SECRET_MASK
+        return match.group(0)
+
+    return _TOKEN.sub(replace, text), count
 
 
 class CacheInfo(NamedTuple):
@@ -136,8 +160,9 @@ class _TemplateCache:
                 self.hits += 1
                 return entry[1], entry[2]
             self.misses += 1
-        cut = truncate_text(text)
+        cut, secrets = _mask_secret_tokens(truncate_text(text))
         masked, count = mask(cut, detector.detect(cut))
+        count += secrets
         with self._lock:
             self._entries[key] = (detector, masked, count)
             self._entries.move_to_end(key)
