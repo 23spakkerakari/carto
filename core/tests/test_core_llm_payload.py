@@ -6,6 +6,9 @@ from __future__ import annotations
 
 import pytest
 
+from carto_common.logging import is_secret_key, mask_string
+from carto_common.settings import SECRET_REF_SCHEMES as COMMON_SCHEMES
+from carto_common.settings import validate_secret_ref as common_secret_ref
 from carto_core.llm_gateway.payload import (
     AttributeRecord,
     FieldRecord,
@@ -25,6 +28,8 @@ from carto_core.llm_gateway.schemas import (
     NameEntityRequest,
     TaskKind,
 )
+from carto_schema.event import value_shape
+from carto_schema.inventory import SECRET_REF_SCHEMES, config_key_is_secret, validate_secret_ref
 
 TENANT = "default"
 TOKENS = ("t1.Zm9vYmFyYmF6cXV4MTIzND", "t12.AbCdEfGhIjKlMnOpQrStUv")
@@ -200,3 +205,145 @@ def test_the_oracle_finds_planted_strings_and_tokens() -> None:
     payload = '{"template_text":"order t1.Zm9vYmFyYmF6cXV4MTIzND done","x":"ORD-1"}'
     findings = forbidden_content_check(payload, forbidden=["ORD-1", "absent", ""])
     assert findings == ("ORD-1", "token:t1.Zm9vYmFyYmF6cXV4MTIzND")
+
+
+# --- value shapes before the provider (ADR 0069) --------------------------------------------------
+
+JWT = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+SHAPED = {
+    "pem": "-----BEGIN RSA PRIVATE KEY----- MIIBOgIBAAJBAKj34GkxFhD -----END RSA PRIVATE KEY-----",
+    "jwt": JWT,
+    "token": TOKENS[0],
+    "aws": "AKIAIOSFODNN7EXAMPLE",
+    "url_password": "postgres://carto:hunter2@db.internal/orders",
+    "secret_assignment": "password=hunter2",
+    "email": "jane.doe@example.com",
+    "uuid": "123e4567-e89b-12d3-a456-426614174000",
+    "hex": "0123456789abcdef",
+    "digits": "order 000447 shipped",
+}
+SECRET_PARTS = (
+    "hunter2",
+    "jane",
+    "example.com",
+    "123e4567",
+    "0123456789abcdef",
+    "000447",
+    "IOSFODNN7EXAMPLE",
+    JWT,
+    TOKENS[0],
+)
+
+
+@pytest.mark.parametrize("text", list(SHAPED.values()), ids=list(SHAPED))
+def test_clean_text_masks_every_value_shape(text: str) -> None:
+    cleaned = clean_text(f"system said {text} today", 200)
+    assert "<*>" in cleaned
+    assert value_shape(cleaned) is None
+    for part in SECRET_PARTS:
+        assert part not in cleaned
+
+
+def test_clean_text_keeps_placeholders_and_constants() -> None:
+    assert clean_text("Order <*> shipped to <*>", 100) == "Order <*> shipped to <*>"
+    assert clean_text("GET /orders approved EUR HTTP/1.1 200 DC-03", 100) == (
+        "GET /orders approved EUR HTTP/1.1 200 DC-03"
+    )
+    assert clean_text("password=<*> token: [REDACTED] retry 3 of 10000", 100) == (
+        "password=<*> token: [REDACTED] retry 3 of 10000"
+    )
+    assert (
+        clean_text("postgres://carto:hunter2@db.internal", 100)
+        == "postgres://carto:<*>@db.internal"
+    )
+    assert clean_text('{"password": "hunter2"}', 100) == '{"password": "<*>"}'
+
+
+def test_a_format_character_cannot_split_a_shape_past_the_mask() -> None:
+    assert clean_text("jane@exam\u200bple.com", 100) == "<*>"
+    assert clean_text("0123\u200b456789abcdef", 100) == "<*>"
+
+
+def test_attribute_values_with_a_value_shape_are_dropped_not_masked() -> None:
+    reader = InMemoryMetadataReader()
+    reader.add(
+        FieldRecord(
+            tenant_id=TENANT,
+            field_id="src/tpl/status",
+            path="status",
+            system_name="Shop",
+            attributes=(
+                AttributeRecord(
+                    "status", ("new", "jane@example.com", "password=hunter2", "<*>", "paid")
+                ),
+            ),
+        )
+    )
+    request = build_label_field_payload(reader, TENANT, ["src/tpl/status"])
+    (field,) = request.fields
+    assert [(a.key, a.values) for a in field.attributes] == [("status", ["new", "paid"])]
+    assert forbidden_content_check(request.model_dump_json(), forbidden=SECRET_PARTS) == ()
+
+
+def test_top_shapes_stay_shapes_and_raw_values_in_the_shape_slot_are_dropped() -> None:
+    reader = InMemoryMetadataReader()
+    reader.add(
+        FieldRecord(
+            tenant_id=TENANT,
+            field_id="src/tpl/order_id",
+            path="order_id",
+            system_name="Shop",
+            top_shapes=(
+                "AAA-9999-999999",
+                "999999999999+",
+                "ORD-2026-000123",
+                "jane@example.com",
+                "S0",
+            ),
+        )
+    )
+    request = build_label_field_payload(reader, TENANT, ["src/tpl/order_id"])
+    (field,) = request.fields
+    assert field.top_shapes == ["AAA-9999-999999", "999999999999+", "S0"]
+
+
+def test_the_schema_mirrors_agree_with_carto_common() -> None:
+    """carto-schema depends on pydantic only, so it repeats the shapes, the secret-key rule and
+    the secret_ref rule of carto_common; this holds the two sides together."""
+    for text in SHAPED.values():
+        assert mask_string(text) != text, text
+    assert SECRET_REF_SCHEMES == COMMON_SCHEMES
+    for ref in ["vault://db/orders", "local:///run/secrets/x", "hunter2", "http://x/y", "vault://"]:
+        outcomes = []
+        for check in (validate_secret_ref, common_secret_ref):
+            try:
+                check(ref)
+                outcomes.append(True)
+            except ValueError:
+                outcomes.append(False)
+        assert outcomes[0] == outcomes[1], ref
+    keys = [
+        "password",
+        "Password",
+        "db_pass",
+        "dbPass",
+        "AuthToken",
+        "x-api-key",
+        "private_key",
+        "access-keys",
+        "clientSecret",
+        "session_id",
+        "sig",
+        "cookie",
+        "host",
+        "secret_ref",
+        "token_count",
+        "password_present",
+        "ssh_key_path",
+        "bypass",
+        "oauth_scheme",
+        "tables",
+        "",
+    ]
+    for key in keys:
+        assert config_key_is_secret(key) == is_secret_key(key), key

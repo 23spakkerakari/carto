@@ -566,3 +566,31 @@ def test_bundle_metadata_files_must_be_the_contract(bundle: Path, tmp_path: Path
     (verified.path / TEMPLATES_FILE).unlink()
     assert read_bundle_metadata(verified) == ([], [])
     assert record_bundle_metadata(verified, InMemoryMetadataStore()) == MetadataResult(0, 0)
+
+
+def test_a_value_in_a_bundle_template_or_field_path_is_refused_without_echo(
+    bundle: Path, tmp_path: Path
+) -> None:
+    """ADR 0069: templates.json and fields.json are under the live path's rules."""
+    verified = _metadata_bundle(bundle, tmp_path)
+    templates = json.loads((verified.path / TEMPLATES_FILE).read_text(encoding="utf-8"))
+    templates[0]["template_text"] = "PO export mailed to jane.doe@example.com"
+    (verified.path / TEMPLATES_FILE).write_text(json.dumps(templates), encoding="utf-8")
+    with pytest.raises(BundleError) as info:
+        read_bundle_metadata(verified)
+    assert TEMPLATES_FILE in str(info.value)
+    assert "jane" not in str(info.value) and "example.com" not in str(info.value)
+    assert "an email address" in str(info.value.__cause__), "the shape is named, not the text"
+    store = InMemoryMetadataStore()
+    with pytest.raises(BundleError):
+        record_bundle_metadata(verified, store)
+    assert store.list_templates("default") == []
+
+    (verified.path / TEMPLATES_FILE).unlink()
+    fields = json.loads((verified.path / FIELDS_FILE).read_text(encoding="utf-8"))
+    fields[0]["path"] = "orders.SO-0004471.qty"
+    (verified.path / FIELDS_FILE).write_text(json.dumps(fields), encoding="utf-8")
+    with pytest.raises(BundleError) as info:
+        read_bundle_metadata(verified)
+    assert FIELDS_FILE in str(info.value)
+    assert "0004471" not in str(info.value)

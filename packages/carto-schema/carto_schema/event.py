@@ -10,7 +10,11 @@ millisecond precision.
 Field names travel in clear (attribute keys, identifier fields, dropped fields), so the model is
 core's backstop for the edge's name masking (ADR 0027, 0030): every dot-separated segment of a
 name must not look like a value, the rule :func:`name_carries_no_value` states. ``template_text``
-must not hold a run of :data:`MAX_TEMPLATE_DIGIT_RUN` or more digits.
+and every attribute value must carry no value shape (ADR 0069): :func:`value_shape` names the
+shapes (an email address, a UUID, a long hex run, a run of :data:`MAX_TEMPLATE_DIGIT_RUN` or more
+digits, a JWT, an AWS access key id, a PEM header, a carto token, a URL with a password, a
+secret-named key with a value in clear) and :func:`mask_value_shapes` replaces them with the
+template placeholder for text that may reach the LLM provider (spec 2.3 invariant 5).
 """
 
 from __future__ import annotations
@@ -31,7 +35,7 @@ from pydantic import (
     field_validator,
 )
 
-from carto_schema.forms import Form, Shape, Token
+from carto_schema.forms import TOKEN_PATTERN, Form, Shape, Token
 
 SchemaVersion = Literal["1"]
 """The ``schema_version`` value this package speaks (spec 7.1)."""
@@ -51,10 +55,104 @@ NAME_DIGIT_RUN: Final = 3
 """Consecutive ASCII digits that make a name segment a value (array and map indexes stay
 below 20, so they never reach it)."""
 MAX_TEMPLATE_DIGIT_RUN: Final = 6
-"""Consecutive ASCII digits that make ``template_text`` carry a value (an order number, a
-card number); shorter numbers are protocol constants like ``HTTP/1.1 200``."""
+"""Consecutive ASCII digits that make ``template_text`` or an attribute value carry a value (an
+order number, a card number); shorter numbers are protocol constants like ``HTTP/1.1 200``."""
+MIN_HEX_RUN: Final = 16
+"""Consecutive hex characters that make a text carry a value (a hash, a session id, a trace id);
+shorter runs are words like ``deadbeef`` or short codes."""
+PLACEHOLDER: Final = "<*>"
+"""The edge's template placeholder: what a value becomes in ``template_text`` (spec 8.3) and
+what :func:`mask_value_shapes` writes over a value shape."""
 _NAME_DIGITS: Final = re.compile(r"[0-9]{%d}" % NAME_DIGIT_RUN)  # noqa: UP031
-_TEMPLATE_DIGITS: Final = re.compile(r"[0-9]{%d}" % MAX_TEMPLATE_DIGIT_RUN)  # noqa: UP031
+_DIGIT_RUN: Final = re.compile(r"[0-9]{%d,}" % MAX_TEMPLATE_DIGIT_RUN)  # noqa: UP031
+_HEX_RUN: Final = re.compile(r"[0-9A-Fa-f]{%d,}" % MIN_HEX_RUN)  # noqa: UP031
+
+# The value shapes mirror ``carto_common.logging`` (this package depends on pydantic only, for
+# the reason ``carto_common.crypto`` repeats ``TOKEN_PATTERN``; a core test holds the two sides
+# together). Every quantifier is bounded or stops at a fixed character, so each scan stays linear
+# on attacker-written text (spec 2.3 invariant 8).
+_PEM_HEADER: Final = "-----BEGIN"
+_PEM_BLOCK: Final = re.compile(r"-----BEGIN(?:(?!-----END).)*(?:-----END[^-]*-----|\Z)", re.DOTALL)
+# The look-behind keeps the scan linear: a run of base64url characters is tried once.
+_JWT: Final = re.compile(r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*")
+_CARTO_TOKEN: Final = re.compile(TOKEN_PATTERN.pattern.removeprefix("^").removesuffix("$"))
+_AWS_KEY: Final = re.compile(r"(?:AKIA|ASIA)[0-9A-Z]{16}")
+# scheme://user:password@host -> the password; the user name is configuration, not a secret,
+# and a placeholder or mask in the password slot ("://carto:<*>@") is already masked.
+_URL_USERINFO: Final = re.compile(r"(?<=://)([^/\s@:]+):(?!<\*>@|\[[A-Z_]+\]@)([^/\s@]+)(?=@)")
+# The look-behind stops a DSN user name (postgres://carto@db.internal) from reading as a mailbox.
+_EMAIL: Final = re.compile(r"(?<![\w.%+/-])[\w.%+-]+@[\w.-]+\.[A-Za-z]{2,}(?![\w-])")
+_UUID: Final = re.compile(
+    r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}"
+)
+# password=..., api-key: ..., Authorization: Bearer ..., "token": "...": a secret-named key
+# (the words of carto_common.logging.SECRET_KEY_WORDS and SECRET_KEY_PAIRS) followed by a value.
+# Group 1 is the key, the separator and an HTTP auth scheme; group 2 the value (a whole quoted
+# or braced string, else up to whitespace or a separator). A value that is the placeholder, a
+# redaction mask or empty ("password=<*>", "token: [REDACTED]", 'pwd=""') is what the edge
+# writes for a template and passes; "token_count=3" and "secret_ref=vault://x" do not match
+# because "_" follows the word. The short words pwd, pass, auth and sig must start a word or a
+# camelCase hump ("dbPass=", not "bypass=" or "oauth=").
+_SECRET_ASSIGNMENT: Final = re.compile(
+    r"(?i)((?:(?:api|private|access)[ _.-]?key|client[ _.-]?secret|password|passwd|passphrase"
+    r"|secret|token|apikey|authorization|cookie|session|bearer|credentials?|signature"
+    r"|(?<![A-Za-z])(?:pwd|pass|auth|sig)|(?-i:(?<=[a-z0-9])(?:P(?i:wd|ass)|A(?i:uth)|S(?i:ig))))"
+    r"""\\?["']?[ \t]{0,16}[=:][ \t]{0,16}(?:(?:basic|bearer|digest)[ \t]{1,16})?)"""
+    r"""(?!\\?["']?(?:<\*>|\[[A-Z_]+\]|(?:basic|bearer|digest)(?:[ \t]|\\?["']|$)|[\s,;&]|$)"""
+    r"""|\\?["']\\?["'])"""
+    r"""(\\"[^"\n]{0,512}\\"|"[^"\n]{0,512}"|'[^'\n]{0,512}'|\{[^}\n]{0,512}\}"""
+    r"""|(?:[^\s"',;&\\]|\\(?!["']))+)"""
+)
+
+VALUE_SHAPES: Final[tuple[tuple[str, re.Pattern[str]], ...]] = (
+    ("a PEM header", _PEM_BLOCK),
+    ("a JWT", _JWT),
+    ("a carto token", _CARTO_TOKEN),
+    ("an AWS access key id", _AWS_KEY),
+    ("a URL with a password", _URL_USERINFO),
+    ("a secret-named key with a value", _SECRET_ASSIGNMENT),
+    ("an email address", _EMAIL),
+    ("a UUID", _UUID),
+    (f"a run of {MIN_HEX_RUN} or more hex characters", _HEX_RUN),
+    (f"a run of {MAX_TEMPLATE_DIGIT_RUN} or more digits", _DIGIT_RUN),
+)
+"""The value shapes :func:`value_shape` looks for, in the order it tries them, each with the
+words an error message uses for it (ADR 0069). Never the text itself."""
+_SHAPE_WORDS: Final = ", ".join(name for name, _ in VALUE_SHAPES)
+
+
+def value_shape(text: str) -> str | None:
+    """The words for the first value shape found in ``text`` (:data:`VALUE_SHAPES`), or ``None``
+    when the text carries none: it may then be a template constant or a low-cardinality value."""
+    for name, pattern in VALUE_SHAPES:
+        if pattern.search(text) is not None:
+            return name
+    return None
+
+
+def _keep_key_mask_value(match: re.Match[str]) -> str:
+    """``password="hunter2"`` becomes ``password="<*>"``: the key and its quotes stay."""
+    value = match.group(2)
+    quote = value[0] if value[0] in "\"'" and value[-1] == value[0] and len(value) > 1 else ""
+    return f"{match.group(1)}{quote}{PLACEHOLDER}{quote}"
+
+
+def mask_value_shapes(text: str) -> str:
+    """``text`` with every value shape replaced by :data:`PLACEHOLDER`, in the order of
+    :data:`VALUE_SHAPES`: a secret-named key keeps its key and a URL keeps its user name, so
+    ``password=hunter2`` becomes ``password=<*>``. For text that must not carry a value but
+    cannot be refused, such as what reaches the LLM provider (spec 2.3 invariant 5)."""
+    text = _PEM_BLOCK.sub(PLACEHOLDER, text) if _PEM_HEADER in text else text
+    text = _JWT.sub(PLACEHOLDER, text)
+    text = _CARTO_TOKEN.sub(PLACEHOLDER, text)
+    text = _AWS_KEY.sub(PLACEHOLDER, text)
+    text = _URL_USERINFO.sub(rf"\1:{PLACEHOLDER}", text)
+    text = _SECRET_ASSIGNMENT.sub(_keep_key_mask_value, text)
+    text = _EMAIL.sub(PLACEHOLDER, text)
+    text = _UUID.sub(PLACEHOLDER, text)
+    text = _HEX_RUN.sub(PLACEHOLDER, text)
+    return _DIGIT_RUN.sub(PLACEHOLDER, text)
+
 
 ULID_PATTERN: Final = re.compile(r"^[0-7][0-9A-HJKMNP-TV-Z]{25}$")
 """A ULID in its canonical form: 26 upper-case Crockford base32 characters, first one 0 to 7."""
@@ -93,11 +191,15 @@ def _require_name(value: str) -> str:
     return value
 
 
-def _require_template_constants(value: str) -> str:
-    if _TEMPLATE_DIGITS.search(value) is not None:
+def _require_no_value_shape(value: str) -> str:
+    """The message names the shape and never echoes the text: it is the value it should not
+    carry (spec 2.3 invariant 7)."""
+    shape = value_shape(value)
+    if shape is not None:
         msg = (
-            f"template_text holds {MAX_TEMPLATE_DIGIT_RUN} or more digits in a row, which is a "
-            "value, not a template constant"
+            f"the text holds {shape}, which is a value, not a template constant or a "
+            f"low-cardinality attribute value; the edge tokenizes or drops values (refused "
+            f"shapes: {_SHAPE_WORDS})"
         )
         raise ValueError(msg)
     return value
@@ -111,14 +213,18 @@ TemplateId = Annotated[str, Field(pattern=TEMPLATE_ID_PATTERN.pattern)]
 AttributeKey = Annotated[str, Field(min_length=1, max_length=MAX_ATTRIBUTE_KEY_LEN)]
 """An attribute key. :class:`CanonicalEvent` checks the keys before this type does, so a
 rejected key never appears in an error location (a dict key is part of the location)."""
-AttributeValue = Annotated[str, Field(max_length=MAX_ATTRIBUTE_VALUE_LEN)]
+AttributeValue = Annotated[
+    str, Field(max_length=MAX_ATTRIBUTE_VALUE_LEN), AfterValidator(_require_no_value_shape)
+]
+"""A low-cardinality attribute value in clear: bounded and under :func:`value_shape`."""
 FieldName = Annotated[
     str, Field(min_length=1, max_length=MAX_FIELD_NAME_LEN), AfterValidator(_require_name)
 ]
 """An identifier or dropped field name, under the same rule as :data:`AttributeKey`."""
 TemplateText = Annotated[
-    str, Field(max_length=MAX_TEMPLATE_TEXT_LEN), AfterValidator(_require_template_constants)
+    str, Field(max_length=MAX_TEMPLATE_TEXT_LEN), AfterValidator(_require_no_value_shape)
 ]
+"""Template constants and placeholders only: bounded and under :func:`value_shape`."""
 
 
 def _require_text_or_datetime(value: object) -> object:

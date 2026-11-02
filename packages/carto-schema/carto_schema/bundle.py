@@ -27,10 +27,12 @@ from pydantic import Field
 from carto_schema.event import (
     ContractModel,
     EventKind,
+    FieldName,
     SchemaVersion,
     SourceId,
     SystemId,
     TemplateId,
+    TemplateText,
     TenantId,
     Ulid,
     UtcTimestamp,
@@ -90,13 +92,14 @@ class BundleField(ContractModel):
 
     ``sample_values`` is non-empty only for ``policy == "keep"``: those values travel in clear in
     the events anyway, and the customer reviews them before sending the bundle (spec 4.1 step
-    2). Fields that are tokenized or dropped show shapes only.
+    2). Fields that are tokenized or dropped show shapes only. ``path`` is under the live
+    path's field-name rule (:data:`~carto_schema.event.FieldName`, ADR 0069).
     """
 
     field_ref: Annotated[str, Field(min_length=1, max_length=512)]
     system_id: SystemId
     template_id: TemplateId
-    path: Annotated[str, Field(min_length=1, max_length=256)]
+    path: FieldName
     field_class: FieldClassName
     policy: PolicyName
     pinned: bool = False
@@ -112,9 +115,12 @@ class BundleField(ContractModel):
 
 
 class BundleTemplate(ContractModel):
+    """One template as the edge mined it; ``template_text`` is under the live path's rule
+    (:data:`~carto_schema.event.TemplateText`: constants and placeholders only, ADR 0069)."""
+
     template_id: TemplateId
     system_id: SystemId
-    template_text: Annotated[str, Field(max_length=4096)]
+    template_text: TemplateText
     kind: EventKind
     count: Annotated[int, Field(ge=0, strict=True)]
     first_seen: UtcTimestamp
