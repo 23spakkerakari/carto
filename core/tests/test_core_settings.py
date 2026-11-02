@@ -11,6 +11,7 @@ from pydantic import ValidationError
 
 from carto_core.settings import (
     MIB,
+    ApiSettings,
     ClickHouseSettings,
     CoreConfigError,
     CoreSettings,
@@ -175,6 +176,29 @@ def test_listener_caps_are_bounded_and_consistent() -> None:
         IngestListenerSettings(max_body_bytes=5 * MIB, max_decompressed_bytes=MIB)
     with pytest.raises(ValidationError):
         IngestListenerSettings(port=0)
+
+
+def test_login_rate_settings_are_positive_and_the_ceiling_covers_one_address() -> None:
+    api = ApiSettings(insecure_http=True)
+    assert api.login_rate_per_minute_per_ip == 10
+    assert api.login_starts_per_minute_per_ip == 60
+    assert api.login_starts_per_minute_total == 600
+    for name in (
+        "login_rate_per_minute_per_ip",
+        "login_starts_per_minute_per_ip",
+        "login_starts_per_minute_total",
+    ):
+        for value in (0, -1):
+            with pytest.raises(ValidationError):
+                ApiSettings.model_validate({"insecure_http": True, name: value})
+    with pytest.raises(ValidationError, match="login_starts_per_minute_total"):
+        ApiSettings(
+            insecure_http=True, login_starts_per_minute_per_ip=50, login_starts_per_minute_total=40
+        )
+    equal = ApiSettings(
+        insecure_http=True, login_starts_per_minute_per_ip=40, login_starts_per_minute_total=40
+    )
+    assert equal.login_starts_per_minute_total == 40
 
 
 def test_log_level_is_case_insensitive_and_bounded() -> None:

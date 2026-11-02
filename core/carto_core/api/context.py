@@ -13,7 +13,8 @@ The client address (:func:`client_ip`) is the socket peer unless the connection 
 install's ``web`` certificate, the role of the console's own nginx (ADR 0052, 0070): then it
 is the last hop of ``X-Forwarded-For``, the address nginx itself appended, validated as an IP
 literal. Any other caller's header is ignored, so nobody can pick the bucket of the login
-limiter or the address the audit log records.
+limiter (:class:`carto_core.api.ratelimit.LoginLimiter`) or the address the audit log
+records.
 """
 
 from __future__ import annotations
@@ -35,7 +36,7 @@ if TYPE_CHECKING:
     from carto_core.api.auth import Principal
     from carto_core.api.oidc import OidcClient
     from carto_core.api.ports import ApiPorts
-    from carto_core.api.ratelimit import TokenBucketLimiter
+    from carto_core.api.ratelimit import LoginLimiter, TokenBucketLimiter
     from carto_core.api.sessions import SessionManager
     from carto_core.settings import CoreSettings
 
@@ -70,6 +71,14 @@ METRIC_NAMES: Final[tuple[tuple[str, str], ...]] = (
     ("carto_api_logins_total", "Successful OIDC logins."),
     ("carto_api_login_failures_total", "OIDC callbacks refused (state, token or claims)."),
     ("carto_api_rate_limited_total", "Requests answered 429."),
+    (
+        "carto_api_login_starts_rate_limited_total",
+        "Login starts answered 429 (the address budget or the ceiling).",
+    ),
+    (
+        "carto_api_login_callbacks_rate_limited_total",
+        "Login callbacks without a valid login cookie answered 429.",
+    ),
     ("carto_api_csrf_refused_total", "Mutations refused for a missing or wrong CSRF token."),
     ("carto_api_decisions_total", "Link decisions and entity or system patches written."),
     ("carto_api_audit_rows_total", "Audit rows appended by the API."),
@@ -113,7 +122,7 @@ class ApiContext:
     metrics: ApiMetrics
     sessions: SessionManager
     oidc: OidcClient
-    login_limiter: TokenBucketLimiter
+    login_limiter: LoginLimiter
     user_limiter: TokenBucketLimiter
 
     @property

@@ -7,6 +7,12 @@ live in process memory, so the limit is per replica: one replica serves the M2 p
 0052), and a shared limiter (the sessions database or a cache) is an M6 item together with the
 other multi-replica concerns. Idle buckets are dropped so a scan of many addresses cannot grow
 the table without bound (spec 2.3 invariant 8).
+
+:class:`LoginLimiter` is the login routes' set of buckets (ADR 0070 section 5): login starts
+per browser address, sized for a whole office behind one NAT or VPN egress address, under a
+ceiling across every address that bounds the pending attempts in the store; and callbacks
+that carry no valid login cookie, per address. A callback with its attempt's cookie is not
+limited here at all: the attempt is single-use, so its budget is one callback per start.
 """
 
 from __future__ import annotations
@@ -15,11 +21,16 @@ import math
 import threading
 from collections.abc import Callable
 from datetime import datetime
-from typing import Final
+from typing import TYPE_CHECKING, Final
 
-__all__ = ["TokenBucketLimiter"]
+if TYPE_CHECKING:
+    from carto_core.settings import ApiSettings
+
+__all__ = ["LoginLimiter", "TokenBucketLimiter"]
 
 _MAX_KEYS: Final = 100_000
+_EVERYONE: Final = ""
+"""The one key of the ceiling bucket."""
 
 
 class TokenBucketLimiter:
@@ -59,3 +70,41 @@ class TokenBucketLimiter:
     def __len__(self) -> int:
         with self._lock:
             return len(self._buckets)
+
+
+class LoginLimiter:
+    """The login routes' buckets (module docstring; :mod:`carto_core.api.routes_auth`)."""
+
+    def __init__(
+        self,
+        *,
+        starts_per_minute_per_ip: int,
+        starts_per_minute_total: int,
+        callbacks_per_minute_per_ip: int,
+        clock: Callable[[], datetime],
+    ) -> None:
+        self._starts = TokenBucketLimiter(starts_per_minute_per_ip, clock)
+        self._ceiling = TokenBucketLimiter(starts_per_minute_total, clock)
+        self._callbacks = TokenBucketLimiter(callbacks_per_minute_per_ip, clock)
+
+    @classmethod
+    def from_settings(cls, settings: ApiSettings, clock: Callable[[], datetime]) -> LoginLimiter:
+        return cls(
+            starts_per_minute_per_ip=settings.login_starts_per_minute_per_ip,
+            starts_per_minute_total=settings.login_starts_per_minute_total,
+            callbacks_per_minute_per_ip=settings.login_rate_per_minute_per_ip,
+            clock=clock,
+        )
+
+    def check_start(self, address: str) -> int | None:
+        """Take a login-start token for ``address`` and one from the ceiling; ``None`` when
+        allowed, else whole seconds to wait. The address bucket is checked first, so one
+        flooding address spends at most its own budget of the ceiling."""
+        wait = self._starts.check(address)
+        if wait is not None:
+            return wait
+        return self._ceiling.check(_EVERYONE)
+
+    def check_callback(self, address: str) -> int | None:
+        """Take a token for a callback from ``address`` that carries no valid login cookie."""
+        return self._callbacks.check(address)

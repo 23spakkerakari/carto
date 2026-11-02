@@ -101,10 +101,51 @@ navigation, which Lax sends; a cross-site fetch or an iframe does not get the co
   no signed-in principal; nothing before this ADR wrote one. The
   `carto_api_login_failures_total` and rate-limit metrics are unchanged.
 
+## 5. The login limiter is per attempt on the callback, per address under a ceiling on login start (review 2026-11-02, Low)
+
+**Context.** Section 1 made the login limiter key on the browser address, but the budget
+stayed `api.login_rate_per_minute_per_ip` (ten a minute) on both `GET /auth/login` and
+`GET /auth/callback`. Behind one corporate NAT or VPN egress every user shares one address, so
+ten logins a minute across a whole office locked everyone out, and anyone on that NAT could do
+it on purpose with ten junk requests a minute (threat-model row 12, availability).
+
+**Decision.** `carto_core.api.ratelimit.LoginLimiter` holds three buckets and the routes use
+them as follows:
+
+- The callback is limited per login attempt, not per address. It carries the
+  `__Host-carto_login` cookie (section 3) and the attempt it names is popped (single-use), so a
+  callback with a valid cookie has a budget of exactly one per login start and needs no
+  address limiter at all. Only a callback without a valid cookie (no state or code, an unknown
+  or expired state, a missing or foreign cookie) takes from a small per-address budget,
+  `api.login_rate_per_minute_per_ip` (ten a minute, as before), checked before the refusal is
+  audited, so junk bounds the audit log too, and, when the request carries no cookie, before
+  the store is read. The state is still popped in every case (section 3 stands).
+- `GET /auth/login` keeps a per-address limiter with its own budget sized for shared egress,
+  `api.login_starts_per_minute_per_ip` (default 60), under a ceiling across every address,
+  `api.login_starts_per_minute_total` (default 600), so nobody can mint pending attempts in the
+  store without bound. The address bucket is checked first, so one flooding address spends at
+  most its own share of the ceiling. Both settings are positive integers and the ceiling must
+  cover one address's budget (a model validator).
+- Every `429` carries `Retry-After`. `carto_api_rate_limited_total` still counts every `429`;
+  `carto_api_login_starts_rate_limited_total` and
+  `carto_api_login_callbacks_rate_limited_total` tell the two login paths apart, since
+  `ApiMetrics` has no labels.
+
+A valid callback that fails later (token exchange, a bad ID token) is a refused login, audited
+and counted as before; it has consumed its attempt, so it cannot be replayed to spend anything
+twice.
+
 ## Alternatives
 
 - A trusted-proxy address allowlist for M5: deferred to the M6 ingress work; the certificate
   role is already the stronger identity (section 1).
+- Raising `login_rate_per_minute_per_ip` alone for section 5: it would raise the junk budget
+  of the callback with it, and no single number fits both a lone laptop and an office behind
+  one address. Per-attempt is the right unit for the callback; the start budget and the ceiling
+  bound the one thing a start costs, a pending attempt in the store.
+- Refunding the address token on a valid callback instead of skipping the limiter: a refund
+  needs a second lock round-trip and still refuses the office's eleventh valid callback in the
+  burst before the first refund lands.
 - A thread-local "current transaction" the audit log reads for M6: implicit, and wrong the
   first time a port runs an append outside the thread that opened the transaction. The
   connection is passed explicitly.
@@ -126,6 +167,12 @@ navigation, which Lax sends; a cross-site fetch or an iframe does not get the co
   `test_core_api_app.py` pins that a padded header keeps the browser's own bucket.
 - `assemble_data_ports` and the in-memory port constructors take the audit log; the committed
   OpenAPI document changed only in the two auth operation descriptions.
+- Section 5: a browser behind a shared address is locked out of `/auth/login` only when that
+  address starts more than sixty logins a minute, and never out of the callback; the limiter
+  remains per replica (M6). `ApiContext.login_limiter` is a `LoginLimiter`, two settings and
+  two counters are new, and the OpenAPI document is unchanged. A callback that carries a cookie
+  still costs one attempt lookup before its junk budget is checked; that is the same cost as
+  any anonymous request's session lookup and bounded the same way.
 - The integration tests of the Postgres path (`test_core_api_postgres.py::
   test_append_on_a_callers_connection_chains_and_rolls_back_with_it` and the rollback step in
   `test_core_api_data_ports.py`) need Docker and ran in CI, not on the laptop that built this.

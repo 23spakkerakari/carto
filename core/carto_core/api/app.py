@@ -47,7 +47,7 @@ from carto_core.api.context import ApiContext, ApiMetrics
 from carto_core.api.oidc import OidcClient
 from carto_core.api.ports import ApiPorts, RoleBinding
 from carto_core.api.problems import PROBLEM_CONTENT_TYPE, Problem, install_problem_handlers
-from carto_core.api.ratelimit import TokenBucketLimiter
+from carto_core.api.ratelimit import LoginLimiter, TokenBucketLimiter
 from carto_core.api.sessions import SessionManager, gate, public_route
 from carto_core.ingest.app import RequestIdMiddleware
 from carto_schema.api import API_VERSION, Role
@@ -234,7 +234,7 @@ def create_app(
         oidc=oidc
         if oidc is not None
         else OidcClient(api_settings.oidc, api_settings.redirect_url, clock=now),
-        login_limiter=TokenBucketLimiter(api_settings.login_rate_per_minute_per_ip, now),
+        login_limiter=LoginLimiter.from_settings(api_settings, now),
         user_limiter=TokenBucketLimiter(api_settings.request_rate_per_minute_per_user, now),
     )
 

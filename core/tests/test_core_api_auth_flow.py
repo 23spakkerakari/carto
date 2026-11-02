@@ -3,8 +3,8 @@ the authorization request carries state, nonce and an S256 PKCE challenge; the c
 exchanges the code with the client secret from its file, verifies the ID token and issues a
 fresh session behind the ``__Host-`` cookie with the right flags; a wrong nonce, issuer,
 audience or an expired token is refused; groups without a binding grant no role; idle and
-absolute timeouts end the session; logout needs the CSRF token and invalidates; login is
-rate-limited per address."""
+absolute timeouts end the session; logout needs the CSRF token and invalidates; login starts
+are rate-limited per address and in total, callbacks per attempt (ADR 0070 section 5)."""
 
 from __future__ import annotations
 
@@ -286,15 +286,70 @@ def test_discovery_naming_another_issuer_is_refused(secret_file: Path) -> None:
 
 
 def test_login_is_rate_limited_per_address(secret_file: Path) -> None:
-    world = _world(secret_file, login_rate_per_minute_per_ip=3)
+    world = _world(secret_file, login_starts_per_minute_per_ip=3)
     for _ in range(3):
         assert world.client.get(LOGIN).status_code == 302
     limited = world.client.get(LOGIN)
     assert limited.status_code == 429
     assert int(limited.headers["retry-after"]) >= 1
     assert limited.json()["title"] == "too many requests"
+    assert world.context.metrics.get("carto_api_rate_limited_total") == 1
+    assert world.context.metrics.get("carto_api_login_starts_rate_limited_total") == 1
+    assert world.context.metrics.get("carto_api_login_callbacks_rate_limited_total") == 0
     world.clock.advance(minutes=1)
     assert world.client.get(LOGIN).status_code == 302
+
+
+def test_callbacks_with_a_valid_cookie_are_not_limited_per_address(secret_file: Path) -> None:
+    """A whole office behind one NAT address signs in: the callback is limited per login
+    attempt (the single-use state behind the login cookie), not per address, so the junk budget
+    of that address being spent does not lock the office out (ADR 0070 section 5)."""
+    world = _world(secret_file)  # login_rate_per_minute_per_ip=10 is the junk-callback budget
+    world.client.cookies.clear()
+    junk = [
+        world.client.get(CALLBACK, params={"code": "c", "state": f"nope-{n}"}) for n in range(11)
+    ]
+    assert [response.status_code for response in junk] == [400] * 10 + [429]
+    assert int(junk[-1].headers["retry-after"]) >= 1
+    assert junk[-1].json()["title"] == "too many requests"
+    assert world.context.metrics.get("carto_api_login_failures_total") == 10, (
+        "a limited callback is refused before it is examined or audited"
+    )
+    assert world.context.metrics.get("carto_api_audit_rows_total") == 10
+    for n in range(11):
+        response = world.login()
+        assert response.status_code == 302, (n, response.text)
+        world.client.cookies.delete(SESSION_COOKIE_NAME)
+    assert len(world.sessions) == 11
+    assert world.context.metrics.get("carto_api_logins_total") == 11
+    assert world.context.metrics.get("carto_api_rate_limited_total") == 1
+    assert world.context.metrics.get("carto_api_login_callbacks_rate_limited_total") == 1
+    assert world.context.metrics.get("carto_api_login_starts_rate_limited_total") == 0
+
+
+def test_a_callback_with_a_foreign_cookie_spends_the_junk_budget_of_its_address(
+    secret_file: Path,
+) -> None:
+    world = _world(secret_file, login_rate_per_minute_per_ip=1)
+    own = world.start_login()
+    own_cookie = world.client.cookies.get(LOGIN_COOKIE_NAME)
+    assert own_cookie
+    world.client.cookies.clear()
+    other = world.start_login()
+    world.client.cookies.set(LOGIN_COOKIE_NAME, own_cookie)
+    foreign = world.finish_login(other)
+    assert foreign.status_code == 400, "the one junk token of this address"
+    attempts = world.ports.login_attempts
+    assert isinstance(attempts, InMemoryLoginAttemptStore)
+    assert len(attempts) == 1, "the other attempt was consumed"
+    world.provider.nonce = own["nonce"]
+    assert world.finish_login(own).status_code == 302, "a valid cookie needs no address budget"
+    assert len(attempts) == 0
+    world.client.cookies.clear()
+    limited = world.client.get(CALLBACK, params={"error": "access_denied"})
+    assert limited.status_code == 429
+    assert int(limited.headers["retry-after"]) >= 1
+    assert len(attempts) == 0, "nothing to pop: the cookie-less callback never reaches the store"
 
 
 # --- callback ----------------------------------------------------------------------------------

@@ -415,7 +415,16 @@ class OidcSettings(_Frozen):
 class ApiSettings(_Frozen):
     """The console API (spec 12, 13, 14.1, 14.2, 14.7). One origin with the web app (plan M2
     decision 10): ``public_url`` is that origin and the OIDC redirect is ``/api/v1/auth/callback``
-    under it."""
+    under it.
+
+    The login limits (spec 14.7 "stricter on login"; ADR 0070 section 5) are three budgets:
+    ``login_starts_per_minute_per_ip`` bounds ``GET /auth/login`` per browser address, sized
+    for an office behind one NAT or VPN egress address; ``login_starts_per_minute_total`` is
+    the ceiling across every address, so nobody can mint pending login attempts in the store
+    without bound; ``login_rate_per_minute_per_ip`` bounds the callbacks that carry no valid
+    login cookie, per address. A callback that carries its attempt's cookie is not limited per
+    address: the attempt is single-use, so its budget is one callback per login start.
+    """
 
     host: str = Field(default="127.0.0.1", min_length=1, max_length=253)
     port: int = Field(default=8444, ge=1, le=65535)
@@ -453,7 +462,24 @@ class ApiSettings(_Frozen):
             "auditor) applied to role_bindings at startup when the table has no bindings yet."
         ),
     )
-    login_rate_per_minute_per_ip: int = Field(default=10, ge=1, le=1000)
+    login_rate_per_minute_per_ip: int = Field(
+        default=10,
+        ge=1,
+        le=1000,
+        description="Callbacks without a valid login cookie per browser address (class docstring).",
+    )
+    login_starts_per_minute_per_ip: int = Field(
+        default=60,
+        ge=1,
+        le=10_000,
+        description="Login starts per browser address; one address may be a whole office.",
+    )
+    login_starts_per_minute_total: int = Field(
+        default=600,
+        ge=1,
+        le=1_000_000,
+        description="Login starts across all addresses; bounds the pending attempts in the store.",
+    )
     request_rate_per_minute_per_user: int = Field(default=600, ge=10, le=100_000)
     max_body_bytes: int = Field(default=MIB, ge=16 * 1024, le=16 * MIB)
     page_size_default: int = Field(default=50, ge=1, le=500)
@@ -485,6 +511,12 @@ class ApiSettings(_Frozen):
             if role not in ROLE_NAMES:
                 msg = f"api.bootstrap_group_roles maps group {group!r} to an unknown role"
                 raise ValueError(msg)
+        if self.login_starts_per_minute_total < self.login_starts_per_minute_per_ip:
+            msg = (
+                "api.login_starts_per_minute_total must be at least "
+                "api.login_starts_per_minute_per_ip: the ceiling covers one address's budget"
+            )
+            raise ValueError(msg)
         return self
 
     @property

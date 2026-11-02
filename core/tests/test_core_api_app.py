@@ -326,7 +326,7 @@ def test_forwarded_client_takes_the_last_hop_and_refuses_junk() -> None:
 def _settings_with_login_limit(per_minute: int) -> CoreSettings:
     return CoreSettings(
         _env_file=None,
-        api=ApiSettings(insecure_http=True, login_rate_per_minute_per_ip=per_minute),
+        api=ApiSettings(insecure_http=True, login_starts_per_minute_per_ip=per_minute),
     )
 
 
@@ -372,6 +372,55 @@ def test_the_forwarded_header_is_ignored_without_the_web_role() -> None:
             for n in range(3)
         ]
         assert statuses == [503, 503, 429], (role, statuses)
+
+
+# --- login starts: the shared-egress budget and the ceiling (ADR 0070 section 5) --------------
+
+
+def _web_world() -> tuple[TestClient, ApiContext]:
+    """A client behind the web proxy with the default login budgets and no provider."""
+    settings = CoreSettings(_env_file=None, api=ApiSettings(insecure_http=True))
+    assert settings.api.login_starts_per_minute_per_ip == 60
+    assert settings.api.login_starts_per_minute_total == 600
+    app = create_app(settings, seeded_ports(), clock=lambda: NOW)
+    context = app.state.context
+    assert isinstance(context, ApiContext)
+    return TestClient(ActAsRole(app, "web"), base_url="https://testserver"), context
+
+
+def _starts(web: TestClient, address: str, count: int) -> list[httpx.Response]:
+    login = f"{API_PREFIX}/auth/login"
+    return [web.get(login, headers={"X-Forwarded-For": address}) for _ in range(count)]
+
+
+def test_login_starts_from_one_address_are_limited_at_the_shared_egress_budget() -> None:
+    """Sixty starts a minute from one address: an office behind one NAT, not ten."""
+    web, context = _web_world()
+    responses = _starts(web, "10.0.0.2", 61)
+    assert [r.status_code for r in responses[:60]] == [503] * 60, "no provider: 503, not 429"
+    limited = responses[60]
+    assert limited.status_code == 429
+    assert int(limited.headers["retry-after"]) >= 1
+    assert limited.json()["title"] == "too many requests"
+    assert _starts(web, "10.0.0.3", 1)[0].status_code == 503, "another address, its own budget"
+    assert context.metrics.get("carto_api_rate_limited_total") == 1
+    assert context.metrics.get("carto_api_login_starts_rate_limited_total") == 1
+    assert context.metrics.get("carto_api_login_callbacks_rate_limited_total") == 0
+
+
+def test_login_starts_have_a_ceiling_across_all_addresses() -> None:
+    """Six hundred starts a minute across ten addresses spend the ceiling; the next start from
+    a fresh address is refused with ``Retry-After`` although its own budget is untouched."""
+    web, context = _web_world()
+    for n in range(10):
+        statuses = [r.status_code for r in _starts(web, f"10.0.1.{n + 1}", 60)]
+        assert statuses == [503] * 60, (n, statuses)
+    limited = _starts(web, "10.0.2.1", 1)[0]
+    assert limited.status_code == 429
+    assert int(limited.headers["retry-after"]) >= 1
+    assert limited.json()["title"] == "too many requests"
+    assert context.metrics.get("carto_api_login_starts_rate_limited_total") == 1
+    assert context.metrics.get("carto_api_rate_limited_total") == 1
 
 
 def test_the_audit_row_records_the_forwarded_address_behind_the_web_role() -> None:

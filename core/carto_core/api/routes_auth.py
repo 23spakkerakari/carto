@@ -12,10 +12,23 @@ time, exchanges the code, verifies the ID token, maps the groups claim to roles 
 ``role_bindings`` (exact group names; a group with no binding grants nothing, so such a user
 signs in and sees ``403`` everywhere, which ``GET /me`` makes visible), upserts the user,
 issues a new session (never adopting an id from the request), clears the login cookie and
-redirects to ``/``. Both login routes are rate-limited per client address (the browser's,
-behind the web proxy; :func:`carto_core.api.context.client_ip`; spec 14.7 "stricter on
-login"). Logout deletes the session and is CSRF-checked like every mutation. Login, logout and
-every refused login are audited (spec 14.9); the refused one as ``auth.login_failed`` by the
+redirects to ``/``.
+
+Rate limits (spec 14.7 "stricter on login"; :class:`carto_core.api.ratelimit.LoginLimiter`;
+ADR 0070 section 5): a login start is limited per client address (the browser's, behind the
+web proxy; :func:`carto_core.api.context.client_ip`) with a budget sized for a whole office
+behind one NAT or VPN egress address, and under a ceiling across every address that bounds
+the pending attempts in the store. The callback is limited per login attempt, not per
+address: the attempt is single-use, so a callback that carries its attempt's cookie needs no
+address budget and one address's junk cannot lock the office out. Only a callback without a
+valid cookie (no state or code, an unknown or expired state, a missing or foreign cookie) takes
+from a small per-address budget, checked before the refusal is audited (so junk bounds the
+audit log too) and, when the request carries no cookie at all, before the store is read. The
+attempt a state names is popped in every case, so a state stays single-use (ADR 0070 section
+3). Every ``429`` carries ``Retry-After``.
+
+Logout deletes the session and is CSRF-checked like every mutation. Login, logout and every
+refused login are audited (spec 14.9); the refused one as ``auth.login_failed`` by the
 anonymous actor with the step as target and the detail as reason.
 
 Failures answer a problem that names the step (``state``, ``exchange``, ``token``), never the
@@ -47,6 +60,7 @@ from carto_core.settings import SESSION_COOKIE_NAME
 from carto_schema.api import MeView, Role
 
 if TYPE_CHECKING:
+    from carto_core.api.context import ApiContext
     from carto_core.settings import ApiSettings
 
 __all__ = ["LOGIN_ATTEMPT_TTL", "LOGIN_COOKIE_NAME", "roles_for_groups", "router"]
@@ -116,14 +130,37 @@ def _clearing_header(settings: ApiSettings) -> dict[str, str]:
     return {"Set-Cookie": scratch.headers["set-cookie"]}
 
 
-def _login_limited(request: Request) -> None:
+def _too_many(context: ApiContext, wait: int, counter: str) -> Problem:
+    context.metrics.inc("carto_api_rate_limited_total")
+    context.metrics.inc(counter)
+    return Problem(
+        429, "too many requests", "too many login attempts", headers={"Retry-After": str(wait)}
+    )
+
+
+def _start_limited(request: Request) -> None:
+    """The per-address budget and the ceiling of a login start (module docstring)."""
     context = context_of(request)
-    wait = context.login_limiter.check(client_ip(request) or "unknown")
+    wait = context.login_limiter.check_start(client_ip(request) or "unknown")
     if wait is not None:
-        context.metrics.inc("carto_api_rate_limited_total")
-        raise Problem(
-            429, "too many requests", "too many login attempts", headers={"Retry-After": str(wait)}
-        )
+        raise _too_many(context, wait, "carto_api_login_starts_rate_limited_total")
+
+
+def _junk_callback_limited(request: Request) -> None:
+    """The per-address budget of a callback that carries no valid login cookie (module
+    docstring); runs before the refusal is audited, so junk bounds the audit log too."""
+    context = context_of(request)
+    wait = context.login_limiter.check_callback(client_ip(request) or "unknown")
+    if wait is not None:
+        raise _too_many(context, wait, "carto_api_login_callbacks_rate_limited_total")
+
+
+async def _junk_callback(request: Request, *, limited: bool, detail: str) -> Problem:
+    """Refuse a callback without a valid login cookie as a ``state`` failure, taking from the
+    junk budget first unless ``limited`` says it already was."""
+    if not limited:
+        _junk_callback_limited(request)
+    return await _login_failed(request, "state", detail)
 
 
 async def _login_failed(request: Request, step: str, detail: str) -> Problem:
@@ -154,7 +191,7 @@ async def _login_failed(request: Request, step: str, detail: str) -> Problem:
 async def login(request: Request) -> Response:
     """Send the browser to the identity provider, bound to it by the login cookie."""
     context = context_of(request)
-    _login_limited(request)
+    _start_limited(request)
     if not context.oidc.configured:
         raise Problem(503, "login unavailable", "no identity provider is configured")
     try:
@@ -188,17 +225,27 @@ async def callback(
 ) -> Response:
     """Finish the flow: cookie to attempt, code to ID token to session."""
     context = context_of(request)
-    _login_limited(request)
     if error is not None or not code or not state:
-        raise await _login_failed(request, "state", "provider returned an error or no code")
+        raise await _junk_callback(
+            request, limited=False, detail="provider returned an error or no code"
+        )
+    cookie = request.cookies.get(LOGIN_COOKIE_NAME)
+    unbound = not cookie or len(cookie) > _MAX_LOGIN_COOKIE_LEN
+    if unbound:
+        # Nothing this callback could be bound to: it takes from the junk budget before the
+        # store is read; the state it names is still consumed below.
+        _junk_callback_limited(request)
     attempt = await run_in_threadpool(context.ports.login_attempts.pop, _state_hash(state))
     now = context.clock()
     if attempt is None or attempt.expires_at <= now or attempt.tenant_id != context.tenant_id:
-        raise await _login_failed(request, "state", "unknown or expired state")
-    if not _binding_matches(request.cookies.get(LOGIN_COOKIE_NAME), attempt.binding_hash):
-        raise await _login_failed(
-            request, "state", "login cookie missing or from another login attempt"
+        raise await _junk_callback(request, limited=unbound, detail="unknown or expired state")
+    if not _binding_matches(cookie, attempt.binding_hash):
+        raise await _junk_callback(
+            request,
+            limited=unbound,
+            detail="login cookie missing or from another login attempt",
         )
+    # From here the callback is the single-use attempt's own: no address budget applies.
     try:
         identity = await run_in_threadpool(
             context.oidc.finish, code, attempt.code_verifier, attempt.nonce
