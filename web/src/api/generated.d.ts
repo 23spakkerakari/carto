@@ -774,7 +774,7 @@ export interface components {
          * @description The rows of the spec 14.2 table. Handlers ask for exactly one of these.
          * @enum {string}
          */
-        Permission: "view" | "review_links" | "manage_expectations" | "ack_alerts" | "manage_sources" | "manage_admin" | "view_audit" | "reveal";
+        Permission: "view" | "search" | "review_links" | "manage_expectations" | "ack_alerts" | "manage_sources" | "manage_admin" | "view_audit" | "reveal";
         /**
          * RejectReason
          * @description Spec 9.6: "Reject (with reason: different meaning, coincidence, wrong direction)".

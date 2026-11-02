@@ -1155,6 +1155,7 @@
         "description": "The rows of the spec 14.2 table. Handlers ask for exactly one of these.",
         "enum": [
           "view",
+          "search",
           "review_links",
           "manage_expectations",
           "ack_alerts",

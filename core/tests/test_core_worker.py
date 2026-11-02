@@ -150,6 +150,91 @@ def test_the_nightly_full_pass_does_not_requeue_itself_every_five_minutes() -> N
     assert len([job for job in queue.pending("default") if job.payload.get("full")]) == 2
 
 
+def test_assemble_and_graph_recur_at_their_own_intervals_when_handled() -> None:
+    """ADR 0060: the demo worker runs assembly every 30 s and the graph rollup every 5 minutes;
+    a worker without those handlers never queues them (the recurring set stays M2's)."""
+    queue, clock = InMemoryJobQueue(), Clock()
+    runs: list[JobKind] = []
+
+    def handler(job: Job) -> JobOutcome:
+        runs.append(job.kind)
+        return JobOutcome()
+
+    worker = _worker(
+        queue,
+        clock,
+        {JobKind.PROFILE: handler, JobKind.ASSEMBLE: handler, JobKind.GRAPH: handler},
+    )
+    worker.ensure_recurring()
+    jobs = _by_kind(queue)
+    assert jobs[JobKind.ASSEMBLE, False].run_after == NOW
+    assert jobs[JobKind.GRAPH, False].run_after == NOW
+    assert len(queue) == 5
+    while worker.run_once():
+        pass
+    assert sorted(runs, key=str) == sorted(
+        [JobKind.PROFILE, JobKind.ASSEMBLE, JobKind.GRAPH], key=str
+    )
+    jobs = _by_kind(queue)
+    assert jobs[JobKind.ASSEMBLE, False].run_after == NOW + timedelta(seconds=30)
+    assert jobs[JobKind.GRAPH, False].run_after == NOW + timedelta(seconds=300)
+    worker.ensure_recurring()
+    assert len(queue) == 5, "dedupe keeps one pending row per kind"
+    # A full assembly (ADR 0062) does not re-queue the incremental one twice.
+    queue.enqueue("default", JobKind.ASSEMBLE, {"full": True}, NOW)
+    assert worker.run_once() is True
+    assert runs[-1] is JobKind.ASSEMBLE
+    assert len([j for j in queue.pending("default") if j.kind is JobKind.ASSEMBLE]) == 1
+
+
+def test_handlers_run_under_the_pass_lock_and_skip_when_another_worker_holds_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Plan M3 decision 2: the lease is not a lock; the pass lock is, and it is per pass."""
+    from contextlib import contextmanager  # noqa: PLC0415
+
+    keys: list[tuple[str, bool]] = []
+    held = {"taken": True}
+
+    @contextmanager
+    def lock(key: str) -> Any:
+        keys.append((key, held["taken"]))
+        yield held["taken"]
+
+    class FakePass:
+        calls = 0
+
+        @classmethod
+        def from_context(cls, _context: WorkerContext) -> FakePass:
+            return cls()
+
+        def run(self, tenant_id: str, *, full: bool, now: datetime) -> JobOutcome:
+            FakePass.calls += 1
+            return JobOutcome(counts={"rows": 1})
+
+    monkeypatch.setattr(worker_module, "load_pass", lambda _module, _name: FakePass)
+    context = _context()
+    locked = WorkerContext(
+        settings=context.settings,
+        tenant_id=context.tenant_id,
+        events=context.events,
+        metadata=context.metadata,
+        engine=context.engine,
+        clock=context.clock,
+        pass_lock=lock,
+    )
+    handlers = default_handler_factory(locked)
+    assert set(handlers) == {JobKind.PROFILE, JobKind.LINK, JobKind.ASSEMBLE, JobKind.GRAPH}
+    assert handlers[JobKind.ASSEMBLE](Job(1, "default", JobKind.ASSEMBLE, {})) == JobOutcome(
+        counts={"rows": 1}
+    )
+    held["taken"] = False
+    skipped = handlers[JobKind.LINK](Job(2, "default", JobKind.LINK, {}))
+    assert skipped == JobOutcome(counts={"skipped": 1})
+    assert FakePass.calls == 1
+    assert keys == [("default/assemble-pass", True), ("default/link-pass", False)]
+
+
 def test_a_failing_handler_backs_off_by_class_only_and_is_dropped_after_the_last_attempt() -> None:
     queue, clock = InMemoryJobQueue(), Clock()
     buffer = io.StringIO()
@@ -280,7 +365,7 @@ def test_the_default_factory_builds_passes_from_the_context_and_calls_run(
 
     monkeypatch.setattr(worker_module, "load_pass", lambda _module, _name: FakePass)
     handlers = default_handler_factory(_context())
-    assert set(handlers) == {JobKind.PROFILE, JobKind.LINK}
+    assert set(handlers) == {JobKind.PROFILE, JobKind.LINK, JobKind.ASSEMBLE, JobKind.GRAPH}
     outcome = handlers[JobKind.PROFILE](Job(1, "default", JobKind.PROFILE, {}))
     assert outcome == JobOutcome(new_sketches=True, counts={"rows_read": 7})
     nightly = handlers[JobKind.LINK](Job(2, "default", JobKind.LINK, {"full": True}))

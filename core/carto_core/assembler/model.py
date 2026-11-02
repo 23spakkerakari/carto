@@ -12,8 +12,9 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import date, datetime
-from enum import StrEnum
 from typing import Final
+
+from carto_schema.api import TransactionStatus
 
 __all__ = [
     "STATUS_PRECEDENCE",
@@ -24,15 +25,6 @@ __all__ = [
     "TransactionRow",
     "TransactionStatus",
 ]
-
-
-class TransactionStatus(StrEnum):
-    """Spec 9.7 item 7."""
-
-    IN_PROGRESS = "in_progress"
-    COMPLETED = "completed"
-    ERRORED = "errored"
-    STALLED = "stalled"
 
 
 STATUS_PRECEDENCE: Final[tuple[TransactionStatus, ...]] = (

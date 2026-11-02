@@ -25,6 +25,7 @@ export type RejectReason = 'different_meaning' | 'coincidence' | 'wrong_directio
 export type Role = 'admin' | 'integration_engineer' | 'business_viewer' | 'auditor';
 export type Permission =
   | 'view'
+  | 'search'
   | 'review_links'
   | 'manage_expectations'
   | 'ack_alerts'

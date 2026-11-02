@@ -36,6 +36,7 @@ ROLE_PERMISSIONS: Final[dict[Role, frozenset[Permission]]] = {
     Role.ADMIN: frozenset(
         {
             Permission.VIEW,
+            Permission.SEARCH,
             Permission.REVIEW_LINKS,
             Permission.MANAGE_EXPECTATIONS,
             Permission.ACK_ALERTS,
@@ -47,13 +48,14 @@ ROLE_PERMISSIONS: Final[dict[Role, frozenset[Permission]]] = {
     Role.INTEGRATION_ENGINEER: frozenset(
         {
             Permission.VIEW,
+            Permission.SEARCH,
             Permission.REVIEW_LINKS,
             Permission.MANAGE_EXPECTATIONS,
             Permission.ACK_ALERTS,
         }
     ),
-    Role.BUSINESS_VIEWER: frozenset({Permission.VIEW, Permission.ACK_ALERTS}),
-    Role.AUDITOR: frozenset({Permission.VIEW, Permission.VIEW_AUDIT}),
+    Role.BUSINESS_VIEWER: frozenset({Permission.VIEW, Permission.SEARCH, Permission.ACK_ALERTS}),
+    Role.AUDITOR: frozenset({Permission.VIEW, Permission.SEARCH, Permission.VIEW_AUDIT}),
 }
 """Spec 14.2, row by row. ``business_viewer`` rows are "scoped to their entities"; scoped
 bindings arrive in M6 (plan M2 "Deferred"), so in M2 the role sees what every viewer sees.

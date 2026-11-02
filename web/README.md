@@ -107,6 +107,7 @@ Runtime (bundled):
 | react, react-dom                | 19.1.10               | MIT     |
 | react-router                    | 7.18.4                | MIT     |
 | @tanstack/react-query           | 5.104.4               | MIT     |
+| @xyflow/react                   | 12.12.0               | MIT     |
 | @radix-ui/react-tabs            | 1.2.1                 | MIT     |
 | @radix-ui/react-radio-group     | 1.5.1                 | MIT     |
 | @radix-ui/react-visually-hidden | 1.2.13                | MIT     |

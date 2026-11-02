@@ -1,18 +1,27 @@
-"""``carto-core worker``: lease profile, link and family jobs from PostgreSQL (spec 5.3, 9.1;
-plan M2 "How the engine runs"; ADR 0055).
+"""``carto-core worker``: lease profile, link, assemble and graph jobs from PostgreSQL (spec
+5.3, 9.1, 9.7, 9.8; plan M2 "How the engine runs"; ADR 0055, 0060).
 
 :class:`Worker` is the loop, testable with an injected :class:`~carto_core.jobs.JobQueue`, a
 clock and a mapping of :class:`~carto_core.jobs.JobKind` to handler. Each round it makes sure
 the recurring jobs exist (``enqueue`` with ``dedupe`` keeps one pending row per kind and
-payload, so restarts and two workers never pile them up), then leases the oldest runnable job of
-the kinds it has a handler for, runs the handler, and completes it:
+payload, so restarts never pile them up), then leases the oldest runnable job of the kinds it
+has a handler for, runs the handler, and completes it:
 
 - an incremental ``profile`` (payload ``{}``) re-queues itself at ``now +
   profiler.update_interval_seconds`` and, when ``worker.link_after_profile`` is set and the pass
   reported new sketches, queues a ``link`` (payload ``{}``) at once;
+- ``assemble`` and ``graph`` (payload ``{}``) re-queue themselves at their own intervals
+  (``assembler.interval_seconds``, ``graph.interval_seconds``) when the worker has a handler
+  for them;
 - the nightly full passes, ``profile {"full": true}`` at ``profiler.rebuild_hour_utc`` and
   ``link {"full": true}`` at ``worker.full_pass_hour_utc``, are re-queued for the next slot by
   the recurring check, so they run once a day whatever happened in between.
+
+The lease is not a lock: dedupe matches unleased rows only and an expired lease is retaken,
+so two workers may lease the same kind in turn and run one pass concurrently. Every handler
+therefore runs under the context's :data:`~carto_core.db.locks.PassLock` (a per-tenant
+advisory try-lock, plan M3 decision 2); a worker that does not get it skips the round and
+reports ``skipped``.
 
 A handler that raises is logged by exception class only (spec 2.3 invariant 7) and the job is
 released for a retry after ``worker.backoff_base_seconds * 2 ** attempts``; after
@@ -36,13 +45,20 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Final
 
 from carto_common.logging import configure_logging, get_logger
+from carto_core.db.locks import PassLock, pass_lock_key
 from carto_core.jobs import Job, JobKind, JobQueue, JobQueueError
 
 if TYPE_CHECKING:
     from sqlalchemy import Engine
 
     from carto_core.metadata import MetadataStore
-    from carto_core.settings import CoreSettings, ProfilerSettings, WorkerSettings
+    from carto_core.settings import (
+        AssemblerSettings,
+        CoreSettings,
+        GraphSettings,
+        ProfilerSettings,
+        WorkerSettings,
+    )
     from carto_core.store import EventStore
 
 __all__ = [
@@ -78,7 +94,8 @@ Handler = Callable[[Job], JobOutcome]
 
 @dataclass(frozen=True, slots=True)
 class WorkerContext:
-    """What the engine passes get: settings, the tenant, both stores, the engine and the clock."""
+    """What the engine passes get: settings, the tenant, both stores, the engine, the clock and
+    the pass lock (``None`` runs the passes unlocked: tests and ``discover``)."""
 
     settings: CoreSettings
     tenant_id: str
@@ -86,6 +103,7 @@ class WorkerContext:
     metadata: MetadataStore
     engine: Engine
     clock: Callable[[], datetime]
+    pass_lock: PassLock | None = None
 
 
 HandlerFactory = Callable[[WorkerContext], Mapping[JobKind, Handler]]
@@ -125,25 +143,34 @@ def load_pass(module_name: str, class_name: str) -> Any | None:
     return pass_type
 
 
-def _handler(pass_object: Any, context: WorkerContext) -> Handler:
+def _handler(pass_object: Any, context: WorkerContext, kind: JobKind) -> Handler:
     def run(job: Job) -> JobOutcome:
         full = bool(job.payload.get("full"))
-        return _outcome(pass_object.run(context.tenant_id, full=full, now=context.clock()))
+        if context.pass_lock is None:
+            return _outcome(pass_object.run(context.tenant_id, full=full, now=context.clock()))
+        with context.pass_lock(pass_lock_key(context.tenant_id, kind.value)) as taken:
+            if not taken:
+                log.info("pass skipped: another worker holds it", kind=kind.value)
+                return JobOutcome(counts={"skipped": 1})
+            return _outcome(pass_object.run(context.tenant_id, full=full, now=context.clock()))
 
     return run
 
 
 def default_handler_factory(context: WorkerContext) -> Mapping[JobKind, Handler]:
-    """``ProfilePass`` and ``LinkPass`` built with ``from_context``; kinds whose pass is not
-    available yet get no handler (module docstring)."""
+    """``ProfilePass``, ``LinkPass``, ``AssemblePass`` and ``GraphPass`` built with
+    ``from_context``; kinds whose pass is not available yet get no handler (module
+    docstring)."""
     handlers: dict[JobKind, Handler] = {}
     for kind, module_name, class_name in (
         (JobKind.PROFILE, "carto_core.profiler.run", "ProfilePass"),
         (JobKind.LINK, "carto_core.linker.run", "LinkPass"),
+        (JobKind.ASSEMBLE, "carto_core.assembler.run", "AssemblePass"),
+        (JobKind.GRAPH, "carto_core.graph.run", "GraphPass"),
     ):
         pass_type = load_pass(module_name, class_name)
         if pass_type is not None:
-            handlers[kind] = _handler(pass_type.from_context(context), context)
+            handlers[kind] = _handler(pass_type.from_context(context), context, kind)
     return handlers
 
 
@@ -167,12 +194,18 @@ class Worker:
         worker: WorkerSettings,
         profiler: ProfilerSettings,
         clock: Callable[[], datetime] | None = None,
+        assembler: AssemblerSettings | None = None,
+        graph: GraphSettings | None = None,
     ) -> None:
+        from carto_core.settings import AssemblerSettings, GraphSettings  # noqa: PLC0415
+
         self._queue = queue
         self._tenant_id = tenant_id
         self._handlers = dict(handlers)
         self._worker = worker
         self._profiler = profiler
+        self._assembler = assembler if assembler is not None else AssemblerSettings()
+        self._graph = graph if graph is not None else GraphSettings()
         self._clock = clock if clock is not None else _utc_now
 
     def __repr__(self) -> str:
@@ -199,6 +232,9 @@ class Worker:
             {"full": True},
             next_daily_slot(at, self._worker.full_pass_hour_utc),
         )
+        for kind in (JobKind.ASSEMBLE, JobKind.GRAPH):
+            if kind in self._handlers:
+                self._queue.enqueue(tenant, kind, {}, at)
 
     def run_once(self, now: datetime | None = None) -> bool:
         """Lease and run one job; False when nothing was runnable."""
@@ -238,9 +274,17 @@ class Worker:
         self._queue.fail(job.id, error, retry_at)
 
     def _follow_up(self, job: Job, outcome: JobOutcome, full: bool) -> None:
+        now = self._clock()
+        if job.kind is JobKind.ASSEMBLE and not full:
+            interval = timedelta(seconds=self._assembler.interval_seconds)
+            self._queue.enqueue(self._tenant_id, JobKind.ASSEMBLE, {}, now + interval)
+            return
+        if job.kind is JobKind.GRAPH:
+            interval = timedelta(seconds=self._graph.interval_seconds)
+            self._queue.enqueue(self._tenant_id, JobKind.GRAPH, {}, now + interval)
+            return
         if job.kind is not JobKind.PROFILE:
             return
-        now = self._clock()
         if not full:
             interval = timedelta(seconds=self._profiler.update_interval_seconds)
             self._queue.enqueue(self._tenant_id, JobKind.PROFILE, {}, now + interval)
@@ -269,6 +313,7 @@ class Worker:
 def run_worker(settings: CoreSettings, *, once: bool = False) -> int:
     """Connect to both stores, build the handlers and run the loop until signalled."""
     from carto_core.db.clickhouse import create_client  # noqa: PLC0415 - keeps import light
+    from carto_core.db.locks import postgres_pass_lock  # noqa: PLC0415
     from carto_core.db.postgres import create_engine_from_settings  # noqa: PLC0415
     from carto_core.jobs_postgres import PostgresJobQueue  # noqa: PLC0415
     from carto_core.metadata import PostgresMetadataStore  # noqa: PLC0415
@@ -286,6 +331,7 @@ def run_worker(settings: CoreSettings, *, once: bool = False) -> int:
                 metadata=PostgresMetadataStore(engine),
                 engine=engine,
                 clock=_utc_now,
+                pass_lock=postgres_pass_lock(engine),
             )
             worker = Worker(
                 PostgresJobQueue(engine),
@@ -293,6 +339,8 @@ def run_worker(settings: CoreSettings, *, once: bool = False) -> int:
                 handlers=default_handler_factory(context),
                 worker=settings.worker,
                 profiler=settings.profiler,
+                assembler=settings.assembler,
+                graph=settings.graph,
             )
             stop = threading.Event()
             if threading.current_thread() is threading.main_thread():
