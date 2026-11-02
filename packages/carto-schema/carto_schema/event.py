@@ -78,8 +78,9 @@ _JWT: Final = re.compile(r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.
 _CARTO_TOKEN: Final = re.compile(TOKEN_PATTERN.pattern.removeprefix("^").removesuffix("$"))
 _AWS_KEY: Final = re.compile(r"(?:AKIA|ASIA)[0-9A-Z]{16}")
 # scheme://user:password@host -> the password; the user name is configuration, not a secret,
-# and a placeholder or mask in the password slot ("://carto:<*>@") is already masked.
-_URL_USERINFO: Final = re.compile(r"(?<=://)([^/\s@:]+):(?!<\*>@|\[[A-Z_]+\]@)([^/\s@]+)(?=@)")
+# and may be empty (redis://:password@host), and a placeholder or mask in the password slot
+# ("://carto:<*>@") is already masked.
+_URL_USERINFO: Final = re.compile(r"(?<=://)([^/\s@:]*):(?!<\*>@|\[[A-Z_]+\]@)([^/\s@]+)(?=@)")
 # The look-behind stops a DSN user name (postgres://carto@db.internal) from reading as a mailbox.
 _EMAIL: Final = re.compile(r"(?<![\w.%+/-])[\w.%+-]+@[\w.-]+\.[A-Za-z]{2,}(?![\w-])")
 _UUID: Final = re.compile(
@@ -92,7 +93,10 @@ _UUID: Final = re.compile(
 # redaction mask or empty ("password=<*>", "token: [REDACTED]", 'pwd=""') is what the edge
 # writes for a template and passes; "token_count=3" and "secret_ref=vault://x" do not match
 # because "_" follows the word. The short words pwd, pass, auth and sig must start a word or a
-# camelCase hump ("dbPass=", not "bypass=" or "oauth=").
+# camelCase hump ("dbPass=", not "bypass=" or "oauth="). A quoted or braced value runs to its
+# closing character, however long (a bound would let a longer value through, since the bare
+# alternative cannot start on a quote); the scan stays linear because each alternative stops at
+# a fixed character or the end of the line.
 _SECRET_ASSIGNMENT: Final = re.compile(
     r"(?i)((?:(?:api|private|access)[ _.-]?key|client[ _.-]?secret|password|passwd|passphrase"
     r"|secret|token|apikey|authorization|cookie|session|bearer|credentials?|signature"
@@ -100,7 +104,7 @@ _SECRET_ASSIGNMENT: Final = re.compile(
     r"""\\?["']?[ \t]{0,16}[=:][ \t]{0,16}(?:(?:basic|bearer|digest)[ \t]{1,16})?)"""
     r"""(?!\\?["']?(?:<\*>|\[[A-Z_]+\]|(?:basic|bearer|digest)(?:[ \t]|\\?["']|$)|[\s,;&]|$)"""
     r"""|\\?["']\\?["'])"""
-    r"""(\\"[^"\n]{0,512}\\"|"[^"\n]{0,512}"|'[^'\n]{0,512}'|\{[^}\n]{0,512}\}"""
+    r"""(\\"[^"\n]*\\"|"[^"\n]*"|'[^'\n]*'|\{[^}\n]*\}"""
     r"""|(?:[^\s"',;&\\]|\\(?!["']))+)"""
 )
 

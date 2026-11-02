@@ -701,3 +701,30 @@ def test_secret_values_are_planted_in_noise_lines_and_recorded(run: Run) -> None
     # Every planted line is a noise event with no transaction behind it.
     secret_lines = [line for line in native.splitlines() if any(v in line for v in secrets)]
     assert len(secret_lines) >= 5
+
+
+def test_every_log_source_carries_planted_secrets(run: Run) -> None:
+    """ADR 0068: each log source of the scenario plants the secrets into its noise lines; the
+    payments XML carries one as a ``<note>`` element of a heartbeat document."""
+    secrets = run.truth.markers.secret_values
+    for pattern in (
+        "webstore/app-*.ndjson",
+        "orders/order-svc-*.log",
+        "payments/messages-*.xml",
+        "warehouse/export-job-*.log",
+        "shipping/shipping-app-*.log",
+    ):
+        text = "\n".join(path.read_text(encoding="utf-8") for path in run.files(pattern))
+        assert any(value in text for value in secrets), pattern
+    notes = 0
+    for path in run.files("payments/messages-*.xml"):
+        for line in path.read_text(encoding="utf-8").splitlines():
+            root = ET.fromstring(line)  # noqa: S314  (synthetic data written by this package)
+            note = root.findtext("note")
+            if note is None:
+                continue
+            notes += 1
+            assert root.tag == "heartbeat"
+            assert root.findtext("status") == "OK"
+            assert any(value in note for value in secrets), note
+    assert notes >= 1

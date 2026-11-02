@@ -41,6 +41,15 @@ SHAPED: dict[str, str] = {
 """One sample per shape, keyed by the words the error message uses."""
 SECRET_PARTS = ("hunter2", "jane", "example.com", "123e4567", "0123456789abcdef", "000447")
 """Substrings of the samples that must never appear in an error."""
+LONG_QUOTED_VALUE = "h" * 600
+MORE_SHAPED: list[tuple[str, str, str]] = [
+    ("a secret-named key with a value", f'password="{LONG_QUOTED_VALUE}"', 'password="<*>"'),
+    ("a secret-named key with a value", f"token: '{LONG_QUOTED_VALUE}' x", "token: '<*>' x"),
+    ("a URL with a password", "redis://:hunter2@cache:6379", "redis://:<*>@cache:6379"),
+    ("a URL with a password", "dsn redis://:hunter2@cache/0 ok", "dsn redis://:<*>@cache/0 ok"),
+]
+"""Variants of a shape with the masked text: a quoted value longer than any bound a quoted
+alternative once had, and a URL whose userinfo has a password but no user name."""
 
 CONSTANTS = [
     "approved",
@@ -65,6 +74,7 @@ CONSTANTS = [
     "oauth=1",
     "auth failed",
     "postgres://carto@db.internal/orders",
+    "redis://:<*>@cache:6379",
     "user@<*>",
     "deadbeef",
     "12345",
@@ -99,6 +109,17 @@ def test_the_samples_cover_every_shape_in_order() -> None:
 def test_value_shape_names_the_shape(name: str, text: str) -> None:
     assert value_shape(text) == name
     assert value_shape(f"seen {text} here") == name
+
+
+@pytest.mark.parametrize(("name", "text", "masked"), MORE_SHAPED)
+def test_shape_variants_are_named_and_masked(name: str, text: str, masked: str) -> None:
+    assert value_shape(text) == name
+    assert mask_value_shapes(text) == masked
+    assert value_shape(masked) is None
+    with pytest.raises(ValidationError) as info:
+        CanonicalEvent.model_validate({**_example(), "template_text": text})
+    assert name in str(info.value)
+    assert "hunter2" not in str(info.value) and LONG_QUOTED_VALUE not in str(info.value)
 
 
 @pytest.mark.parametrize("text", CONSTANTS)
@@ -147,6 +168,11 @@ def test_mask_value_shapes_keeps_keys_user_names_and_quotes() -> None:
         "a@" * (MAX_TEMPLATE_TEXT_LEN // 2),
         "a.b" * (MAX_TEMPLATE_TEXT_LEN // 3),
         "://u:" * (MAX_TEMPLATE_TEXT_LEN // 5),
+        "://:" * (MAX_TEMPLATE_TEXT_LEN // 4),
+        'password="' + "a" * (MAX_TEMPLATE_TEXT_LEN - 10),
+        "password='" + "a" * (MAX_TEMPLATE_TEXT_LEN - 10),
+        'password="a' * (MAX_TEMPLATE_TEXT_LEN // 11),
+        "pwd={" + "a" * (MAX_TEMPLATE_TEXT_LEN - 5),
         "0123456789abcde-" * (MAX_TEMPLATE_TEXT_LEN // 16),
     ],
 )

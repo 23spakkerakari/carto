@@ -556,7 +556,9 @@ def strip_config(config: Mapping[str, Any]) -> dict[str, Any]:
     and every nested structure removed, scalars and lists of strings kept and bounded. Every
     string goes through the log redactor's :func:`~carto_common.logging.mask_string` (ADR
     0068), so a URL with userinfo, an e-mail address or a token shape under a benign key
-    (``url``, ``dsn``, ``paths``) leaves masked, not in clear."""
+    (``url``, ``dsn``, ``paths``) leaves masked, not in clear. A string is masked whole and cut
+    to ``MAX_CONFIG_VALUE_LEN`` afterwards: cut first, a password whose ``@`` sat past the cut
+    would have left in clear."""
     out: dict[str, Any] = {}
     for key, value in config.items():
         name = str(key)
@@ -565,11 +567,9 @@ def strip_config(config: Mapping[str, Any]) -> dict[str, Any]:
         if value is None or isinstance(value, bool | int | float):
             out[name] = value
         elif isinstance(value, str):
-            out[name] = mask_string(value[:MAX_CONFIG_VALUE_LEN])[:MAX_CONFIG_VALUE_LEN]
+            out[name] = mask_string(value)[:MAX_CONFIG_VALUE_LEN]
         elif isinstance(value, list) and all(isinstance(item, str) for item in value):
-            out[name] = [
-                mask_string(item[:MAX_CONFIG_VALUE_LEN])[:MAX_CONFIG_VALUE_LEN] for item in value
-            ]
+            out[name] = [mask_string(item)[:MAX_CONFIG_VALUE_LEN] for item in value]
         # dicts, lists of dicts and mixed lists are dropped: a secret could hide inside them
         if len(out) >= MAX_CONFIG_KEYS:
             break

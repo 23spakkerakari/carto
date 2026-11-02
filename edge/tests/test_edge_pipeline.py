@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -17,8 +18,10 @@ from carto_common.crypto import Keyring, TokenKey, generate_key
 from carto_common.ids import derive_ulid, is_ulid
 from carto_edge.config import (
     ClassifySettings,
+    EdgeSettings,
     FieldPolicyPin,
     ParseConfig,
+    PiiSettings,
     RecordFormat,
     SourceConfig,
     SourcesFile,
@@ -27,7 +30,7 @@ from carto_edge.config import (
 )
 from carto_edge.pipeline.classify import Classifier
 from carto_edge.pipeline.model import RawRecord
-from carto_edge.pipeline.pii import RegexDetector
+from carto_edge.pipeline.pii import PiiHit, RegexDetector
 from carto_edge.pipeline.pipeline import (
     OUT_OF_RANGE_FUTURE,
     REASON_CONTRACT,
@@ -39,6 +42,7 @@ from carto_edge.pipeline.pipeline import (
 from carto_edge.pipeline.stats import FieldStatsStore
 from carto_edge.pipeline.templates import TemplateStore
 from carto_edge.pipeline.tokenize import Tokenizer
+from carto_edge.runtime import build_runtime
 from carto_schema.event import ActorKind, EventKind, ObservedAtQuality, Severity
 
 RECEIVED = datetime(2026, 10, 8, 12, 0, 0, tzinfo=UTC)
@@ -596,3 +600,41 @@ def test_the_range_reads_the_pipelines_clock_at_each_record() -> None:
     assert pipeline.process(_at("2026-10-01T00:00:00.000Z")).event is not None
     now[0] = datetime(2026, 10, 20, tzinfo=UTC)
     assert pipeline.process(_at("2026-10-01T00:00:00.000Z", 2)).out_of_range == REASON_TOO_OLD
+
+
+class _PersonDetector(RegexDetector):
+    """The regex detector plus a PERSON hit on ``Alice``, as Presidio would report one."""
+
+    def detect(self, text: str) -> list[PiiHit]:
+        hits = super().detect(text)
+        start = text.find("Alice")
+        if start >= 0:
+            hits.append(PiiHit("PERSON", start, start + 5, 0.85))
+        return sorted(hits)
+
+
+def test_the_runtime_guards_template_constants_with_the_detector(tmp_path: Path) -> None:
+    """ADR 0068: the template store the runtime builds asks the PII detector before a cluster's
+    words become constants, so a name three varying retries share stays a parameter and is
+    dropped like any other PII value, while an ordinary line mines its template."""
+    cfg = EdgeSettings(state_dir=tmp_path / "state", pii=PiiSettings(enabled=False))
+    runtime = build_runtime(
+        cfg, sources_file(), mode="analyze", init_local_keys=True, detector=_PersonDetector()
+    )
+    try:
+        assert runtime.templates.constant_filter is not None
+        for n in range(1, 4):
+            text = f"2026-09-23T04:00:0{n}Z INFO Refund approved for Alice Smith attempt {n}"
+            result = runtime.pipeline.process(raw_line(text, n))
+            assert result.event is not None
+            assert "Alice" not in result.event.model_dump_json()
+            assert result.event.template_text == " ".join(["<*>"] * 7)
+        for n in range(1, 4):
+            text = (
+                f"2026-09-23T05:00:0{n}Z INFO SFTP upload complete: SHIP_2026092{n}.csv ({n} bytes)"
+            )
+            result = runtime.pipeline.process(raw_line(text, 10 + n))
+            assert result.event is not None
+        assert result.event.template_text == "SFTP upload complete: <*> <*> bytes)"
+    finally:
+        runtime.close()
