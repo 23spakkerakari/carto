@@ -75,7 +75,7 @@ export function createHandlers(db: MockDb) {
     }
     if (request.method !== 'GET' && request.method !== 'HEAD') {
       if (request.headers.get('x-csrf-token') !== db.me.csrf_token) {
-        return problem(403, 'CSRF token missing or wrong');
+        return problem(403, 'forbidden', "send the session's CSRF token in x-csrf-token");
       }
     }
     return null;
@@ -159,7 +159,7 @@ export function createHandlers(db: MockDb) {
     http.post(`${BASE}/auth/logout`, ({ request }) => {
       if (db.options.loggedOut) return problem(401, 'Signed out');
       if (request.headers.get('x-csrf-token') !== db.me.csrf_token) {
-        return problem(403, 'CSRF token missing or wrong');
+        return problem(403, 'forbidden', "send the session's CSRF token in x-csrf-token");
       }
       db.options.loggedOut = true;
       return new HttpResponse(null, { status: 204 });

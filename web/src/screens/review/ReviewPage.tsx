@@ -8,6 +8,7 @@ import { LINK_STATUSES, type LinkStatus, type LinkView } from '../../api/types';
 import { hasPermission, LINK_STATUS_TAB } from '../../lib/words';
 import { Dialog } from '../../ui/Dialog';
 import { EmptyState, ErrorLine, LoadMore, Loading, PageHeader } from '../../ui/primitives';
+import { ListTruncated } from '../../ui/ListTruncated';
 import { DECIDABLE, LinkDetail } from './LinkDetail';
 import { Queue, type QueueAction } from './Queue';
 import { RejectForm, type RejectValues } from './RejectForm';
@@ -115,6 +116,7 @@ export function ReviewPage() {
           { label: 'Order', value: 'confidence × volume' },
         ]}
       />
+      <ListTruncated list="systems" />
       <Tabs.Root value={status} onValueChange={selectTab}>
         <Tabs.List aria-label="Link status" className="mb-4 flex gap-1 border-b border-hairline">
           {LINK_STATUSES.map((value) => (

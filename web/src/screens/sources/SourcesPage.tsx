@@ -13,6 +13,7 @@ import {
   stateOf,
   Untrusted,
 } from '../../ui/primitives';
+import { ListTruncated } from '../../ui/ListTruncated';
 
 /** Setup > Sources, read-only (ADR 0050): what is connected and how healthy it is. */
 export function SourcesPage() {
@@ -32,6 +33,8 @@ export function SourcesPage() {
           { label: 'Configured', value: 'on the edge (read-only here)' },
         ]}
       />
+      <ListTruncated list="sources" />
+      <ListTruncated list="systems" />
       {sources.isPending ? (
         <Loading what="Loading sources" />
       ) : sources.isError ? (

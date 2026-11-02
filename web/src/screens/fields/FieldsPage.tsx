@@ -13,6 +13,7 @@ import {
   PageHeader,
   Untrusted,
 } from '../../ui/primitives';
+import { ListTruncated } from '../../ui/ListTruncated';
 
 /** Setup > Field policies, read-only (ADR 0050): class, policy, pins, shapes, forms, quality.
  * Shapes, never values. */
@@ -56,6 +57,7 @@ export function FieldsPage() {
           </label>
         }
       />
+      <ListTruncated list="systems" />
       {fields.isPending ? (
         <Loading what="Loading fields" />
       ) : fields.isError ? (

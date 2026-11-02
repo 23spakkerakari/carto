@@ -15,6 +15,7 @@ import {
   stateOf,
   Untrusted,
 } from '../../ui/primitives';
+import { ListTruncated } from '../../ui/ListTruncated';
 
 /** A configuration value as text. Scalars print as they are; lists and objects as indented
  * JSON text. Nothing is interpreted: no links, no markup. */
@@ -66,6 +67,7 @@ export function SourceDetailPage() {
           { label: 'Updated', value: formatTime(s.updated_at), mono: true },
         ]}
       />
+      <ListTruncated list="systems" />
       <div className="grid gap-8 xl:grid-cols-2">
         <section aria-labelledby="src-health">
           <SectionTitle>

@@ -205,6 +205,19 @@ export function createClient(config: ClientConfig = {}) {
 
 export type ApiClient = ReturnType<typeof createClient>;
 
+/** True for the API's CSRF refusal (core `sessions.gate`): a 403 whose problem has the same
+ * `type` (`about:blank`) and `title` (`forbidden`) as the role refusal of `auth.require`, so the
+ * only field that tells them apart is `detail`, "send the session's CSRF token in x-csrf-token"
+ * against "this account may not <permission>". Matched on that detail text, case-insensitively,
+ * because the API sets no distinguishing field. */
+export function isCsrfRefusal(error: unknown): boolean {
+  return (
+    error instanceof ApiError &&
+    error.status === 403 &&
+    /\bcsrf token\b/i.test(error.problem.detail)
+  );
+}
+
 /** A short, plain line for an error, for the one-line error slots of the screens. */
 export function describeError(error: unknown): string {
   if (error instanceof ApiError) {
@@ -214,6 +227,7 @@ export function describeError(error: unknown): string {
         ? 'Too many requests. Try again shortly.'
         : `Too many requests. Try again in ${error.retryAfterSeconds} s.`;
     }
+    if (isCsrfRefusal(error)) return 'Your session changed. Reload the page and try again.';
     if (error.status === 403) return 'Your role does not allow this.';
     return error.problem.detail
       ? `${error.problem.title}: ${error.problem.detail}`

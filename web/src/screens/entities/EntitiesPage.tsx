@@ -15,6 +15,7 @@ import {
   PageHeader,
   Untrusted,
 } from '../../ui/primitives';
+import { ListTruncated } from '../../ui/ListTruncated';
 
 /** Entity families (spec 9.6): the name stays "Suggested" until a reviewer confirms it. */
 export function EntitiesPage() {
@@ -39,6 +40,7 @@ export function EntitiesPage() {
           },
         ]}
       />
+      <ListTruncated list="systems" />
       {entities.isPending ? (
         <Loading what="Loading entities" />
       ) : entities.isError ? (

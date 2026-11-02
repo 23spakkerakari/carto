@@ -14,6 +14,7 @@ import {
   stateOf,
   Untrusted,
 } from '../../ui/primitives';
+import { ListTruncated } from '../../ui/ListTruncated';
 
 export function SystemDetailPage() {
   const { id = '' } = useParams();
@@ -40,6 +41,7 @@ export function SystemDetailPage() {
           { label: 'Updated', value: formatTime(s.updated_at), mono: true },
         ]}
       />
+      <ListTruncated list="sources" />
       {s.description ? (
         <p className="max-w-3xl">
           <Untrusted text={s.description} />

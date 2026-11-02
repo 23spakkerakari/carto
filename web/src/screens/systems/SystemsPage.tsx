@@ -12,6 +12,7 @@ import {
   stateOf,
   Untrusted,
 } from '../../ui/primitives';
+import { ListTruncated } from '../../ui/ListTruncated';
 
 /** Systems as the edge reported them (ADR 0050), read-only in M2. */
 export function SystemsPage() {
@@ -38,6 +39,8 @@ export function SystemsPage() {
           { label: 'Reported by', value: 'the edge' },
         ]}
       />
+      <ListTruncated list="systems" />
+      <ListTruncated list="sources" />
       {systems.isPending ? (
         <Loading what="Loading systems" />
       ) : systems.isError ? (
