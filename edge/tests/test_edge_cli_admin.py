@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 import structlog
 
+import carto_common.crypto as crypto_module
 from carto_common.crypto import LocalKms, WrappedKey
 from carto_edge.audit import verify as verify_audit
 from carto_edge.cli.admin import NEW_SUFFIX, RETIRED_SUFFIX
@@ -168,7 +169,7 @@ def test_the_staged_master_is_written_whole_or_not_at_all(
     settings = EdgeSettings(state_dir=state)
     master = settings.local_kms_key_file
     staged = master.with_name(master.name + NEW_SUFFIX)
-    real = admin.write_private_file
+    real = crypto_module.write_private_file
     written: list[str] = []
 
     def recording(path: Path, data: bytes) -> None:
@@ -250,7 +251,7 @@ def test_an_interrupt_before_the_retired_copy_is_resumed(
     retired = master.with_name(master.name + RETIRED_SUFFIX)
     old_master = master.read_bytes()
     token = KeyManager(settings).load_keyring().active.token("id", "SO-0004471")
-    real = admin.write_private_file
+    real = crypto_module.write_private_file
 
     def failing(path: Path, data: bytes) -> None:
         if path.name.endswith(RETIRED_SUFFIX):

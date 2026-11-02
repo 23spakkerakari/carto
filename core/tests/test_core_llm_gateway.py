@@ -406,12 +406,16 @@ def test_parse_suggestions_blanks_an_unclean_rationale_and_keeps_the_label(case:
     assert dropped == 0
     assert [(s.label, s.rationale) for s in result.suggestions] == [("Order", "")]
     assert not rationale_is_clean(BLANKED_RATIONALES[case])
-    assert (
-        Suggestion(
-            target_id="f1", label_type="order", label="Order", confidence=0.5, rationale=42
-        ).rationale
-        == ""
+    blanked = Suggestion.model_validate(
+        {
+            "target_id": "f1",
+            "label_type": "order",
+            "label": "Order",
+            "confidence": 0.5,
+            "rationale": 42,
+        }
     )
+    assert blanked.rationale == ""
 
 
 def test_parse_suggestions_filters_targets_duplicates_and_cap() -> None:
