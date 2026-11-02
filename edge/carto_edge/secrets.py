@@ -23,6 +23,7 @@ credential pair is one secret value: a JSON object ``{"username": ..., "password
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import re
@@ -37,7 +38,14 @@ from typing import Final, Self
 
 import httpx
 
-from carto_common.crypto import AesGcmBox, CryptoError, KeyWrapper, WrappedKey, generate_key
+from carto_common.crypto import (
+    AesGcmBox,
+    CryptoError,
+    KeyWrapper,
+    WrappedKey,
+    _create_private,
+    generate_key,
+)
 from carto_common.settings import validate_secret_ref
 from carto_edge.config import EdgeSettings
 from carto_edge.net.http import build_ssl_context
@@ -65,6 +73,9 @@ VAULT_TIMEOUT_SECONDS: Final = 10.0
 DEFAULT_VAULT_FIELD: Final = "value"
 SECRET_NAME_RE: Final = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,255}$")
 SECRETS_DB_NAME: Final = "secrets.sqlite"
+_SQLITE_SIDE_FILES: Final = ("-wal", "-shm", "-journal")
+"""Files SQLite creates next to the database under the process umask; restricted after the
+first connection (ADR 0070 section 7)."""
 DATA_KEY_FILE_NAME: Final = "secrets-data-key.json"
 DATA_KEY_PURPOSE: Final = "secrets"
 
@@ -131,7 +142,13 @@ class LocalSecretStore:
     """``local://`` secrets: SQLite rows of AES-256-GCM ciphertext under a KMS-wrapped data key.
 
     One connection shared across threads behind a lock (ADR 0014), so the gateway's threadpool
-    and the poll scheduler's worker threads can resolve through the same store."""
+    and the poll scheduler's worker threads can resolve through the same store.
+
+    The database file is created exclusively with mode 0600 before SQLite opens it (an empty
+    file is an empty database to SQLite), and the ``-wal``, ``-shm`` and ``-journal`` files
+    SQLite creates under the process umask are restricted to the owner right after the first
+    connection, so no file of the store is readable by others at any instant (ADR 0070
+    section 7). The rows are ciphertext either way; the modes are defence in depth."""
 
     __slots__ = ("_box", "_db", "_lock", "_path")
 
@@ -139,23 +156,22 @@ class LocalSecretStore:
         self._path = path
         self._box = AesGcmBox(data_key)
         self._lock = threading.Lock()
-        existed = path.exists()
         path.parent.mkdir(parents=True, exist_ok=True)
         try:
+            if not path.exists():
+                # A FileExistsError means another process got there first; its file is 0600 too.
+                with contextlib.suppress(FileExistsError):
+                    _create_private(path, b"")
             self._db = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
             self._db.execute("PRAGMA journal_mode=WAL")
             self._db.execute(
                 "CREATE TABLE IF NOT EXISTS secrets ("
                 "name TEXT PRIMARY KEY, blob BLOB NOT NULL, updated_at TEXT NOT NULL)"
             )
-        except sqlite3.Error as exc:
+        except (sqlite3.Error, OSError) as exc:
             msg = f"cannot open the local secret store at {path}"
             raise SecretError(msg) from exc
-        if not existed:
-            try:
-                path.chmod(0o600)
-            except OSError:  # pragma: no cover - platform dependent
-                logger.warning("could not restrict permissions of %s", path)
+        _restrict_store_files(path)
 
     def __repr__(self) -> str:
         return f"LocalSecretStore(path={str(self._path)!r})"
@@ -229,6 +245,17 @@ class LocalSecretStore:
 
     def __exit__(self, *exc: object) -> None:
         self.close()
+
+
+def _restrict_store_files(path: Path) -> None:
+    """Owner-only mode on the database and every SQLite side file that exists."""
+    for candidate in (path, *(path.with_name(path.name + s) for s in _SQLITE_SIDE_FILES)):
+        if not candidate.exists():
+            continue
+        try:
+            candidate.chmod(0o600)
+        except OSError:  # pragma: no cover - platform dependent
+            logger.warning("could not restrict permissions of %s", candidate)
 
 
 # ---------------------------------------------------------------------------------------------

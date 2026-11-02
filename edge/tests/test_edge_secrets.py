@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import sqlite3
+import stat
 import threading
 from pathlib import Path
 
@@ -106,6 +107,39 @@ def test_local_store_round_trip(settings: EdgeSettings, kms: LocalKms) -> None:
         assert store.delete("db") is False
     finally:
         store.close()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+def test_local_store_files_are_owner_only_from_creation(
+    settings: EdgeSettings, kms: LocalKms
+) -> None:
+    """ADR 0070 section 7: the database file is created exclusively with mode 0600 before SQLite
+    opens it, and the WAL side files SQLite creates under the umask are restricted right after
+    the first connection, so no file of the store is ever readable by others."""
+    previous = os.umask(0)
+    try:
+        store = LocalSecretStore.open(settings, kms)
+        try:
+            store.put("api", "value")
+            database = settings.state_dir / "secrets.sqlite"
+            for suffix in ("", "-wal", "-shm"):
+                path = database.with_name(database.name + suffix)
+                assert path.exists(), suffix
+                assert stat.S_IMODE(path.stat().st_mode) == 0o600, path.name
+        finally:
+            store.close()
+        # Reopening an existing store keeps its mode and restricts fresh side files again.
+        again = LocalSecretStore.open(settings, kms)
+        try:
+            assert again.get("api") == "value"
+            for suffix in ("", "-wal", "-shm"):
+                path = database.with_name(database.name + suffix)
+                if path.exists():
+                    assert stat.S_IMODE(path.stat().st_mode) == 0o600, path.name
+        finally:
+            again.close()
+    finally:
+        os.umask(previous)
 
 
 def test_local_store_values_are_not_in_clear_on_disk(settings: EdgeSettings, kms: LocalKms) -> None:

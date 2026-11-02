@@ -30,6 +30,8 @@ import hmac
 import json
 import os
 import secrets
+import ssl
+import stat
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -65,6 +67,7 @@ __all__ = [
     "b64url_decode",
     "b64url_encode",
     "canonical_context",
+    "create_public",
     "fsync_directory",
     "generate_key",
     "key_fingerprint",
@@ -102,6 +105,8 @@ depend on carto-schema."""
 KmsProvider = Literal["local", "vault"]
 
 PRIVATE_FILE_MODE: Final = 0o600
+PUBLIC_FILE_MODE: Final = 0o644
+"""Certificates and other public artefacts: world-readable, owner-writable."""
 _O_BINARY: Final = getattr(os, "O_BINARY", 0)
 """Windows opens descriptors in text mode unless told otherwise; key bytes must not be
 translated."""
@@ -318,6 +323,18 @@ def _create_private(path: Path, data: bytes) -> None:
         os.fsync(handle.fileno())
 
 
+def create_public(path: Path, data: bytes) -> None:
+    """Create ``path`` (it must not exist, not even as a symlink) with mode 0644, write and
+    fsync. ``O_EXCL`` means a planted symlink or file at the path is refused
+    (:class:`FileExistsError`) rather than followed or overwritten; the caller fsyncs the
+    directory."""
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_BINARY, PUBLIC_FILE_MODE)
+    with os.fdopen(descriptor, "wb") as handle:
+        handle.write(data)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
 def write_private_file(path: Path, data: bytes) -> None:
     """Replace ``path`` with ``data`` atomically and durably, owner-only (0600) from creation:
     a temporary file is created exclusively with mode 0600, written and fsynced, renamed over
@@ -451,6 +468,22 @@ class LocalKms:
 
     @classmethod
     def open(cls, path: Path) -> Self:
+        """Open a master key file. On POSIX a file that group or others can read is refused
+        (the message names the path and its mode): a readable master key is every wrapped key
+        in clear (spec 2.3 invariant 9). Windows has no mode bits; the ACL of the state
+        directory is the install's job there."""
+        if os.name != "nt":
+            try:
+                mode = stat.S_IMODE(path.stat().st_mode)
+            except OSError as exc:
+                msg = f"cannot read local KMS key file {path}"
+                raise CryptoError(msg) from exc
+            if mode & 0o077:
+                msg = (
+                    f"refusing local KMS key file {path}: mode {mode:04o} lets group or others "
+                    "read it; make it owner-only (chmod 600) and check who could have read it"
+                )
+                raise CryptoError(msg)
         try:
             material = path.read_bytes()
         except OSError as exc:
@@ -492,6 +525,12 @@ class VaultTransitKms:
     enforces it). The Vault token is read by the caller from the configured token file, never
     from the environment or a config value (spec 8.4). Vault is the customer's secret store,
     not a source system, so these POSTs are outside the read-only rule of spec 8.1.
+
+    The HTTP client it builds ignores the process environment (``trust_env=False``: no
+    ``HTTPS_PROXY``, no ``SSL_CERT_FILE``), verifies the server with the system trust store or
+    the ``ca_file`` given, TLS 1.2 at least, and never follows a redirect, so neither the token
+    nor the key material can be steered to another host (ADR 0070 section 7). A caller-supplied
+    ``client`` (tests) is still asked not to follow redirects on every request.
     """
 
     ALGORITHM: Final = "vault-transit"
@@ -507,6 +546,7 @@ class VaultTransitKms:
         client: httpx.Client | None = None,
         timeout_seconds: float = 10.0,
         mount: str = "transit",
+        ca_file: Path | None = None,
     ) -> None:
         if not base_url.startswith(("https://", "http://127.0.0.1")):
             msg = "Vault URL must use https (plain http is allowed for 127.0.0.1 only)"
@@ -518,7 +558,16 @@ class VaultTransitKms:
         self._key_name = key_name
         self._mount = mount.strip("/")
         self._headers = {"X-Vault-Token": token_value, "X-Vault-Request": "true"}
-        self._client = client if client is not None else httpx.Client(timeout=timeout_seconds)
+        self._client = (
+            client
+            if client is not None
+            else httpx.Client(
+                timeout=timeout_seconds,
+                trust_env=False,
+                follow_redirects=False,
+                verify=_vault_ssl_context(ca_file),
+            )
+        )
         self._key_id = f"vault:{self._mount}/{key_name}"
 
     def __repr__(self) -> str:
@@ -535,7 +584,9 @@ class VaultTransitKms:
     def _post(self, operation: str, payload: Mapping[str, str]) -> dict[str, object]:
         url = f"{self._base_url}/v1/{self._mount}/{operation}/{self._key_name}"
         try:
-            response = self._client.post(url, json=dict(payload), headers=self._headers)
+            response = self._client.post(
+                url, json=dict(payload), headers=self._headers, follow_redirects=False
+            )
         except httpx.HTTPError as exc:
             msg = f"Vault Transit {operation} request failed: {type(exc).__name__}"
             raise CryptoError(msg) from exc
@@ -599,6 +650,23 @@ class VaultTransitKms:
         return _check_unwrapped(
             wrapped, self.provider, self._key_id, _require_key(material, "unwrapped key")
         )
+
+
+def _vault_ssl_context(ca_file: Path | None) -> ssl.SSLContext:
+    """Server verification for Vault: the system trust store or ``ca_file`` alone (never the
+    environment's ``SSL_CERT_FILE``), TLS 1.2 minimum (spec 14.4)."""
+    if ca_file is not None and not ca_file.is_file():
+        msg = f"Vault ca_file {ca_file} is not a readable file"
+        raise CryptoError(msg)
+    try:
+        context = ssl.create_default_context(
+            purpose=ssl.Purpose.SERVER_AUTH, cafile=str(ca_file) if ca_file is not None else None
+        )
+    except (OSError, ssl.SSLError) as exc:
+        msg = f"Vault ca_file {ca_file} cannot be loaded"
+        raise CryptoError(msg) from exc
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    return context
 
 
 # ---------------------------------------------------------------------------------------------

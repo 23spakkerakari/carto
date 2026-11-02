@@ -22,10 +22,13 @@ The CA keys and certificates go to ``--ca-key-dir`` (default ``--out``) as ``<li
 and ``<listener>-ca.crt``; keeping them where no running service mounts means a compromised
 service cannot mint certificates (spec 14.4, 15). Server certificates carry SANs for the service
 name, ``localhost`` and any ``--dns``/``--ip`` given. Keys are written with owner-only permissions
-and never overwritten: a directory holding any key this run would write is refused before
-anything is touched. With ``--if-missing`` a complete earlier run (every file this run would write
-is present) is a success that writes nothing, which is what a Compose one-shot job needs on its
-second start; a partial one is still refused. The output lists certificate fingerprints only.
+and never overwritten; certificates are created exclusively too (a planted file or symlink is
+refused, not followed): a directory holding any file this run would write is refused before
+anything is touched. Leaf lifetimes stop at :data:`MAX_LEAF_DAYS` (398 days, the public-CA
+ceiling; spec 14.4 wants 90); the CAs keep ten years. With ``--if-missing`` a complete earlier
+run (every file this run would write is present) is a success that writes nothing, which is what
+a Compose one-shot job needs on its second start; a partial one is still refused. The output
+lists certificate fingerprints only.
 Kubernetes installs use cert-manager with one issuer per listener instead (M6).
 
 ``carto-ctl pki issue`` signs one client certificate from a listener's CA for a host outside the
@@ -42,6 +45,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
+from carto_common.crypto import create_public, fsync_directory
 from carto_common.mtls import ROLES
 from carto_common.pki import (
     LEAF_VALID_DAYS,
@@ -65,7 +69,7 @@ __all__ = [
     "DEFAULT_OUT",
     "DEFAULT_SERVICES",
     "LISTENER_CLIENTS",
-    "MAX_DAYS",
+    "MAX_LEAF_DAYS",
     "IssuedFile",
     "PkiInitResult",
     "PkiIssueResult",
@@ -86,7 +90,10 @@ DEFAULT_SERVICES: Final[tuple[str, ...]] = (
     "web",
 )
 DEFAULT_OUT: Final = Path("pki")
-MAX_DAYS: Final = 3650
+MAX_LEAF_DAYS: Final = 398
+"""The longest a service or collector certificate may live: the public-CA ceiling for a leaf
+(spec 14.4 wants 90 and that stays the default). CAs are not issued from the command line and
+keep :data:`carto_common.pki.CA_VALID_DAYS`."""
 LISTENER_CLIENTS: Final[dict[str, tuple[str, ...]]] = {
     "ingest-api": ("edge-gateway",),
     "edge-gateway": ("otel-collector", "collector", "proxy", "api"),
@@ -152,8 +159,8 @@ def _days(text: str) -> int:
     except ValueError:
         msg = "must be a whole number of days"
         raise argparse.ArgumentTypeError(msg) from None
-    if not 1 <= value <= MAX_DAYS:
-        msg = f"must be between 1 and {MAX_DAYS}"
+    if not 1 <= value <= MAX_LEAF_DAYS:
+        msg = f"must be between 1 and {MAX_LEAF_DAYS}"
         raise argparse.ArgumentTypeError(msg)
     return value
 
@@ -269,6 +276,20 @@ def pki_complete(out: Path, services: tuple[str, ...], ca_key_dir: Path | None =
     return all(path.is_file() for path in files)
 
 
+def _occupied(path: Path) -> bool:
+    return path.is_symlink() or path.exists()
+
+
+def _write_certificate(path: Path, pem: bytes) -> None:
+    """A CA certificate copy for a service: created exclusively, mode 0644, directory fsynced."""
+    try:
+        create_public(path, pem)
+    except FileExistsError as exc:
+        msg = f"refusing to overwrite existing certificate {path}"
+        raise PkiError(msg) from exc
+    fsync_directory(path.parent)
+
+
 def _record(
     issued: list[IssuedFile], out: Path, path: Path, pair: CertificatePair, role: str | None
 ) -> None:
@@ -291,13 +312,18 @@ def initialize_pki(
     ca_key_dir: Path | None = None,
     now: dt.datetime | None = None,
 ) -> PkiInitResult:
-    """Create a CA per listener and every service's certificates; refuse to overwrite any key."""
+    """Create a CA per listener and every service's certificates; refuse to overwrite any file
+    the run would write, keys first in the message, before anything is touched."""
     plan = _plan(services)
     key_dir = ca_key_dir if ca_key_dir is not None else out
-    _files, keys = _planned(out, key_dir, plan)
-    existing = [str(path) for path in keys if path.exists()]
+    files, keys = _planned(out, key_dir, plan)
+    existing_keys = [str(path) for path in keys if _occupied(path)]
+    if existing_keys:
+        msg = f"refusing to overwrite existing private key(s): {', '.join(existing_keys)}"
+        raise PkiError(msg)
+    existing = [str(path) for path in files if path not in keys and _occupied(path)]
     if existing:
-        msg = f"refusing to overwrite existing private key(s): {', '.join(existing)}"
+        msg = f"refusing to overwrite existing certificate(s): {', '.join(existing)}"
         raise PkiError(msg)
     key_dir.mkdir(parents=True, exist_ok=True)
     authorities: dict[str, CertificatePair] = {}
@@ -323,7 +349,7 @@ def initialize_pki(
         )
         folder = out / listener
         write_pem(server, folder / "listener.crt", folder / "listener.key")
-        (folder / "listener-ca.crt").write_bytes(ca.certificate_pem)
+        _write_certificate(folder / "listener-ca.crt", ca.certificate_pem)
         _record(issued, out, folder / "listener.crt", server, listener)
     for service, targets in plan.calls.items():
         folder = out / service
@@ -334,7 +360,7 @@ def initialize_pki(
                 ca, service, server=False, role=role, valid_days=days, now=now
             )
             write_pem(client, folder / f"to-{target}.crt", folder / f"to-{target}.key")
-            (folder / f"to-{target}-ca.crt").write_bytes(ca.certificate_pem)
+            _write_certificate(folder / f"to-{target}-ca.crt", ca.certificate_pem)
             _record(issued, out, folder / f"to-{target}.crt", client, role)
     return PkiInitResult(
         out=out,
@@ -468,13 +494,19 @@ def issue_client(
         raise PkiError(msg)
     certificate_path = out / f"to-{listener}.crt"
     key_path = out / f"to-{listener}.key"
-    if key_path.exists():
+    ca_path = out / f"to-{listener}-ca.crt"
+    if _occupied(key_path):
         msg = f"refusing to overwrite existing private key {key_path}"
+        raise PkiError(msg)
+    occupied = [str(path) for path in (certificate_path, ca_path) if _occupied(path)]
+    if occupied:
+        msg = f"refusing to overwrite existing certificate(s): {', '.join(occupied)}"
         raise PkiError(msg)
     authority = _load_authority(ca_key_dir, listener)
     client = issue_certificate(authority, name, server=False, role=role, valid_days=days, now=now)
+    out.mkdir(parents=True, exist_ok=True)
     write_pem(client, certificate_path, key_path)
-    (out / f"to-{listener}-ca.crt").write_bytes(authority.certificate_pem)
+    _write_certificate(ca_path, authority.certificate_pem)
     return PkiIssueResult(
         certificate=certificate_path,
         fingerprint=certificate_fingerprint(client.certificate),

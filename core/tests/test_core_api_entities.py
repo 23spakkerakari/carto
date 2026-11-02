@@ -139,7 +139,10 @@ def test_a_failing_audit_append_rolls_the_patch_back() -> None:
 
 
 def test_description_only_patch_leaves_the_name_unconfirmed() -> None:
-    client, _ports, context = _world()
+    """Spec 2.3 invariant 5 (ADR 0070 section 6): the LLM's suggestion is confirmed only by a
+    PATCH that carries a name; one that carries a description alone leaves it a suggestion,
+    in the response, in the store and in the audit row."""
+    client, ports, context = _world()
     headers = _login(client, context, Role.ADMIN)
     response = client.patch(
         f"{ENTITIES}/ent_01",
@@ -147,8 +150,24 @@ def test_description_only_patch_leaves_the_name_unconfirmed() -> None:
         headers={**headers, "If-Match": 'W/"1"'},
     )
     assert response.status_code == 200
-    assert response.json()["name_confirmed"] is False
-    assert response.json()["description"].startswith("One purchase")
+    body = response.json()
+    assert body["name_confirmed"] is False
+    assert body["name"] == "Order" and body["suggested_name"] == "Order"
+    assert body["description"].startswith("One purchase")
+    stored = ports.entities.get("default", "ent_01")
+    assert stored is not None and stored.name_confirmed is False
+    [entry] = _audit(ports).entries()
+    assert entry.action == "entity.patch"
+    assert entry.after is not None and entry.after["name_confirmed"] is False
+    assert entry.before is not None and entry.before["name_confirmed"] is False
+    # A later PATCH that names it confirms it.
+    confirmed = client.patch(
+        f"{ENTITIES}/ent_01",
+        json={"name": "Customer order"},
+        headers={**headers, "If-Match": 'W/"2"'},
+    )
+    assert confirmed.status_code == 200 and confirmed.json()["name_confirmed"] is True
+    assert confirmed.json()["description"].startswith("One purchase")
 
 
 def test_patch_needs_review_links_and_a_valid_body() -> None:

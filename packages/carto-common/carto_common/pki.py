@@ -21,7 +21,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
-from carto_common.crypto import _create_private
+from carto_common.crypto import _create_private, create_public, fsync_directory
 from carto_common.mtls import role_uri
 
 __all__ = [
@@ -185,21 +185,46 @@ def issue_certificate(
     return CertificatePair(certificate.public_bytes(serialization.Encoding.PEM), _key_pem(key))
 
 
+def _occupied(path: Path) -> bool:
+    """Something is at ``path``: a file, a directory or a symlink (dangling ones included)."""
+    return path.is_symlink() or path.exists()
+
+
 def write_pem(pair: CertificatePair, certificate_path: Path, key_path: Path) -> None:
-    """Write both files. The key file is created exclusively with owner-only permissions from
-    its first instant (``crypto._create_private``: ``O_EXCL`` and mode 0600 on the ``open``
-    itself, so no umask or chmod window ever leaves it readable) and is never overwritten."""
+    """Write both files, neither over anything. The key file is created exclusively with
+    owner-only permissions from its first instant (``crypto._create_private``: ``O_EXCL`` and
+    mode 0600 on the ``open`` itself, so no umask or chmod window ever leaves it readable); the
+    certificate the same way with mode 0644 (``crypto.create_public``), so a symlink planted at
+    either path is refused, not followed (ADR 0070 section 7). The key is written first and the
+    certificate second; when the certificate cannot be written the key just created is
+    withdrawn, so no new certificate is ever left beside an old key and no new key beside
+    nothing. The directory is fsynced after both."""
     certificate_path.parent.mkdir(parents=True, exist_ok=True)
     key_path.parent.mkdir(parents=True, exist_ok=True)
-    if key_path.exists():
+    if _occupied(key_path):
         msg = f"refusing to overwrite existing private key {key_path}"
         raise PkiError(msg)
-    certificate_path.write_bytes(pair.certificate_pem)
+    if _occupied(certificate_path):
+        msg = f"refusing to overwrite existing certificate {certificate_path}"
+        raise PkiError(msg)
     try:
         _create_private(key_path, pair.private_key_pem)
     except FileExistsError as exc:  # created between the check and the open
         msg = f"refusing to overwrite existing private key {key_path}"
         raise PkiError(msg) from exc
+    try:
+        create_public(certificate_path, pair.certificate_pem)
+    except FileExistsError as exc:
+        key_path.unlink(missing_ok=True)
+        msg = f"refusing to overwrite existing certificate {certificate_path}"
+        raise PkiError(msg) from exc
+    except OSError as exc:
+        key_path.unlink(missing_ok=True)
+        msg = f"cannot write certificate {certificate_path}: {type(exc).__name__}"
+        raise PkiError(msg) from exc
+    fsync_directory(key_path.parent)
+    if certificate_path.parent != key_path.parent:
+        fsync_directory(certificate_path.parent)
 
 
 def load_certificate(path: Path) -> x509.Certificate:

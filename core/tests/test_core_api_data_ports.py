@@ -692,6 +692,53 @@ def test_a_family_built_from_accepted_links_is_listed_and_renamed() -> None:
     assert w.client.get(f"{API_PREFIX}/entities").json()["items"][0]["name"] == "Customer order"
 
 
+def test_a_description_only_patch_leaves_the_suggestion_unconfirmed() -> None:
+    """Spec 2.3 invariant 5 (ADR 0070 section 6) on the repository path: the adapter passes a
+    missing name through as ``None`` and the repository then changes the description alone,
+    so the LLM's ``suggested_name`` is not confirmed under the reviewer's identity. The audit
+    row carries ``name_confirmed: false`` after the change."""
+    w = world()
+    for link_id in (EXACT_ID, BRIDGE_ID):
+        w.review.accept(TENANT, link_id, actor="alice", expected_version=1)
+    built = w.clock.tick(minutes=5)
+    FamilyBuilder(w.links, w.entities, namer=lambda _members: "Order").rebuild(TENANT, now=built)
+    headers = w.login(Role.INTEGRATION_ENGINEER)
+    entity = w.client.get(f"{API_PREFIX}/entities").json()["items"][0]
+    assert entity["name_confirmed"] is False and entity["suggested_name"] == "Order"
+
+    w.clock.tick(minutes=1)
+    described = w.client.patch(
+        f"{API_PREFIX}/entities/{entity['id']}",
+        json={"description": "Web orders"},
+        headers={**headers, "If-Match": entity["etag"]},
+    )
+    assert described.status_code == 200, described.text
+    body = described.json()
+    assert body["name"] == "Order" and body["suggested_name"] == "Order"
+    assert body["name_confirmed"] is False and body["description"] == "Web orders"
+    stored = w.entities.get(TENANT, entity["id"])
+    assert stored is not None
+    assert stored.name is None and stored.name_confirmed is False
+    assert stored.suggested_name == "Order" and stored.description == "Web orders"
+    entry = w.audit.entries(TENANT)[-1]
+    assert (entry.action, entry.target) == ("entity.patch", f"entity:{entity['id']}")
+    assert entry.after is not None and entry.after["name_confirmed"] is False
+    assert entry.after["name"] == "Order"
+
+    # The same PATCH with a name confirms it and keeps the description.
+    w.clock.tick(minutes=1)
+    named = w.client.patch(
+        f"{API_PREFIX}/entities/{entity['id']}",
+        json={"name": "Customer order"},
+        headers={**headers, "If-Match": body["etag"]},
+    )
+    assert named.status_code == 200, named.text
+    assert named.json()["name_confirmed"] is True
+    confirmed = w.entities.get(TENANT, entity["id"])
+    assert confirmed is not None and confirmed.name == "Customer order"
+    assert confirmed.name_confirmed and confirmed.description == "Web orders"
+
+
 def test_readiness_asks_every_data_port() -> None:
     w = world()
     assert w.client.get("/readyz").status_code == 200

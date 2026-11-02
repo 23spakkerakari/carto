@@ -113,8 +113,8 @@ def test_private_key_is_owner_only_from_creation(tmp_path: Path) -> None:
     ca = create_ca()
     write_pem(ca, tmp_path / "ca.crt", tmp_path / "ca.key")
     assert stat.S_IMODE((tmp_path / "ca.key").stat().st_mode) == 0o600
-    # The certificate is public and keeps the ordinary mode.
-    assert stat.S_IMODE((tmp_path / "ca.crt").stat().st_mode) & 0o044
+    # The certificate is public: created exclusively with mode 0644, whatever the umask.
+    assert stat.S_IMODE((tmp_path / "ca.crt").stat().st_mode) == 0o644
 
 
 def test_an_existing_key_is_never_overwritten(tmp_path: Path) -> None:
@@ -125,6 +125,62 @@ def test_an_existing_key_is_never_overwritten(tmp_path: Path) -> None:
         write_pem(create_ca(), certificate_path, key_path)
     assert key_path.read_bytes() == b"operator key"
     assert not certificate_path.exists()
+
+
+def _plant_symlink(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target)
+    except (OSError, NotImplementedError):  # no symlink privilege (Windows without developer mode)
+        pytest.skip("symlinks are not available here")
+
+
+def test_a_planted_symlink_at_the_certificate_path_is_refused(tmp_path: Path) -> None:
+    """ADR 0070 section 7: the certificate is created exclusively like the key, so a symlink
+    planted at its path is neither followed nor replaced, and no key is left behind."""
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.write_bytes(b"operator file")
+    certificate_path = tmp_path / "ca.crt"
+    _plant_symlink(certificate_path, elsewhere)
+    key_path = tmp_path / "ca.key"
+    with pytest.raises(PkiError, match="refusing to overwrite"):
+        write_pem(create_ca(), certificate_path, key_path)
+    assert elsewhere.read_bytes() == b"operator file"
+    assert certificate_path.is_symlink()
+    assert not key_path.exists(), "a key written before the refused certificate is withdrawn"
+
+
+def test_an_existing_certificate_is_never_overwritten_and_no_key_is_left(tmp_path: Path) -> None:
+    certificate_path = tmp_path / "ca.crt"
+    certificate_path.write_bytes(b"operator certificate")
+    key_path = tmp_path / "ca.key"
+    with pytest.raises(PkiError, match="refusing to overwrite"):
+        write_pem(create_ca(), certificate_path, key_path)
+    assert certificate_path.read_bytes() == b"operator certificate"
+    assert not key_path.exists()
+
+
+def test_the_key_is_written_before_the_certificate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failure while the certificate is written leaves no half pair: the key written first
+    is withdrawn and the error names the certificate."""
+    import carto_common.pki as pki_module  # noqa: PLC0415
+
+    created: list[str] = []
+    real_public = pki_module.create_public
+
+    def failing_public(path: Path, data: bytes) -> None:
+        created.append(path.name)
+        msg = "disk gone"
+        raise OSError(msg)
+
+    monkeypatch.setattr(pki_module, "create_public", failing_public)
+    with pytest.raises(PkiError, match=r"ca\.crt"):
+        write_pem(create_ca(), tmp_path / "ca.crt", tmp_path / "ca.key")
+    assert created == ["ca.crt"]
+    assert not (tmp_path / "ca.key").exists() and not (tmp_path / "ca.crt").exists()
+    monkeypatch.setattr(pki_module, "create_public", real_public)
+    write_pem(create_ca(), tmp_path / "ca.crt", tmp_path / "ca.key")  # the path is free again
 
 
 def test_fingerprint_format() -> None:

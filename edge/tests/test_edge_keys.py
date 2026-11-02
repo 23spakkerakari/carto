@@ -23,6 +23,7 @@ from carto_common.crypto import (
     VaultTransitKms,
     WrappedKey,
     canonical_context,
+    generate_key,
     token,
 )
 from carto_common.settings import RetentionSettings
@@ -345,6 +346,23 @@ def test_build_kms_local(settings: EdgeSettings) -> None:
     assert kms.key_id == created.key_id
 
 
+def test_build_kms_vault_caps_the_token_file_size(tmp_path: Path) -> None:
+    """The same 4096-byte cap as ``carto-ctl key init`` (ADR 0070 section 7)."""
+    token_file = tmp_path / "vault.token"
+    settings = EdgeSettings(
+        state_dir=tmp_path / "state",
+        kms=KmsSettings(
+            provider="vault", vault_url="https://vault.internal:8200", vault_token_file=token_file
+        ),
+    )
+    token_file.write_bytes(b"h" * 4097)
+    with pytest.raises(KeyManagementError, match="larger than 4096") as info:
+        build_kms(settings)
+    assert "hhhh" not in str(info.value)
+    token_file.write_bytes(b"h" * 4096)
+    assert isinstance(build_kms(settings), VaultTransitKms)
+
+
 def test_build_kms_vault_reads_the_token_from_a_file(tmp_path: Path) -> None:
     token_file = tmp_path / "vault.token"
     settings = EdgeSettings(
@@ -494,6 +512,88 @@ def test_rewrap_failure_leaves_the_old_files_untouched(tmp_path: Path) -> None:
     assert {path.name: path.read_bytes() for path in manager.wrapped_key_files()} == originals
     assert not list(settings.keys_dir.glob("*.rewrap"))
     assert manager.load_keyring().active.version == 1
+
+
+def _cut_power_at_staging_replace(monkeypatch: pytest.MonkeyPatch, ordinal: int) -> list[str]:
+    """Fail the ``ordinal``-th replace of a ``.rewrap`` staging file over its key file (phase
+    two of a rewrap); the atomic writes of the staging files themselves are left alone."""
+    real_replace = Path.replace
+    replaced: list[str] = []
+
+    def replace(self: Path, target: str | os.PathLike[str]) -> Path:
+        if self.name.endswith(".rewrap"):
+            replaced.append(Path(target).name)
+            if len(replaced) == ordinal:
+                msg = f"disk gone while installing {Path(target).name}"
+                raise OSError(msg)
+        return real_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", replace)
+    return replaced
+
+
+def test_an_interrupted_rewrap_is_resumed_by_the_next_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ADR 0070 section 7: a crash in phase two leaves some files under the new KMS key and
+    some under the old one; the next ``rewrap`` with the same new KMS verifies the former,
+    rewraps the latter and finishes. Nothing tells the operator to delete anything."""
+    settings = EdgeSettings(state_dir=tmp_path / "state")
+    manager = KeyManager(settings)
+    manager.init(create_local_kms=True)
+    manager.vault_data_key()
+    manager.rotate(overlap_days=30)
+    token = manager.load_keyring().active.token("id", "SO-0004471")
+    vault_key = manager.vault_data_key()
+    files = manager.wrapped_key_files()
+    assert len(files) == 3
+    old_kms = manager.kms
+    new_kms = LocalKms.create(tmp_path / "new-master.key")
+
+    replaced = _cut_power_at_staging_replace(monkeypatch, 2)
+    with pytest.raises(KeyManagementError, match="re-run `carto-edge key rewrap`") as info:
+        manager.rewrap(new_kms)
+    assert "remove" not in str(info.value) and "delete" not in str(info.value)
+    assert replaced[1] in str(info.value), "the message names the file that failed"
+    monkeypatch.undo()
+    assert not list(settings.keys_dir.glob("*.rewrap")), "no staging file is left behind"
+    key_ids = {path.name: WrappedKey.read(path).key_id for path in files}
+    assert key_ids[replaced[0]] == new_kms.key_id
+    assert all(key_ids[name] == old_kms.key_id for name in key_ids if name != replaced[0])
+
+    # The next run, from a fresh process that still opens the old master, resumes.
+    resumed = KeyManager(settings)
+    rewritten = resumed.rewrap(new_kms)
+    assert [path.name for path in rewritten] == [
+        path.name for path in files if path.name != replaced[0]
+    ]
+    assert not list(settings.keys_dir.glob("*.rewrap"))
+    for path in files:
+        assert WrappedKey.read(path).key_id == new_kms.key_id
+        new_kms.unwrap(WrappedKey.read(path))
+    after = KeyManager(settings, new_kms)
+    assert after.load_keyring().active.token("id", "SO-0004471") == token
+    assert after.vault_data_key() == vault_key
+
+
+def test_a_completed_rewrap_run_again_rewraps_nothing_and_a_foreign_file_is_refused(
+    tmp_path: Path,
+) -> None:
+    settings = EdgeSettings(state_dir=tmp_path / "state")
+    manager = KeyManager(settings)
+    manager.init(create_local_kms=True)
+    new_kms = LocalKms.create(tmp_path / "new-master.key")
+    assert len(manager.rewrap(new_kms)) == 2
+    # Every file is under the new key already: a resume verifies and rewrites nothing.
+    assert KeyManager(settings).rewrap(new_kms) == []
+    # A file under neither key is named and nothing is replaced (fail closed).
+    stranger = LocalKms.create(tmp_path / "stranger.key")
+    foreign = settings.keys_dir / "vault-data-key.json"
+    stranger.wrap(generate_key(), {"purpose": "reveal-vault"}).write(foreign)
+    before = {path.name: path.read_bytes() for path in manager.wrapped_key_files()}
+    with pytest.raises(KeyManagementError, match=r"vault-data-key\.json"):
+        KeyManager(settings).rewrap(new_kms)
+    assert {path.name: path.read_bytes() for path in manager.wrapped_key_files()} == before
 
 
 # ---------------------------------------------------------------------------------------------

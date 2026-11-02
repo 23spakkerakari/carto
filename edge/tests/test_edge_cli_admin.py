@@ -13,8 +13,9 @@ from pathlib import Path
 import pytest
 import structlog
 
+from carto_common.crypto import LocalKms, WrappedKey
 from carto_edge.audit import verify as verify_audit
-from carto_edge.cli.admin import RETIRED_SUFFIX
+from carto_edge.cli.admin import NEW_SUFFIX, RETIRED_SUFFIX
 from carto_edge.cli.main import EXIT_FAILURE, EXIT_OK, EXIT_USAGE, main
 from carto_edge.config import EdgeSettings
 from carto_edge.keys import KeyManager
@@ -75,8 +76,11 @@ def test_key_rotate_and_rewrap_keep_tokens_and_are_audited(
     assert retired.read_bytes() == old_master
     again = KeyManager(settings).load_keyring()
     assert again.previous[0].token("id", "SO-0004471") == before
-    # A second rewrap refuses while the retired master is still there.
+    # A second rewrap refuses while the retired master is still there, and never tells the
+    # operator to remove a file (ADR 0070 section 7).
     assert run("key", "rewrap", "--state-dir", str(state)) == EXIT_FAILURE
+    err = capsys.readouterr().err
+    assert RETIRED_SUFFIX in err and "remove" not in err
 
     audit = verify_audit(settings.audit_file)
     assert audit.ok and audit.rows == 6
@@ -90,12 +94,90 @@ def test_key_rotate_and_rewrap_keep_tokens_and_are_audited(
     ]
 
 
+def _fail_second_staging_replace(monkeypatch: pytest.MonkeyPatch) -> None:
+    real_replace = Path.replace
+    seen = 0
+
+    def replace(self: Path, target: str | os.PathLike[str]) -> Path:
+        nonlocal seen
+        if self.name.endswith(".rewrap"):
+            seen += 1
+            if seen == 2:
+                msg = "disk gone"
+                raise OSError(msg)
+        return real_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", replace)
+
+
+def test_an_interrupted_local_rewrap_is_resumed_by_the_next_run(
+    state: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """ADR 0070 section 7: a crash after the first file is rewrapped leaves ``local-kms.key.new``
+    beside files under both masters; the next ``key rewrap`` resumes and finishes, and no
+    message ever says to remove the staged master (the only key for those files)."""
+    settings = EdgeSettings(state_dir=state)
+    KeyManager(settings).vault_data_key()
+    master = settings.local_kms_key_file
+    staged = master.with_name(master.name + NEW_SUFFIX)
+    retired = master.with_name(master.name + RETIRED_SUFFIX)
+    old_master = master.read_bytes()
+    before = KeyManager(settings).load_keyring().active.token("id", "SO-0004471")
+
+    _fail_second_staging_replace(monkeypatch)
+    assert run("key", "rewrap", "--state-dir", str(state)) == EXIT_FAILURE
+    err = capsys.readouterr().err
+    assert "re-run `carto-edge key rewrap`" in err
+    assert "remove" not in err and "delete" not in err
+    monkeypatch.undo()
+    assert master.read_bytes() == old_master and staged.is_file() and not retired.exists()
+    new_kms = LocalKms.open(staged)
+    key_ids = {p.name: WrappedKey.read(p).key_id for p in KeyManager(settings).wrapped_key_files()}
+    assert new_kms.key_id in key_ids.values() and len(set(key_ids.values())) == 2
+    assert not list(settings.keys_dir.glob("*.rewrap"))
+
+    assert run("key", "rewrap", "--state-dir", str(state)) == EXIT_OK
+    out = capsys.readouterr().out
+    assert "tokens are unchanged" in out and "resumed" in out
+    assert master.read_bytes() != old_master and not staged.exists()
+    assert retired.read_bytes() == old_master
+    assert LocalKms.open(master).key_id == new_kms.key_id
+    for path in KeyManager(settings).wrapped_key_files():
+        assert WrappedKey.read(path).key_id == new_kms.key_id
+    assert KeyManager(settings).load_keyring().active.token("id", "SO-0004471") == before
+    assert _actions(settings) == [
+        "key.rewrap.intent",
+        "key.rewrap.failed",
+        "key.rewrap.intent",
+        "key.rewrap.done",
+    ]
+    assert verify_audit(settings.audit_file).ok
+
+
+def test_a_planted_retired_master_refuses_the_rewrap_without_saying_remove(
+    state: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    settings = EdgeSettings(state_dir=state)
+    master = settings.local_kms_key_file
+    retired = master.with_name(master.name + RETIRED_SUFFIX)
+    retired.write_bytes(bytes(32))
+    before = {path.name: path.read_bytes() for path in settings.keys_dir.iterdir()}
+    assert run("key", "rewrap", "--state-dir", str(state)) == EXIT_FAILURE
+    err = capsys.readouterr().err
+    assert RETIRED_SUFFIX in err and "remove" not in err and "delete" not in err
+    assert {path.name: path.read_bytes() for path in settings.keys_dir.iterdir()} == before
+    assert _actions(settings) == ["key.rewrap.intent", "key.rewrap.failed"]
+
+
 def test_key_commands_fail_cleanly_without_keys(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, state: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     assert run("key", "status", "--state-dir", str(tmp_path / "none")) == EXIT_FAILURE
     assert "key init" in capsys.readouterr().err
     assert run("key", "rotate", "--overlap-days", "0", "--state-dir", str(tmp_path)) == EXIT_USAGE
+    # The ceiling keeps ``timedelta`` and ``retire_at`` inside a sane range (ADR 0070 section 7).
+    assert run("key", "rotate", "--overlap-days", "367", "--state-dir", str(state)) == EXIT_USAGE
+    assert "366" in capsys.readouterr().err
 
 
 def test_secret_set_reads_stdin_or_a_file_never_an_argument(
@@ -226,6 +308,7 @@ def test_changes_write_intent_then_outcome(state: Path, monkeypatch: pytest.Monk
         "secret.delete.done",
     ]
     rows = [json.loads(line) for line in settings.audit_file.read_text().splitlines()]
+    assert rows[0]["details"] == {}, "not even the secret's length is audited"
     assert rows[3]["details"]["active_version"] == 2
     assert rows[5]["details"] == {"existed": False}
     assert verify_audit(settings.audit_file).ok

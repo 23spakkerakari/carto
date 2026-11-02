@@ -35,7 +35,11 @@ When the KMS key itself rotates, :meth:`KeyManager.rewrap` unwraps every wrapped
 ``keys/`` (tenant keys of every version, the vault data key, the local secret store data key)
 and wraps the same material under the new KMS key with the same context, in two phases: every
 file is re-wrapped into a staging file first and the staging files replace the originals only
-when all succeeded, so a KMS failure half way leaves the old set intact. Tokens do not change.
+when all succeeded, so a KMS failure half way leaves the old set intact. A crash while the
+staging files are being installed leaves some files under the new key and some under the old
+one; ``rewrap`` is resumable (ADR 0070 section 7): run again with the same new KMS it leaves
+every file that already unwraps under the new key alone, re-wraps the rest and only then
+reports success. Tokens do not change.
 
 Nothing here logs or returns key material; :meth:`KeyManager.status` reports versions,
 fingerprints and dates only (spec 2.3 invariant 7).
@@ -94,6 +98,8 @@ DEFAULT_OVERLAP_DAYS: Final = 30
 PURPOSE_TOKENIZATION: Final = "tokenization"
 PURPOSE_REVEAL_VAULT: Final = "reveal-vault"
 INIT_HINT: Final = "run `carto-ctl key init`"
+MAX_TOKEN_FILE_BYTES: Final = 4096
+"""The Vault token file is read up to this many bytes, as ``carto-ctl key init`` does."""
 
 log = get_logger(component="keys")
 
@@ -187,9 +193,18 @@ def build_kms(settings: EdgeSettings) -> KeyWrapper:
         msg = "kms.vault_url and kms.vault_token_file are required for the vault provider"
         raise KeyManagementError(msg)
     try:
-        token_value = token_file.read_text(encoding="utf-8").strip()
+        with token_file.open("rb") as handle:
+            data = handle.read(MAX_TOKEN_FILE_BYTES + 1)
     except OSError as exc:
         msg = f"cannot read the Vault token file {token_file}"
+        raise KeyManagementError(msg) from exc
+    if len(data) > MAX_TOKEN_FILE_BYTES:
+        msg = f"the Vault token file {token_file} is larger than {MAX_TOKEN_FILE_BYTES} bytes"
+        raise KeyManagementError(msg)
+    try:
+        token_value = data.decode("utf-8").strip()
+    except UnicodeDecodeError as exc:
+        msg = f"the Vault token file {token_file} is not UTF-8 text"
         raise KeyManagementError(msg) from exc
     if not token_value:
         msg = f"the Vault token file {token_file} is empty"
@@ -453,16 +468,34 @@ class KeyManager:
 
         The material and the context of each key stay the same, which the fingerprint check
         confirms before anything is replaced. ``new_kms`` may be the current KMS object when the
-        KMS rotated its own key version (Vault Transit wraps with the latest version)."""
+        KMS rotated its own key version (Vault Transit wraps with the latest version); then
+        every file is re-wrapped. When ``new_kms`` is another key, a file already under it (an
+        interrupted earlier run) is verified to unwrap and left alone, a file under the current
+        KMS is re-wrapped, and a file under neither is refused before anything is replaced.
+        Phase two installs the staging files one by one; a failure there names the file, keeps
+        what was installed (those files unwrap under ``new_kms`` only) and asks for a re-run,
+        which resumes (module docstring, ADR 0070 section 7)."""
         old = self.kms
         files = self.wrapped_key_files()
         if not files:
             msg = f"no wrapped key files in {self.keys_dir}; {INIT_HINT}"
             raise KeyManagementError(msg)
+        resuming = new_kms.key_id != old.key_id
         staged: list[tuple[Path, Path]] = []
+        kept: list[Path] = []
         try:
             for path in files:
                 wrapped = WrappedKey.read(path)
+                if resuming and wrapped.key_id == new_kms.key_id:
+                    new_kms.unwrap(wrapped)  # already moved by an interrupted run; verify
+                    kept.append(path)
+                    continue
+                if wrapped.key_id != old.key_id:
+                    msg = (
+                        f"{path.name} is wrapped under {wrapped.key_id}, neither the current "
+                        f"KMS key nor the new one; nothing was replaced"
+                    )
+                    raise KeyManagementError(msg)
                 fresh = new_kms.wrap(old.unwrap(wrapped), wrapped.context)
                 if fresh.fingerprint != wrapped.fingerprint:
                     msg = f"re-wrapping {path.name} changed its fingerprint"
@@ -475,19 +508,41 @@ class KeyManager:
                 staging.unlink(missing_ok=True)
             if isinstance(exc, KeyManagementError):
                 raise
-            msg = "re-wrapping failed; the existing key files are unchanged"
+            msg = (
+                "re-wrapping failed; the existing key files are unchanged"
+                f" (re-run `carto-edge key rewrap` to retry): {type(exc).__name__}"
+            )
             raise KeyManagementError(msg) from exc
-        for staging, path in staged:
-            staging.replace(path)
-        fsync_directory(self.keys_dir)
+        installed: list[Path] = []
+        try:
+            for staging, path in staged:
+                staging.replace(path)
+                installed.append(path)
+            fsync_directory(self.keys_dir)
+        except OSError as exc:
+            failed = staged[len(installed)][1].name if len(installed) < len(staged) else ""
+            for staging, _path in staged[len(installed) :]:
+                with contextlib.suppress(OSError):
+                    staging.unlink(missing_ok=True)
+            with contextlib.suppress(OSError):
+                fsync_directory(self.keys_dir)
+            msg = (
+                f"re-wrapping stopped while installing {failed or 'the key files'} "
+                f"({type(exc).__name__}); {len(installed)} of {len(staged)} files are now under "
+                f"the new KMS key {new_kms.key_id} and the rest under {old.key_id}. Keep both "
+                "keys and re-run `carto-edge key rewrap` to resume; it finishes the files that "
+                "are still under the old key"
+            )
+            raise KeyManagementError(msg) from exc
         self._kms = new_kms
         log.info(
             "keys.rewrapped",
-            files=[path.name for _staging, path in staged],
+            files=[path.name for path in installed],
+            already_under_new_key=[path.name for path in kept],
             old_kms_key_id=old.key_id,
             new_kms_key_id=new_kms.key_id,
         )
-        return [path for _staging, path in staged]
+        return installed
 
     # -----------------------------------------------------------------------------------------
     # vault data key, assertion key, status

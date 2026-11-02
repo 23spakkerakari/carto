@@ -12,14 +12,17 @@ schema validation, the egress allowlist, audit and retries, so an adapter cannot
 
 from __future__ import annotations
 
+import re
 from enum import StrEnum
 from typing import Annotated, Final, Protocol, runtime_checkable
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 __all__ = [
     "LABEL_DICTIONARY",
+    "LABEL_PATTERN",
     "MAX_LABEL_LEN",
+    "RATIONALE_PATTERN",
     "AttributeSummary",
     "FieldSummary",
     "LabelFieldRequest",
@@ -34,7 +37,25 @@ __all__ = [
 ]
 
 MAX_LABEL_LEN: Final = 48
+MAX_RATIONALE_LEN: Final = 200
 MAX_TEMPLATE_TEXT_LEN: Final = 512
+
+LABEL_PATTERN: Final = r"^[A-Za-z0-9 _:/().-]+$"
+"""Letters, digits, space and a little punctuation: no markup, no braces, no control
+characters, nothing a template engine or a shell would act on."""
+RATIONALE_PATTERN: Final = r"^[A-Za-z0-9 _:/().,;'?!-]*$"
+""":data:`LABEL_PATTERN` plus sentence punctuation; still no ``<>{}``, quotes of the double
+kind, backslashes or control characters (ADR 0070 section 7)."""
+_LINK_SHAPED: Final = re.compile(
+    r"://|(?:^|[^A-Za-z0-9])www\.|\.[A-Za-z]{2,6}(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
+"""A URL scheme separator, a ``www.`` host, or a dot followed by two to six letters that end a
+word (``evil.co``, ``orders.com``): a label a reviewer might take for a link and click. A dot
+before a digit or a space (``no. 1``, ``v1.2``) is ordinary text."""
+_URL_SHAPED: Final = re.compile(r"://|(?:^|[^A-Za-z0-9])www\.", re.IGNORECASE)
+"""For the rationale, which may legitimately quote a dotted field path (``orders.order_id``):
+only a scheme separator or a ``www.`` host is refused."""
 MAX_ATTRIBUTE_VALUES: Final = 8
 MAX_FIELDS_PER_REQUEST: Final = 64
 
@@ -139,11 +160,27 @@ class Suggestion(_Strict):
 
     target_id: Annotated[str, Field(max_length=512)]
     label_type: LabelType
-    label: Annotated[
-        str, Field(min_length=1, max_length=MAX_LABEL_LEN, pattern=r"^[A-Za-z0-9 _:/().-]+$")
-    ]
+    label: Annotated[str, Field(min_length=1, max_length=MAX_LABEL_LEN, pattern=LABEL_PATTERN)]
     confidence: Annotated[float, Field(ge=0.0, le=1.0)]
-    rationale: Annotated[str, Field(max_length=200)] = ""
+    rationale: Annotated[str, Field(max_length=MAX_RATIONALE_LEN, pattern=RATIONALE_PATTERN)] = ""
+
+    @field_validator("label")
+    @classmethod
+    def _label_is_not_link_shaped(cls, value: str) -> str:
+        """A label must not look like a URL or a domain (ADR 0070 section 7): the console shows
+        it to a reviewer, and a name shaped like a link invites a click."""
+        if _LINK_SHAPED.search(value):
+            msg = "must not look like a URL or a domain name"
+            raise ValueError(msg)
+        return value
+
+    @field_validator("rationale")
+    @classmethod
+    def _rationale_carries_no_url(cls, value: str) -> str:
+        if _URL_SHAPED.search(value):
+            msg = "must not carry a URL"
+            raise ValueError(msg)
+        return value
 
 
 class SuggestionList(_Strict):

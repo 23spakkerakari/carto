@@ -188,6 +188,14 @@ one internal caller. A POSIX test creates a key under umask 0 and asserts mode 0
 asserts an existing key is untouched by a refused write. Windows has no mode bits; the test
 skips there, as the `carto-ctl` one does.
 
+**Amendment (audit 2026-11-02, ADR 0070 section 7).** The certificate was still written with
+`write_bytes`, which follows a planted symlink and overwrites, and it was written before the
+key, so the refusal path left a new certificate beside an old key. `write_pem` now checks that
+nothing is at either path, creates the key, then creates the certificate through
+`crypto.create_public` (`O_CREAT | O_EXCL`, mode 0644), withdraws the key it just wrote if the
+certificate cannot be written, and fsyncs the directory. `create_public` is public because
+`carto-ctl pki` writes its CA copies through it too; `_create_private` keeps its name.
+
 ## Consequences
 
 - A sources file with a weakened transport setting and no `insecure_transport: true` fails to
@@ -210,3 +218,6 @@ skips there, as the `carto-ctl` one does.
   the disk buffer or the state directory through the pipeline, not in the connector.
 - `$C.run(...)` also matches `asyncio.run(...)` inside a connector module, which is not
   something a connector should call either.
+- Section 4 amendment: `write_pem` refuses an existing certificate as it refuses an existing
+  key, so a directory with a stray `.crt` has to be cleared before `pki init` runs there;
+  `--if-missing` on a complete run is unchanged.

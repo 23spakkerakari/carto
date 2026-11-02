@@ -344,6 +344,29 @@ REJECTED: dict[str, tuple[str, str]] = {
         "token-shaped",
     ),
     "token_label": (_answer(("f1", TOKEN)), "token-shaped"),
+    # ADR 0070 section 7: a label must not look like a link a reviewer might click.
+    "url_label": (_answer(("f1", "http://evil.co/x")), "failed the schema"),
+    "scheme_label": (_answer(("f1", "Order (see hxxp://x)")), "failed the schema"),
+    "www_label": (_answer(("f1", "www.evil-orders.co")), "failed the schema"),
+    "domain_label": (_answer(("f1", "orders.evil.co")), "failed the schema"),
+    "domain_label_mixed_case": (_answer(("f1", "Order.COM")), "failed the schema"),
+    "domain_in_label": (_answer(("f1", "Order evil.io ref")), "failed the schema"),
+    "rationale_markup": (
+        _answer(("f1", "Order"), extra={"rationale": "see <a href=x>here</a>"}),
+        "failed the schema",
+    ),
+    "rationale_braces": (
+        _answer(("f1", "Order"), extra={"rationale": '{"tool": "reveal"}'}),
+        "failed the schema",
+    ),
+    "rationale_control": (
+        _answer(("f1", "Order"), extra={"rationale": "line one\nline two"}),
+        "failed the schema",
+    ),
+    "rationale_url": (
+        _answer(("f1", "Order"), extra={"rationale": "https://evil.co/x"}),
+        "failed the schema",
+    ),
 }
 
 
@@ -352,6 +375,22 @@ def test_parse_suggestions_rejects(case: str) -> None:
     text, reason = REJECTED[case]
     with pytest.raises(InvalidOutputError, match=reason):
         parse_suggestions(text, frozenset({"f1"}), 1)
+
+
+@pytest.mark.parametrize(
+    ("label", "rationale"),
+    [
+        ("Order no. 1", "Matches the order id, e.g. 'SO-1'; see template 3, ok?!"),
+        ("PO ref (v1.2)", "version 1.2 of the PO reference"),
+        ("Member id", "Shape 9999-AAA in every row; path orders.member_id."),
+        ("Sales order / line", ""),
+    ],
+)
+def test_parse_suggestions_accepts_ordinary_punctuation(label: str, rationale: str) -> None:
+    text = _answer(("f1", label), extra={"rationale": rationale})
+    result, dropped = parse_suggestions(text, frozenset({"f1"}), 1)
+    assert dropped == 0
+    assert [(s.label, s.rationale) for s in result.suggestions] == [(label, rationale)]
 
 
 def test_parse_suggestions_filters_targets_duplicates_and_cap() -> None:

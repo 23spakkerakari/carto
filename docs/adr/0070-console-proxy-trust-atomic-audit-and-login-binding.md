@@ -135,6 +135,85 @@ A valid callback that fails later (token exchange, a bad ID token) is a refused 
 and counted as before; it has consumed its attempt, so it cannot be replayed to spend anything
 twice.
 
+## 6. A PATCH confirms a name only when it carries one (audit 2026-11-02, Medium; spec 2.3 invariant 5)
+
+**Context.** `EntityRepository.set_name` took a name and set `name_confirmed = TRUE`
+unconditionally, and `EntityPortAdapter.patch` filled a missing name with the current display
+name, which for an unreviewed entity is the LLM's `suggested_name` (or `""`). A reviewer who
+only wrote a description therefore confirmed the model's suggestion under their own identity,
+and the audit row said so. The in-memory port did it right (`name_confirmed = current or name
+is not None`), so the HTTP test passed while the PostgreSQL path did not.
+
+**Decision.** `set_name` takes `name: str | None`. With a name it sets `name`, `name_confirmed`,
+`description` and `updated_at` as before. With `None` the UPDATE's SET list is `description`
+and `updated_at` alone (`_SET_ENTITY_DESCRIPTION`), so `name` and `name_confirmed` are not
+touched, whatever they hold. The adapter passes the request's `name` through unchanged. The
+in-memory repository mirrors it. A description-only PATCH on an entity with a suggestion
+leaves `name` NULL, `name_confirmed` false and `display_name` the suggestion, and its audit
+row's `after` says `name_confirmed: false`; a PATCH with a name confirms it. The repository
+test (`exercise_entities`, run against the in-memory and the PostgreSQL repository), the
+data-ports test over the adapter and the HTTP test pin all three layers.
+
+## 7. Key-file hygiene from the audit of 2026-11-02 (B to G)
+
+Six smaller findings of the same audit, recorded together because each is one narrow rule:
+
+- **`key rewrap` is resumable and never asks for `.new` to be removed (B, Medium-High).**
+  Phase two of `KeyManager.rewrap` replaced the staged files outside the `try`, so an
+  `OSError` or a crash left `local-kms.key.new` beside files already wrapped under it, the
+  next run refused because `.new` existed and told the operator to remove it, which would have
+  destroyed the only key for those files; and a half-rewrapped set could not be repaired
+  because `rewrap` refused a file already under the new key id. Now: when the new KMS key id
+  differs from the current one, a file already under the new id is verified (unwrapped) and
+  left alone, a file under the current id is re-wrapped, and a file under neither is refused by
+  name before anything is replaced; when the ids are the same (Vault Transit after a transit
+  key rotation) every file is re-wrapped as before. Phase two runs inside a `try`: a failure
+  names the file, removes only the staging files not yet installed, reports how many files are
+  under each key and says `re-run carto-edge key rewrap to resume`. `_rewrap_local` opens an
+  existing `.new` instead of refusing, never deletes it, and installs the new master only
+  after every file is under it, copying the old master to `.retired` first and then renaming
+  `.new` over `local-kms.key`, so a master file exists at every instant (the earlier two
+  renames had a window with none). A `.retired` without a `.new` is an earlier, completed
+  rewrap the operator has not finished and still refuses; that message tells them to verify
+  the backups and destroy it per the runbook, not to remove anything. The runbook gains a
+  "Rewrap interrupted" section. Tests cut the power on the second staging replace and show
+  the next run finishing with every file under the new master.
+- **`VaultTransitKms` builds its own isolated client (C, Medium).** `httpx.Client(timeout=...)`
+  left `trust_env` on, so `HTTPS_PROXY` or `SSL_CERT_FILE` in the environment steered the
+  Vault token and the plaintext key material to a proxy with an attacker CA. The client is now
+  built like the KV resolver's: `trust_env=False`, an explicit TLS 1.2-minimum context from
+  the system store or an optional `ca_file`, `follow_redirects=False`; and every request
+  passes `follow_redirects=False` so a caller-supplied client cannot follow either. `ca_file`
+  is a constructor parameter; the edge's `KmsSettings` has no `vault_ca_file` field yet and
+  `build_kms` passes none (Consequences).
+- **Certificates are created exclusively, after the key (D, Low).** `write_pem` and the CA
+  copies in `carto-ctl pki` wrote certificates with `write_bytes`, following a planted symlink
+  and overwriting, and wrote the certificate before the key, so the refusal path left a new
+  certificate beside an old key. `crypto.create_public` is `_create_private` with mode 0644;
+  `write_pem` checks that nothing (file, directory or symlink, dangling included) is at either
+  path, writes the key, then the certificate, withdraws the key it just wrote when the
+  certificate cannot be written, and fsyncs the directory. `pki init` checks every file it
+  would write before touching anything (keys named first in the message); `pki issue` checks
+  its two certificate paths too.
+- **The local secret store's files are owner-only from creation (E, Low).** `sqlite3.connect`
+  created `secrets.sqlite` under the umask and ran `PRAGMA journal_mode=WAL` before the
+  `chmod`, so the `-wal` and `-shm` side files kept the umask mode. The file is now created
+  exclusively with mode 0600 before SQLite opens it (an empty file is an empty database), and
+  the database and every side file that exists are `chmod 600` after the first connection.
+  `LocalKms.open` refuses, on POSIX, a master key file that group or others can read, naming
+  the path and its mode.
+- **Bounds (F, Low).** `carto-ctl pki init|issue --days` stops at 398 (`MAX_LEAF_DAYS`, the
+  public-CA ceiling for a leaf; the default stays 90 per spec 14.4; CAs are not issued from
+  the command line and keep ten years). The edge's Vault token file is read with the same
+  4096-byte cap as `carto-ctl key init`. `carto-edge key rotate --overlap-days` stops at 366.
+  The `secret.set.intent` audit row no longer carries the value's byte length.
+- **Suggestion labels cannot look like links (G, Low).** The label pattern admitted
+  `http://evil.co/x`. A `label` is refused when it contains `://`, a `www.` host, or a dot
+  followed by two to six letters that end a word (`evil.co`, `Order.COM`); `rationale` gets the
+  label's character class plus `,;'?!` (so still no `<>{}`, backslash or control character) and
+  is refused when it carries `://` or `www.`, but may quote a dotted field path. Such answers
+  fail the schema and are discarded and counted as invalid output like any other.
+
 ## Alternatives
 
 - A trusted-proxy address allowlist for M5: deferred to the M6 ingress work; the certificate
@@ -176,6 +255,20 @@ twice.
 - The integration tests of the Postgres path (`test_core_api_postgres.py::
   test_append_on_a_callers_connection_chains_and_rolls_back_with_it` and the rollback step in
   `test_core_api_data_ports.py`) need Docker and ran in CI, not on the laptop that built this.
+- Section 6: a description-only PATCH changes `updated_at` (and so the ETag) without touching
+  the name columns; a client that reads `name_confirmed` from the response sees it unchanged.
+  `EntityRepository.set_name` is a protocol change; both implementations and the one caller
+  changed with it.
+- Section 7: an operator who has a `local-kms.key.new` from a run interrupted before this
+  change runs `carto-edge key rewrap` once and it finishes; nothing has to be removed by hand.
+  `KmsSettings` still has no `vault_ca_file` field (it lives in `carto_edge.config`, outside
+  this package), so a Vault Transit server signed by a private CA needs that CA in the
+  container's system trust store until the field is added and threaded to
+  `VaultTransitKms(ca_file=...)`; `SSL_CERT_FILE` no longer works for it, on purpose. On
+  POSIX, an install whose `local-kms.key` is group- or world-readable stops starting until the
+  mode is fixed; the message says how. `pki init` now also refuses a directory holding a stray
+  certificate where it would write one; `--if-missing` is unchanged (a complete run is still
+  a success that writes nothing). A rationale that quotes a URL is now invalid output.
 - Not built: the worker's own transitions (`auto_accept`, `refresh_staleness`, `_repropose`)
   still write their audit row after the decision's transaction through `ReviewService._record`;
   they are engine transitions, not human actions under invariant 6, and the hook is in place

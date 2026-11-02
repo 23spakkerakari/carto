@@ -17,9 +17,13 @@ see the same state volume and KMS.
   and retire dates, never material; ``rotate`` creates version n+1 and keeps n for the overlap
   window (the gateway reads the keyring at startup, so restart it afterwards); ``rewrap`` moves
   every wrapped key to a new KMS key without changing a token: with the local KMS a new master
-  key file is generated and the old one is kept as ``local-kms.key.retired`` until the operator
-  has verified the backups and destroys it; with Vault Transit, rotate the transit key in Vault
-  first, then ``rewrap`` wraps with its latest version.
+  key file is generated as ``local-kms.key.new``, every file is re-wrapped under it, and only
+  then is it installed as ``local-kms.key`` with the old one kept as ``local-kms.key.retired``
+  until the operator has verified the backups and destroys it; with Vault Transit, rotate the
+  transit key in Vault first, then ``rewrap`` wraps with its latest version. An interrupted
+  rewrap is resumed by running the command again (ADR 0070 section 7): the staged ``.new``
+  master is the only key for the files already re-wrapped, so no message ever asks for it to
+  be removed.
 - ``secret`` (ADR 0013, spec 14.3): the ``local://`` store for Compose pilots. A value is read
   from ``--from-file`` or standard input (a prompt without echo on a terminal), never from an
   argument, so it cannot land in shell history or a process listing; ``list`` prints names only.
@@ -47,7 +51,15 @@ from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 from typing import Final, TextIO
 
-from carto_common.crypto import CryptoError, KeyWrapper, KmsProvider, LocalKms, WrappedKey
+from carto_common.crypto import (
+    CryptoError,
+    KeyWrapper,
+    KmsProvider,
+    LocalKms,
+    WrappedKey,
+    fsync_directory,
+    write_private_file,
+)
 from carto_edge.audit import AuditChainError, EdgeAudit
 from carto_edge.config import ConfigError, EdgeSettings, SourceType, load_sources_file
 from carto_edge.connectors.base import ConnectorContext, ConnectorError, ReadConnector, TestResult
@@ -62,8 +74,11 @@ EXIT_OK: Final = 0
 EXIT_FAILURE: Final = 1
 EXIT_USAGE: Final = 2
 MAX_SECRET_BYTES: Final = 64 * 1024
+MAX_OVERLAP_DAYS: Final = 366
+"""``--overlap-days`` ceiling: a year; ``timedelta`` would accept far more than any retention."""
 RETIRED_SUFFIX: Final = ".retired"
 NEW_SUFFIX: Final = ".new"
+RESUME_HINT: Final = "re-run `carto-edge key rewrap` to resume"
 _PUSH_ONLY: Final = frozenset({SourceType.OTLP})
 
 Handler = Callable[[argparse.Namespace, TextIO, TextIO], int]
@@ -100,7 +115,10 @@ def add_commands(commands: _Subparsers) -> None:
         "--overlap-days",
         type=int,
         default=None,
-        help="Days the old version keeps tokenizing (default: max(30, event retention))",
+        help=(
+            "Days the old version keeps tokenizing (default: max(30, event retention); at most "
+            f"{MAX_OVERLAP_DAYS})"
+        ),
     )
     _leaf(key_commands, "rewrap", "Re-wrap every key under a new KMS key", _key_rewrap)
 
@@ -209,8 +227,8 @@ def _key_status(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
 
 
 def _key_rotate(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
-    if args.overlap_days is not None and args.overlap_days < 1:
-        return _usage(err, "--overlap-days must be at least 1")
+    if args.overlap_days is not None and not 1 <= args.overlap_days <= MAX_OVERLAP_DAYS:
+        return _usage(err, f"--overlap-days must be between 1 and {MAX_OVERLAP_DAYS}")
     settings = _settings(args)
     manager = KeyManager(settings)
     try:
@@ -238,17 +256,19 @@ def _key_rewrap(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
     try:
         old_key_id = manager.kms.key_id
         with _audited(settings, "key.rewrap", "keys", {"old": old_key_id}) as outcome:
+            resumed = False
             if settings.kms.provider == "local":
-                rewritten, new_key_id = _rewrap_local(manager, settings.local_kms_key_file)
+                rewritten, new_key_id, resumed = _rewrap_local(manager, settings.local_kms_key_file)
             else:
                 rewritten = manager.rewrap(manager.kms)
                 new_key_id = manager.kms.key_id
-            outcome.update(files=[path.name for path in rewritten], new=new_key_id)
+            outcome.update(files=[path.name for path in rewritten], new=new_key_id, resumed=resumed)
     except AuditUnavailableError as exc:
         return _fail(err, f"rewrap refused: {exc}")
     except (KeyManagementError, CryptoError, OSError) as exc:
         return _fail(err, f"rewrap failed: {exc}")
-    out.write(f"re-wrapped {len(rewritten)} key files under {new_key_id}; tokens are unchanged.\n")
+    how = "resumed an interrupted rewrap and re-wrapped" if resumed else "re-wrapped"
+    out.write(f"{how} {len(rewritten)} key files under {new_key_id}; tokens are unchanged.\n")
     if settings.kms.provider == "local":
         retired = settings.local_kms_key_file.with_name(
             settings.local_kms_key_file.name + RETIRED_SUFFIX
@@ -260,22 +280,50 @@ def _key_rewrap(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
     return EXIT_OK
 
 
-def _rewrap_local(manager: KeyManager, master: Path) -> tuple[list[Path], str]:
-    """New local master key, rewrap, then swap the master files (old one kept as retired)."""
+def _rewrap_local(manager: KeyManager, master: Path) -> tuple[list[Path], str, bool]:
+    """New local master key staged as ``.new``, rewrap, then install it (the old master kept as
+    ``.retired``). Returns the files rewritten, the new key id and whether this run resumed an
+    interrupted one.
+
+    Resumable (ADR 0070 section 7): a ``.new`` file from an interrupted run is opened, not
+    replaced, since the files that run already re-wrapped unwrap under it alone; the staged
+    master is never deleted by this command. The install order keeps a master on disk at every
+    instant: the old master is copied to ``.retired`` first, then ``.new`` is renamed over the
+    master. A ``.retired`` without a ``.new`` is an earlier, completed rewrap the operator has
+    not finished (runbook: verify the backups, then destroy it), and the command refuses."""
     fresh_path = master.with_name(master.name + NEW_SUFFIX)
     retired = master.with_name(master.name + RETIRED_SUFFIX)
-    if fresh_path.exists() or retired.exists():
-        msg = f"{fresh_path.name} or {retired.name} exists from an earlier rewrap; remove it first"
+    resumed = fresh_path.exists()
+    if retired.exists() and not resumed:
+        msg = (
+            f"{retired} exists from an earlier rewrap; verify the backups taken after it and "
+            "destroy it as docs/runbooks/key-rotation.md describes before rewrapping again"
+        )
         raise KeyManagementError(msg)
-    fresh = LocalKms.create(fresh_path)
+    if resumed:
+        try:
+            fresh = LocalKms.open(fresh_path)
+        except CryptoError as exc:
+            msg = (
+                f"{fresh_path} was staged by an interrupted rewrap but cannot be opened; keep "
+                "it and see 'Rewrap interrupted' in docs/runbooks/key-rotation.md"
+            )
+            raise KeyManagementError(msg) from exc
+    else:
+        fresh = LocalKms.create(fresh_path)
+    # From here on the staged master may be the only key for some files: it is never removed.
+    rewritten = manager.rewrap(fresh)
     try:
-        rewritten = manager.rewrap(fresh)
-    except KeyManagementError:
-        fresh_path.unlink(missing_ok=True)
-        raise
-    master.replace(retired)
-    fresh_path.replace(master)
-    return rewritten, fresh.key_id
+        write_private_file(retired, master.read_bytes())
+        fresh_path.replace(master)
+        fsync_directory(master.parent)
+    except OSError as exc:
+        msg = (
+            f"every key file is under the new master {fresh_path} but installing it as "
+            f"{master.name} failed ({type(exc).__name__}); {RESUME_HINT}"
+        )
+        raise KeyManagementError(msg) from exc
+    return rewritten, fresh.key_id, resumed
 
 
 # ---------------------------------------------------------------------------------------------
@@ -316,7 +364,7 @@ def _secret_set(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
     target = f"local://{args.name}"
     try:
         with (
-            _audited(settings, "secret.set", target, {"bytes": len(value.encode("utf-8"))}),
+            _audited(settings, "secret.set", target, {}),
             _open_store(settings) as store,
         ):
             store.put(args.name, value)

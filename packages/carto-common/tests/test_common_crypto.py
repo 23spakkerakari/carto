@@ -181,9 +181,26 @@ def test_local_kms_open_rejects_bad_files(tmp_path: Path) -> None:
     with pytest.raises(CryptoError, match="cannot read"):
         LocalKms.open(tmp_path / "missing.key")
     bad = tmp_path / "bad.key"
+    bad.touch(mode=0o600)
     bad.write_bytes(b"short")
     with pytest.raises(CryptoError, match="32-byte"):
         LocalKms.open(bad)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+@pytest.mark.parametrize("mode", [0o640, 0o604, 0o644, 0o660])
+def test_local_kms_open_refuses_a_master_key_readable_by_others(tmp_path: Path, mode: int) -> None:
+    """ADR 0070 section 7: a master key file that group or others can read is refused, and the
+    message names the path and its mode so the operator can fix it."""
+    path = tmp_path / "local-kms.key"
+    LocalKms.create(path)
+    LocalKms.open(path)  # 0600 as created
+    path.chmod(mode)
+    with pytest.raises(CryptoError, match=f"{mode:04o}") as info:
+        LocalKms.open(path)
+    assert str(path) in str(info.value) and "chmod 600" in str(info.value)
+    path.chmod(0o400)
+    LocalKms.open(path)  # read-only for the owner is fine
 
 
 def test_wrapped_key_file_round_trip(tmp_path: Path) -> None:
@@ -238,6 +255,47 @@ def test_vault_transit_wrap_unwrap_through_mock_transport() -> None:
     with pytest.raises(CryptoError):
         kms.unwrap(wrapped.model_copy(update={"context": {"tenant_id": "other"}}))
     assert "s.token" not in repr(kms)
+
+
+def test_vault_transit_client_ignores_the_environment_and_never_follows_redirects(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """ADR 0070 section 7: ``HTTPS_PROXY`` or ``SSL_CERT_FILE`` in the environment must not
+    redirect the Vault token and the key material to a proxy with an attacker CA, and a 3xx
+    from Vault must not send them to another host."""
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:9")
+    monkeypatch.setenv("SSL_CERT_FILE", str(tmp_path / "attacker-ca.pem"))
+    kms = VaultTransitKms("https://vault.internal:8200", "carto", "s.token")
+    client = kms._client
+    assert client.trust_env is False
+    assert client.follow_redirects is False
+    assert not client._mounts, "no proxy mounts from the environment"
+
+    calls: list[str] = []
+
+    def redirecting(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        return httpx.Response(302, headers={"location": "https://evil.example/v1/transit"})
+
+    # Even a caller-supplied client that would follow redirects is told not to per request.
+    following = httpx.Client(transport=httpx.MockTransport(redirecting), follow_redirects=True)
+    kms = VaultTransitKms("https://vault.internal:8200", "carto", "s.token", client=following)
+    with pytest.raises(CryptoError, match="HTTP 302"):
+        kms.wrap(generate_key(), {"tenant_id": "default"})
+    assert calls == ["https://vault.internal:8200/v1/transit/encrypt/carto"]
+
+
+def test_vault_transit_takes_an_explicit_ca_bundle(tmp_path: Path) -> None:
+    from carto_common.pki import create_ca  # noqa: PLC0415
+
+    bundle = tmp_path / "vault-ca.pem"
+    bundle.write_bytes(create_ca().certificate_pem)
+    kms = VaultTransitKms("https://vault.internal:8200", "carto", "s.token", ca_file=bundle)
+    assert kms._client.trust_env is False
+    with pytest.raises(CryptoError, match="ca_file"):
+        VaultTransitKms(
+            "https://vault.internal:8200", "carto", "s.token", ca_file=tmp_path / "missing.pem"
+        )
 
 
 def test_vault_transit_rejects_plain_http_and_bad_key_names() -> None:

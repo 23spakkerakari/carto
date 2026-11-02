@@ -190,13 +190,16 @@ class EntityRepository(Protocol):
         tenant_id: str,
         entity_id: str,
         *,
-        name: str,
+        name: str | None,
         description: str | None,
         now: datetime,
         on_write: TransactionHook[Entity] | None = None,
     ) -> Entity:
-        """Confirm a name (spec 9.6). Raises :class:`NotFoundError`. ``on_write`` runs inside
-        the transaction with the stored entity (ADR 0070)."""
+        """Confirm ``name`` (spec 9.6) and set the description. With ``name=None`` only the
+        description and ``updated_at`` change: ``name`` and ``name_confirmed`` are left as they
+        are, so a description alone never confirms the LLM's suggestion (spec 2.3 invariant 5,
+        ADR 0070 section 6). Raises :class:`NotFoundError`. ``on_write`` runs inside the
+        transaction with the stored entity (ADR 0070)."""
         ...
 
     def ping(self) -> bool: ...
@@ -392,7 +395,7 @@ class InMemoryEntityRepository:
         tenant_id: str,
         entity_id: str,
         *,
-        name: str,
+        name: str | None,
         description: str | None,
         now: datetime,
         on_write: TransactionHook[Entity] | None = None,
@@ -403,7 +406,11 @@ class InMemoryEntityRepository:
                 msg = "entity not found"
                 raise NotFoundError(msg)
             stored = replace(
-                entity, name=name, name_confirmed=True, description=description, updated_at=now
+                entity,
+                name=entity.name if name is None else name,
+                name_confirmed=entity.name_confirmed or name is not None,
+                description=description,
+                updated_at=now,
             )
             if on_write is not None:
                 on_write(None, stored)
@@ -514,6 +521,12 @@ _SET_ENTITY_NAME = sqlalchemy.text(
     "UPDATE entities SET name = :name, name_confirmed = TRUE, description = :description, "
     "updated_at = :now WHERE tenant_id = :tenant_id AND id = :id"
 )
+_SET_ENTITY_DESCRIPTION = sqlalchemy.text(
+    "UPDATE entities SET description = :description, updated_at = :now "
+    "WHERE tenant_id = :tenant_id AND id = :id"
+)
+"""A description alone: ``name`` and ``name_confirmed`` are not in the SET list (ADR 0070
+section 6)."""
 
 
 def _link_parameters(tenant_id: str, link: KeyLink, now: datetime) -> dict[str, object]:
@@ -826,23 +839,25 @@ class PostgresEntityRepository:
         tenant_id: str,
         entity_id: str,
         *,
-        name: str,
+        name: str | None,
         description: str | None,
         now: datetime,
         on_write: TransactionHook[Entity] | None = None,
     ) -> Entity:
+        parameters: dict[str, object] = {
+            "tenant_id": tenant_id,
+            "id": entity_id,
+            "description": description,
+            "now": now,
+        }
+        if name is None:
+            statement = _SET_ENTITY_DESCRIPTION
+        else:
+            statement = _SET_ENTITY_NAME
+            parameters["name"] = name
         try:
             with self._engine.begin() as connection:
-                result = connection.execute(
-                    _SET_ENTITY_NAME,
-                    {
-                        "tenant_id": tenant_id,
-                        "id": entity_id,
-                        "name": name,
-                        "description": description,
-                        "now": now,
-                    },
-                )
+                result = connection.execute(statement, parameters)
                 if int(result.rowcount) == 0:
                     msg = "entity not found"
                     raise NotFoundError(msg)

@@ -64,14 +64,45 @@ the old set intact. Tokens do not change.
 
 - Vault Transit: rotate the transit key in Vault first (`vault write -f transit/keys/carto/rotate`),
   then run `carto-edge key rewrap`, which wraps with the latest key version.
-- Local KMS: `carto-edge key rewrap` generates a new master key file, re-wraps everything under it,
-  installs it as `keys/local-kms.key` and keeps the old one as `keys/local-kms.key.retired`.
-  Take a new backup of `keys/`, verify it restores, then destroy the retired file; a second rewrap
-  refuses to run while it exists.
+- Local KMS: `carto-edge key rewrap` generates a new master key file as `keys/local-kms.key.new`,
+  re-wraps everything under it, then copies the old master to `keys/local-kms.key.retired` and
+  renames `.new` over `keys/local-kms.key` (a master file exists at every instant). Take a new
+  backup of `keys/`, verify it restores, then destroy the retired file; a second rewrap refuses
+  to run while it exists.
 
 Restart edge-gateway afterwards. `key.rewrap.intent` and then `key.rewrap.done` (or
 `key.rewrap.failed`) are recorded in the edge audit file; without a writable audit file the
 command changes nothing.
+
+### Rewrap interrupted
+
+A rewrap can stop half way: a full disk, a killed container, a power cut while the re-wrapped
+files are being installed. The command then prints which file it stopped at, how many files are
+under each key and `re-run carto-edge key rewrap to resume`, and `key.rewrap.failed` is in the
+audit file. The state on disk is safe as long as nothing is deleted:
+
+- **Local KMS.** `keys/local-kms.key` is still the old master and `keys/local-kms.key.new` is
+  the new one. Some wrapped files are under the old master, some under the new; the ones under
+  the new master can only be unwrapped with `.new`. **Never delete `local-kms.key.new`.** Run
+  `carto-edge key rewrap` again: it opens the staged master instead of generating another, leaves
+  every file that already unwraps under it alone, re-wraps the rest, and only then installs the
+  masters (`.retired`, then the rename). The output says it resumed. If the second run reports a
+  file wrapped under neither key, restore that one file from the backup taken before the rewrap
+  (it was under the old master then) and run the command again.
+- **Local KMS, stopped while installing the masters.** `local-kms.key.new` and
+  `local-kms.key.retired` both exist: every wrapped file is under `.new`. Run the command again;
+  it verifies that, rewrites `.retired` from the current master and finishes the rename. A
+  `.retired` *without* a `.new` is the other case: an earlier rewrap that completed, whose old
+  master you have not destroyed yet (above).
+- **Vault Transit.** Nothing is staged on the edge: the transit key already has its new version
+  and Vault can still decrypt under the old one. Run `carto-edge key rewrap` again; it re-wraps
+  every file (Vault reports the same key id for every version).
+
+Do not restart edge-gateway between the interrupted run and the resumed one if you can avoid it:
+the running gateway holds the keys in memory, while a fresh start opens `keys/local-kms.key`
+(the old master) and fails on the files already moved to the new one. If it has restarted, finish
+the rewrap first, then start it. The command never asks you to remove a key file; a message
+that seems to is a reason to stop and read this section.
 
 ## Loss of the tenant key
 

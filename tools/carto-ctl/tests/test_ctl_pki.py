@@ -18,7 +18,7 @@ from cryptography.x509.oid import ExtendedKeyUsageOID
 from carto_common.pki import certificate_fingerprint, load_certificate, load_private_key
 from carto_ctl.cli import main
 from carto_ctl.exit_codes import EXIT_FAILURE, EXIT_OK, EXIT_USAGE
-from carto_ctl.pki import LISTENER_CLIENTS, initialize_pki
+from carto_ctl.pki import LISTENER_CLIENTS, MAX_LEAF_DAYS, initialize_pki
 
 STACK = "ingest-api,edge-gateway,otel-collector"
 
@@ -217,6 +217,63 @@ def test_custom_lifetime(tmp_path: Path) -> None:
     assert leaf.not_valid_after_utc - leaf.not_valid_before_utc == dt.timedelta(days=30)
     ca = load_certificate(out / "edge-gateway-ca.crt")
     assert ca.not_valid_after_utc - ca.not_valid_before_utc == dt.timedelta(days=3650)
+    # Leaves stop at the public-CA ceiling (ADR 0070 section 7); the CA keeps its ten years.
+    assert MAX_LEAF_DAYS == 398
+    longest = tmp_path / "longest"
+    argv = ["pki", "init", "--out", str(longest), "--services", STACK, "--days", "398"]
+    assert main(argv) == EXIT_OK
+    leaf = load_certificate(longest / "otel-collector" / "to-edge-gateway.crt")
+    assert leaf.not_valid_after_utc - leaf.not_valid_before_utc == dt.timedelta(days=398)
+    ca = load_certificate(longest / "edge-gateway-ca.crt")
+    assert ca.not_valid_after_utc - ca.not_valid_before_utc == dt.timedelta(days=3650)
+
+
+def _plant_symlink(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks are not available here")
+
+
+def test_pki_init_refuses_a_planted_file_or_symlink_where_a_certificate_goes(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """ADR 0070 section 7: certificates are created exclusively too, and every file the run
+    would write is checked before anything is touched."""
+    out, ca_dir = tmp_path / "pki", tmp_path / "pki-ca"
+    (out / "edge-gateway").mkdir(parents=True)
+    (out / "edge-gateway" / "listener-ca.crt").write_bytes(b"planted")
+    assert _init(out, ca_dir, "--services", STACK) == EXIT_FAILURE
+    err = capsys.readouterr().err
+    assert "refusing to overwrite" in err and "listener-ca.crt" in err
+    assert {path.name for path in out.rglob("*")} == {"edge-gateway", "listener-ca.crt"}
+    assert not ca_dir.exists()
+    assert (out / "edge-gateway" / "listener-ca.crt").read_bytes() == b"planted"
+
+    other, other_ca = tmp_path / "other", tmp_path / "other-ca"
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.write_bytes(b"operator file")
+    other_ca.mkdir()
+    _plant_symlink(other_ca / "edge-gateway-ca.crt", elsewhere)
+    assert _init(other, other_ca, "--services", STACK) == EXIT_FAILURE
+    assert "refusing to overwrite" in capsys.readouterr().err
+    assert elsewhere.read_bytes() == b"operator file"
+    assert not other.exists()
+
+
+def test_pki_issue_refuses_a_planted_certificate(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    out, ca_dir, host = tmp_path / "pki", tmp_path / "pki-ca", tmp_path / "host"
+    assert _init(out, ca_dir, "--services", STACK) == EXIT_OK
+    host.mkdir()
+    (host / "to-edge-gateway-ca.crt").write_bytes(b"planted")
+    capsys.readouterr()
+    argv = ["pki", "issue", "--listener", "edge-gateway", "--name", "collector-a"]
+    argv += ["--ca-key-dir", str(ca_dir), "--out", str(host)]
+    assert main(argv) == EXIT_FAILURE
+    assert "refusing to overwrite" in capsys.readouterr().err
+    assert _files(host) == {"to-edge-gateway-ca.crt"}
 
 
 @pytest.mark.parametrize(
@@ -227,6 +284,7 @@ def test_custom_lifetime(tmp_path: Path) -> None:
         ["--services", "-edge"],
         ["--ip", "nope"],
         ["--days", "0"],
+        ["--days", "399"],  # the public-CA ceiling for a leaf; spec 14.4 wants 90
         ["--days", "4000"],
         ["--days", "ninety"],
         ["--dns", "bad name"],
@@ -343,7 +401,10 @@ def test_pki_issue_refuses_a_ca_key_that_does_not_match(
     assert "is not the key of" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("argv", [["--name", "bad name"], ["--name", "*.x"], ["--listener", "x"]])
+@pytest.mark.parametrize(
+    "argv",
+    [["--name", "bad name"], ["--name", "*.x"], ["--listener", "x"], ["--days", "399"]],
+)
 def test_pki_issue_bad_options_are_usage_errors(
     tmp_path: Path, argv: list[str], capsys: pytest.CaptureFixture[str]
 ) -> None:

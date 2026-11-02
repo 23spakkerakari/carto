@@ -437,10 +437,12 @@ class EntityPortAdapter:
     """``EntityPort`` over ``EntityRepository``; ``link_ids`` from the links assigned to the
     entity. The version is :func:`updated_at_version` of the row (module docstring).
 
-    The repository offers one write, ``set_name``, which confirms the name it is given; a patch
-    that carries only a description therefore confirms the current display name as well. The
-    route checks ``If-Match`` and the adapter checks the version again before writing, but the
-    write itself is not guarded by the version (``set_name`` takes none).
+    The repository offers one write, ``set_name``: with a name it confirms it (spec 9.6); with
+    ``name=None`` it changes the description alone and leaves ``name`` and ``name_confirmed``
+    as they are, so a description-only patch never confirms the LLM's suggestion under the
+    reviewer's identity (spec 2.3 invariant 5, ADR 0070 section 6). The route checks
+    ``If-Match`` and the adapter checks the version again before writing, but the write itself
+    is not guarded by the version (``set_name`` takes none).
     """
 
     __slots__ = ("_audit", "_entities", "_links")
@@ -498,7 +500,7 @@ class EntityPortAdapter:
             stored = self._entities.set_name(
                 tenant_id,
                 entity_id,
-                name=name if name is not None else (current.display_name or ""),
+                name=name,
                 description=description if description is not None else current.description,
                 now=at,
                 on_write=on_write,

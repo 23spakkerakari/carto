@@ -225,11 +225,25 @@ def exercise_entities(repository: EntityRepository, tenant: str) -> None:
     assert repository.list_entities("other-tenant") == []
 
     later = NOW + timedelta(minutes=5)
+    # A description alone confirms nothing (ADR 0070 section 6): the LLM's suggestion stays a
+    # suggestion and the name column stays empty.
+    described = repository.set_name(tenant, "ent_1", name=None, description="Web orders", now=later)
+    assert described.name is None and not described.name_confirmed
+    assert described.suggested_name == "Order" and described.display_name == "Order"
+    assert described.description == "Web orders" and described.updated_at == later
+    assert repository.get(tenant, "ent_1") == described
+    with pytest.raises(NotFoundError):
+        repository.set_name(tenant, "ent_missing", name=None, description="x", now=later)
+
     named = repository.set_name(tenant, "ent_1", name="Sales order", description=None, now=later)
     assert named.name == "Sales order" and named.name_confirmed
     assert named.suggested_name == "Order"
     assert named.updated_at == later
     assert named.display_name == "Sales order"
+    assert named.description is None, "a name with description=None clears the description"
+    # Once confirmed, a description-only write keeps the confirmation.
+    kept = repository.set_name(tenant, "ent_1", name=None, description="Orders", now=later)
+    assert kept.name == "Sales order" and kept.name_confirmed and kept.description == "Orders"
     with pytest.raises(NotFoundError):
         repository.set_name(tenant, "ent_missing", name="x", description=None, now=later)
 
