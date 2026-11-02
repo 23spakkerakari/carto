@@ -712,9 +712,10 @@ def _counting_miner(store: TemplateStore, system_id: str) -> list[str]:
 
     def counted(message: str) -> dict[str, object]:
         calls.append(message)
-        return original(message)
+        result: dict[str, object] = original(message)
+        return result
 
-    state.miner.add_log_message = counted  # type: ignore[method-assign]
+    state.miner.add_log_message = counted
     return calls
 
 
