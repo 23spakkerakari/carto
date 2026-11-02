@@ -315,43 +315,163 @@ def test_apply_retention_rewrites_an_unreadable_ttl() -> None:
 # --- postgres scripts --------------------------------------------------------------------------
 
 
+def _postgres_revisions() -> list[str]:
+    """The revision ids the ``versions`` files carry, in order: ``0001``, ``0002``, ..."""
+    names = sorted(
+        path.name
+        for path in (POSTGRES_MIGRATIONS_DIR / "versions").glob("[0-9][0-9][0-9][0-9]_*.py")
+    )
+    return [name[:4] for name in names]
+
+
 def test_postgres_scripts_form_one_linear_history() -> None:
+    """Every ``NNNN_*.py`` file is one revision, numbered in rising order, each revising the one
+    before it; a second head (two files revising the same parent) fails here."""
     assert (POSTGRES_MIGRATIONS_DIR / "alembic.ini").is_file()
     assert (POSTGRES_MIGRATIONS_DIR / "env.py").is_file()
     assert (POSTGRES_MIGRATIONS_DIR / "script.py.mako").is_file()
+    expected = _postgres_revisions()
+    assert expected[:4] == ["0001", "0002", "0003", "0004"]
+    # Numbers only rise: 0005 is the M3 demo branch's trace migration, so 0006 (ADR 0071) revises
+    # 0004 on this branch and is re-parented onto 0005 when the two merge.
+    assert expected == sorted(expected) and len(set(expected)) == len(expected)
     config = Config()
     config.set_main_option("script_location", str(POSTGRES_MIGRATIONS_DIR))
     script = ScriptDirectory.from_config(config)
-    assert script.get_heads() == ["0004"]
+    assert script.get_heads() == [expected[-1]]
     revisions = list(script.walk_revisions())
-    assert [revision.revision for revision in revisions] == ["0004", "0003", "0002", "0001"]
+    assert [revision.revision for revision in revisions] == list(reversed(expected))
     assert revisions[-1].down_revision is None
-    assert [revision.down_revision for revision in revisions[:-1]] == ["0003", "0002", "0001"]
+    assert [revision.down_revision for revision in revisions[:-1]] == list(reversed(expected[:-1]))
 
 
-def test_migration_0004_builds_only_fixed_grant_statements() -> None:
-    """Spec 14.7: the guarded GRANT blocks are fixed strings with the fixed role names."""
-    path = POSTGRES_MIGRATIONS_DIR / "versions" / "0004_map_discovery.py"
-    spec = importlib.util.spec_from_file_location("migration_0004", path)
+def _load_migration(name: str) -> Any:
+    path = POSTGRES_MIGRATIONS_DIR / "versions" / name
+    spec = importlib.util.spec_from_file_location(f"migration_{name[:4]}", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    grants = module._grant_statements()
-    assert len(grants) == 3
-    for statement in grants:
+    return module
+
+
+def _assert_guarded_fixed_statements(statements: Sequence[str]) -> None:
+    """Spec 14.7: a ``DO`` block per role, fixed strings, no placeholder of any kind."""
+    for statement in statements:
         assert statement.startswith(
             "DO $$ BEGIN IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = "
         )
         assert statement.endswith(" END IF; END $$;")
-        assert ":" not in statement and "%" not in statement
+        assert ":" not in statement and "%" not in statement and "{" not in statement
+        role = statement.split("rolname = '", 1)[1].split("'", 1)[0]
+        assert role in {"carto_app", "carto_worker", "carto_ingest"}
+
+
+def test_migration_0004_builds_only_fixed_grant_statements() -> None:
+    """Spec 14.7: the guarded GRANT blocks are fixed strings with the fixed role names."""
+    module = _load_migration("0004_map_discovery.py")
+    grants = module._grant_statements()
+    assert len(grants) == 3
+    _assert_guarded_fixed_statements(grants)
     app, worker, ingest = grants
     assert "TO carto_app;" in app and "GRANT SELECT, INSERT ON audit_log TO carto_app;" in app
     assert "TO carto_worker;" in worker
-    assert "UPDATE, DELETE" not in ingest and "audit_log" not in ingest
+    # 0004 grants carto_ingest no DELETE at all; 0006 adds it on ingest_batches alone (ADR 0071).
+    assert "DELETE" not in ingest and "audit_log" not in ingest
     assert "GRANT SELECT, INSERT, UPDATE ON templates, fields, systems, sources" in ingest
     assert len(module._revoke_statements()) == 3
     assert "RAISE EXCEPTION" in module.AUDIT_TRIGGER_FUNCTION
     assert "BEFORE UPDATE OR DELETE ON audit_log" in module.AUDIT_TRIGGER_ROWS
+
+
+MIGRATION_0006 = "0006_grants_for_ledger_worker_and_llm_calls.py"
+
+
+def test_migration_0006_grants_the_ledger_role_delete_on_the_ledger_only() -> None:
+    """ADR 0071 (plan M9): release and prune are ``DELETE FROM ingest_batches``, so the grant
+    follows the code, on that table and nowhere else; audit_log stays out of reach."""
+    module = _load_migration(MIGRATION_0006)
+    assert module.revision == "0006" and module.down_revision == "0004"
+    grants = module._grant_statements()
+    _assert_guarded_fixed_statements(grants)
+    ingest = [s for s in grants if "rolname = 'carto_ingest'" in s]
+    assert len(ingest) == 1
+    (statement,) = ingest
+    assert "GRANT DELETE ON ingest_batches TO carto_ingest;" in statement
+    assert statement.count("GRANT") == 1 and statement.count("DELETE") == 1
+    for table in ("templates", "fields", "systems", "sources", "audit_log", "llm_calls"):
+        assert table not in statement, table
+    revokes = [s for s in module._revoke_statements() if "rolname = 'carto_ingest'" in s]
+    assert revokes == [
+        module._guarded("carto_ingest", ["REVOKE DELETE ON ingest_batches FROM carto_ingest;"])
+    ]
+
+
+def test_migration_0006_takes_the_identity_tables_from_the_worker() -> None:
+    """ADR 0071 (plan M11): the worker has no business with users, groups, role bindings or
+    sessions; it keeps ``settings`` (thresholds, ADR 0055; the profiler watermark)."""
+    module = _load_migration(MIGRATION_0006)
+    base = _load_migration("0004_map_discovery.py")
+    assert set(module.IDENTITY_TABLES) == {"users", "groups", "role_bindings", "sessions"}
+    assert set(module.IDENTITY_TABLES) <= set(base.APP_TABLES)
+    grants = module._grant_statements()
+    worker = [s for s in grants if "rolname = 'carto_worker'" in s]
+    assert len(worker) == 1
+    (statement,) = worker
+    assert "REVOKE ALL ON users, groups, role_bindings, sessions FROM carto_worker;" in statement
+    assert "settings" not in statement and "jobs" not in statement
+    app = [s for s in grants if "rolname = 'carto_app'" in s]
+    assert len(app) == 1
+    assert "users" not in app[0] and "sessions" not in app[0], "the api keeps its identity tables"
+    down = [s for s in module._revoke_statements() if "rolname = 'carto_worker'" in s]
+    assert len(down) == 1
+    assert (
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON users, groups, role_bindings, sessions "
+        "TO carto_worker;"
+    ) in down[0]
+
+
+def test_migration_0006_makes_llm_calls_append_only() -> None:
+    """ADR 0071 (plan M11, spec 9.9): the LLM call audit is ``SELECT, INSERT`` for both console
+    roles and a trigger pair refuses UPDATE, DELETE and TRUNCATE for everyone, as audit_log."""
+    module = _load_migration(MIGRATION_0006)
+    grants = module._grant_statements()
+    for role in ("carto_app", "carto_worker"):
+        (statement,) = [s for s in grants if f"rolname = '{role}'" in s]
+        assert (
+            f"REVOKE ALL ON llm_calls FROM {role}; GRANT SELECT, INSERT ON llm_calls TO {role};"
+            in (statement)
+        )
+        (down,) = [s for s in module._revoke_statements() if f"rolname = '{role}'" in s]
+        assert f"GRANT SELECT, INSERT, UPDATE, DELETE ON llm_calls TO {role};" in down
+    assert "RAISE EXCEPTION 'llm_calls is append-only (spec 9.9)'" in module.LLM_TRIGGER_FUNCTION
+    assert "ERRCODE = 'insufficient_privilege'" in module.LLM_TRIGGER_FUNCTION
+    assert module.LLM_TRIGGER_ROWS.startswith(
+        "CREATE TRIGGER llm_calls_no_update_delete BEFORE UPDATE OR DELETE ON llm_calls "
+    )
+    assert module.LLM_TRIGGER_TRUNCATE.startswith(
+        "CREATE TRIGGER llm_calls_no_truncate BEFORE TRUNCATE ON llm_calls "
+    )
+    for statement in (module.LLM_TRIGGER_ROWS, module.LLM_TRIGGER_TRUNCATE):
+        assert statement.endswith("EXECUTE FUNCTION llm_calls_append_only();")
+    assert module.LLM_TRIGGER_DROPS == (
+        "DROP TRIGGER IF EXISTS llm_calls_no_truncate ON llm_calls;",
+        "DROP TRIGGER IF EXISTS llm_calls_no_update_delete ON llm_calls;",
+        "DROP FUNCTION IF EXISTS llm_calls_append_only();",
+    )
+
+
+def test_migration_0006_statement_lists_are_symmetric() -> None:
+    """Three roles, one guarded block each way; the downgrade names every table the upgrade
+    touched and nothing else."""
+    module = _load_migration(MIGRATION_0006)
+    grants, revokes = module._grant_statements(), module._revoke_statements()
+    assert len(grants) == 3 and len(revokes) == 3
+    _assert_guarded_fixed_statements(revokes)
+    tables = {"ingest_batches", "llm_calls", "users", "groups", "role_bindings", "sessions"}
+    for statement in (*grants, *revokes):
+        words = set(re.findall(r"[a-z_]+", statement))
+        assert words & tables, statement
+        assert not words & {"templates", "fields", "systems", "sources", "audit_log", "settings"}
 
 
 def test_clickhouse_migrations_dir_is_the_repository_layout_of_section_20() -> None:

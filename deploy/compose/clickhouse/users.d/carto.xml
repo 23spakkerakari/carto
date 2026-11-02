@@ -1,10 +1,38 @@
-<!-- ClickHouse profile for the pilot stack (spec 14.4 per-service users; the INSERT-only
-     carto_ingest user is created by `carto-core migrate` in M6 with the other service users). -->
+<!-- ClickHouse profiles and users of the pilot stack (spec 14.4 per-service users; ADR 0071).
+
+     The owner `carto` is written by the image's entrypoint from CLICKHOUSE_USER and
+     CLICKHOUSE_PASSWORD_FILE (users.d/default-user.xml, profile `default`); `migrate` and
+     `ingest-api` and `worker` (which writes the trace tables from M3) connect as it.
+     `carto_reader` is the read-only user of `api`, which only ever SELECTs: profile `readonly` refuses every write and DDL (and, with
+     readonly = 1, any change of a query setting; the stores pass none). Its password comes from
+     the CARTO_CH_READER_PASSWORD environment variable, which the clickhouse service's entrypoint
+     wrapper in compose.yaml reads from the ch_reader_password secret file: a users.d file cannot
+     read a file itself, and the owner has no access management, so no init SQL can create the
+     user. Both users accept any client address, like the owner the entrypoint writes: the `core`
+     Docker network, internal to the host, is the only way to reach this server (spec 14.5).
+     The INSERT-only `carto_ingest`, a worker user with INSERT and SELECT on its own tables
+     and the other users `carto-core migrate` will create remain M6 (ADR 0071). -->
 <clickhouse>
   <profiles>
     <default>
       <max_memory_usage>4000000000</max_memory_usage>
       <max_execution_time>60</max_execution_time>
     </default>
+    <readonly>
+      <readonly>1</readonly>
+      <max_memory_usage>4000000000</max_memory_usage>
+      <max_execution_time>60</max_execution_time>
+    </readonly>
   </profiles>
+  <users>
+    <carto_reader>
+      <profile>readonly</profile>
+      <password from_env="CARTO_CH_READER_PASSWORD"/>
+      <networks>
+        <ip>::/0</ip>
+      </networks>
+      <quota>default</quota>
+      <access_management>0</access_management>
+    </carto_reader>
+  </users>
 </clickhouse>

@@ -3,8 +3,9 @@ PostgreSQL, a retention change rewrites the TTLs, a batch posted to the app land
 ``events`` and ``event_identifiers`` with its ledger row, a duplicate is skipped, the ledger's
 claims work on PostgreSQL and the replacing tables merge a second copy (ADR 0034), a batch over
 many days is inserted in day groups (ADR 0036), a heartbeat upserts, a bundle loads
-idempotently, and a bundle the offline analyzer builds from scenario A loads into core with no
-marker in the stored rows (spec 21, M1 acceptance; spec 18.3). Skipped when Docker is
+idempotently, a bundle the offline analyzer builds from scenario A loads into core with no
+marker in the stored rows (spec 21, M1 acceptance; spec 18.3), and the per-service roles hold
+exactly the grants of migrations 0004 and 0006 (ADR 0071). Skipped when Docker is
 unreachable."""
 
 from __future__ import annotations
@@ -24,7 +25,9 @@ import docker  # type: ignore[import-untyped]
 import pytest
 import sqlalchemy
 import zstandard
+from alembic.script import ScriptDirectory
 from clickhouse_connect.driver.client import Client
+from sqlalchemy.exc import DBAPIError
 from testcontainers.community.clickhouse import ClickHouseContainer
 from testcontainers.community.postgres import PostgresContainer
 from testcontainers.core.config import testcontainers_config
@@ -38,9 +41,10 @@ from carto_core.db.clickhouse import ClickHouseWriter, create_client
 from carto_core.db.postgres import create_engine_from_settings
 from carto_core.ingest.app import create_app
 from carto_core.ingest.health import PostgresSourceHealthStore, SourceHealthRecord
-from carto_core.ingest.ledger import ClaimState, LedgerEntry, PostgresBatchLedger
+from carto_core.ingest.ledger import ClaimState, LedgerEntry, LedgerError, PostgresBatchLedger
 from carto_core.migrations import (
     MIGRATION_LOCK_KEY,
+    alembic_config,
     apply_clickhouse_migrations,
     apply_postgres_migrations,
     apply_retention,
@@ -79,6 +83,8 @@ POSTGRES_IMAGE = os.environ.get("CARTO_TEST_POSTGRES_IMAGE", "postgres:16-alpine
 DB_USER = "carto_test"
 DB_PASSWORD = "carto_test"  # noqa: S105 - throwaway container credential
 DB_NAME = "carto_test"
+SERVICE_ROLES = ("carto_ingest", "carto_app", "carto_worker")
+"""The per-service roles of spec 14.4 (``deploy/compose/postgres/init-roles.sh``)."""
 JSON = {"content-type": "application/json"}
 BUNDLE_ID = "01K71Y5B2XQ0M4N8P3R6S9T1VX"
 BASE_MS = 1_790_000_000_000
@@ -143,7 +149,7 @@ def postgres(tmp_path_factory: pytest.TempPathFactory) -> Iterator[PostgresSetti
     with PostgresContainer(
         POSTGRES_IMAGE, username=DB_USER, password=DB_PASSWORD, dbname=DB_NAME, driver=None
     ) as container:
-        yield PostgresSettings(
+        settings = PostgresSettings(
             host=container.get_container_host_ip(),
             port=int(container.get_exposed_port(5432)),
             database=DB_NAME,
@@ -151,6 +157,28 @@ def postgres(tmp_path_factory: pytest.TempPathFactory) -> Iterator[PostgresSetti
             password_file=password_file,
             sslmode="disable",
         )
+        _create_service_roles(settings)
+        yield settings
+
+
+def _create_service_roles(owner: PostgresSettings) -> None:
+    """What ``deploy/compose/postgres/init-roles.sh`` does before the first migrate: the three
+    per-service roles exist, so the guarded grants of migrations 0004 and 0006 apply. One
+    throwaway password for all of them; the statements are fixed strings."""
+    engine = create_engine_from_settings(owner)
+    try:
+        with engine.begin() as connection:
+            for role in SERVICE_ROLES:
+                connection.execute(
+                    sqlalchemy.text(f"CREATE ROLE {role} LOGIN PASSWORD '{DB_PASSWORD}'")
+                )
+    finally:
+        engine.dispose()
+
+
+def _as_role(owner: PostgresSettings, role: str) -> sqlalchemy.Engine:
+    """An engine connected as one of the service roles (same throwaway password)."""
+    return create_engine_from_settings(owner.model_copy(update={"user": role}))
 
 
 @pytest.fixture(scope="module")
@@ -319,7 +347,7 @@ def test_postgres_migrations_apply_idempotently(postgres: PostgresSettings) -> N
             version = connection.execute(
                 sqlalchemy.text("SELECT version_num FROM alembic_version")
             ).scalar_one()
-        assert version == "0004"
+        assert version == ScriptDirectory.from_config(alembic_config()).get_current_head()
         health_columns = {column["name"] for column in inspector.get_columns("source_health")}
         assert "sent_at" in health_columns
         source_columns = {column["name"] for column in inspector.get_columns("sources")}
@@ -660,3 +688,114 @@ def test_scenario_a_bundle_from_the_analyzer_loads_into_core(
     assert len(markers) > 0
     hits = leak_scan.scan_rows(rows, markers)
     assert not hits, f"markers in the ClickHouse rows: {dict(hits)}"
+
+
+def test_the_ingest_role_releases_and_prunes_its_ledger_and_nothing_else(
+    migrated: tuple[Client, sqlalchemy.Engine], postgres: PostgresSettings
+) -> None:
+    """ADR 0071 (plan M9): connected as ``carto_ingest`` (as ingest-api is in the pilot stack),
+    the ledger's DELETE-based ``release`` and ``prune`` succeed; the role still cannot delete
+    metadata or read the audit log. On 0004's grants alone ``release`` raised ``LedgerError``."""
+    _client, owner = migrated
+    engine = _as_role(postgres, "carto_ingest")
+    try:
+        ledger = PostgresBatchLedger(engine)
+        # Received long ago, so the prune cutoff below catches this row and no other test's.
+        t0 = datetime(2001, 1, 1, 12, 0, tzinfo=UTC)
+        timeout = timedelta(seconds=120)
+        batch_id = new_ulid()
+        entry = LedgerEntry("default", batch_id, "src_ledger_role", 2, t0)
+        first = ledger.claim(entry, t0 - timeout)
+        assert first.state is ClaimState.CLAIMED
+        try:
+            ledger.release("default", batch_id, first.claimed_at)
+        except LedgerError as exc:  # pragma: no cover - the failure this test exists for
+            pytest.fail(f"carto_ingest cannot release its own claim: {exc}")
+        again = ledger.claim(entry, t0 - timeout)
+        assert (again.state, again.took_over) == (ClaimState.CLAIMED, False), "released"
+        ledger.complete(entry, t0)
+        assert ledger.prune(t0 + timedelta(seconds=1)) == 1
+        with owner.connect() as connection:
+            left = connection.execute(
+                sqlalchemy.text("SELECT count(*) FROM ingest_batches WHERE batch_id = :batch_id"),
+                {"batch_id": batch_id},
+            ).scalar_one()
+        assert left == 0
+        for statement in (
+            "DELETE FROM templates",
+            "DELETE FROM fields",
+            "DELETE FROM systems",
+            "DELETE FROM sources",
+            "SELECT count(*) FROM audit_log",
+            "SELECT count(*) FROM llm_calls",
+            "SELECT count(*) FROM sessions",
+        ):
+            with pytest.raises(DBAPIError) as info, engine.begin() as connection:
+                connection.execute(sqlalchemy.text(statement))
+            assert "permission denied" in str(info.value), statement
+    finally:
+        engine.dispose()
+
+
+def test_the_worker_role_has_no_identity_tables_and_llm_calls_is_append_only(
+    migrated: tuple[Client, sqlalchemy.Engine], postgres: PostgresSettings
+) -> None:
+    """ADR 0071 (plan M11): ``carto_worker`` reads ``settings`` but none of the identity
+    tables; both console roles can only insert into and read ``llm_calls``, and the trigger
+    pair stops the owner too (spec 9.9, like audit_log under spec 14.9)."""
+    _client, owner = migrated
+    worker = _as_role(postgres, "carto_worker")
+    app = _as_role(postgres, "carto_app")
+    try:
+        with worker.connect() as connection:
+            assert (
+                connection.execute(sqlalchemy.text("SELECT count(*) FROM settings")).scalar_one()
+                >= 0
+            )
+        for table in ("users", "groups", "role_bindings", "sessions"):
+            with pytest.raises(DBAPIError) as info, worker.begin() as connection:
+                connection.execute(sqlalchemy.text(f"SELECT count(*) FROM {table}"))  # noqa: S608 - fixed table names
+            assert "permission denied" in str(info.value), table
+        with app.connect() as connection:
+            assert (
+                connection.execute(sqlalchemy.text("SELECT count(*) FROM users")).scalar_one() >= 0
+            )
+        call_id = new_ulid()
+        insert = sqlalchemy.text(
+            "INSERT INTO llm_calls (id, tenant_id, at, task, payload_sha256, provider, model, "
+            "latency_ms, status) VALUES (:id, 'default', :at, 'label_fields', :sha, 'fake', "
+            "'fake-1', 12, 'ok')"
+        )
+        with app.begin() as connection:
+            connection.execute(insert, {"id": call_id, "at": RECENT, "sha": "a" * 64})
+        with worker.connect() as connection:
+            status = connection.execute(
+                sqlalchemy.text("SELECT status FROM llm_calls WHERE id = :id"), {"id": call_id}
+            ).scalar_one()
+        assert status == "ok"
+        for role_engine in (app, worker):
+            for statement in (
+                "UPDATE llm_calls SET status = 'edited' WHERE id = :id",
+                "DELETE FROM llm_calls WHERE id = :id",
+            ):
+                with pytest.raises(DBAPIError) as info, role_engine.begin() as connection:
+                    connection.execute(sqlalchemy.text(statement), {"id": call_id})
+                assert "permission denied" in str(info.value), statement
+        for statement in (
+            "UPDATE llm_calls SET status = 'edited' WHERE id = :id",
+            "DELETE FROM llm_calls WHERE id = :id",
+        ):
+            with pytest.raises(DBAPIError) as info, owner.begin() as connection:
+                connection.execute(sqlalchemy.text(statement), {"id": call_id})
+            assert "append-only" in str(info.value), statement
+        with pytest.raises(DBAPIError) as info, owner.begin() as connection:
+            connection.execute(sqlalchemy.text("TRUNCATE llm_calls"))
+        assert "append-only" in str(info.value)
+        with owner.connect() as connection:
+            kept = connection.execute(
+                sqlalchemy.text("SELECT status FROM llm_calls WHERE id = :id"), {"id": call_id}
+            ).scalar_one()
+        assert kept == "ok"
+    finally:
+        worker.dispose()
+        app.dispose()

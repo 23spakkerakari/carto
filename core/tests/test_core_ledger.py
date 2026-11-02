@@ -135,3 +135,30 @@ def test_the_pruner_starts_once_and_stops(starts: int) -> None:
         pruner.start()
     pruner.stop(timeout=5)
     assert pruner._thread is not None and not pruner._thread.is_alive()
+
+
+def test_the_postgres_ledger_statements_are_the_shapes_migration_0006_grants() -> None:
+    """ADR 0071: ``carto_ingest`` holds SELECT, INSERT, UPDATE (0004) and DELETE (0006) on
+    ``ingest_batches`` because the ledger is written exactly this way; a statement that
+    changes shape here changes the grant, so the shapes are pinned."""
+    from carto_core.ingest import ledger as module  # noqa: PLC0415 - private statement text
+
+    assert module._RELEASE.text.startswith("DELETE FROM ingest_batches ")
+    assert module._PRUNE.text.startswith("DELETE FROM ingest_batches WHERE ctid IN (")
+    assert "SELECT ctid FROM ingest_batches" in module._PRUNE.text
+    assert module._CLAIM.text.startswith("INSERT INTO ingest_batches ")
+    assert "ON CONFLICT (tenant_id, batch_id) DO UPDATE" in module._CLAIM.text
+    assert module._COMPLETE.text.startswith("INSERT INTO ingest_batches ")
+    assert "ON CONFLICT (tenant_id, batch_id) DO UPDATE" in module._COMPLETE.text
+    assert module._STATE.text.startswith("SELECT state, claimed_at FROM ingest_batches ")
+    for statement in (
+        module._CLAIM,
+        module._STATE,
+        module._COMPLETE,
+        module._RELEASE,
+        module._PRUNE,
+    ):
+        text = statement.text
+        assert "ingest_batches" in text
+        for other in ("templates", "fields", "systems", "sources", "audit_log", "llm_calls"):
+            assert other not in text, (other, text)
