@@ -63,6 +63,11 @@ import, lint or test it.
   The thirteen founder questions were answered on 2026-11-01 with the plan's recommendations
   (recorded under the questions; spec 8.4, 9.5, 9.7, 9.8, 12, 14.2, 14.9 edited). Code waits
   on the M2 acceptance and the `fix-c2` rebase. ADRs from 0060 when code starts.
+- M3 demo cut: branch `m3-demo` cut 2026-11-02 from `m3-trace-spec` at e12b626
+  (docs/plans/M3-demo.md): the subset of M3 a demo video needs (assembler, graph rollup, map
+  and trace screens, tokenize-for-search, a manual-hop preview badge); reveal, batches, skew,
+  composite merge keys, load tests and scenario C stay in M3 proper. ADRs 0060 to 0066
+  as listed in the plan. Its PR targets `m3-trace-spec`.
 - Spec direction 2026-10-21 on branch `spec-data-layer` (ADR 0059, proposed): hosted data layer,
   business rules and hosted deployment as v2 (spec 22.2 to 22.4); partial failures, stale data
   and missed events into M4 (spec 10.1, 10.2); partner questions 9 to 25 in spec 23 open.
