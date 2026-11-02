@@ -339,6 +339,15 @@ class CoreLinkSettings(_Frozen):
     retry_max_seconds: float = Field(
         default=60.0, ge=1, le=3600, description="Cap of the forwarder's exponential backoff."
     )
+    parked_max_age_days: int = Field(
+        default=7,
+        ge=1,
+        le=365,
+        description=(
+            "Batches core refused for good (parked) are deleted from the disk buffer after "
+            "this many days (ADR 0073), so a persistent refusal cannot fill it."
+        ),
+    )
 
     @field_validator("url")
     @classmethod

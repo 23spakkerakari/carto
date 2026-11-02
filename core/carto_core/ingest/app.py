@@ -5,16 +5,20 @@ Endpoints, all internal (mutual TLS, never behind the ingress; see :mod:`.server
 - ``POST /internal/ingest``: one :class:`~carto_schema.ingest.IngestBatch` as JSON, optionally
   ``Content-Encoding: zstd``. The body is capped on the wire and after decompression (spec 2.3
   invariant 8); a zstd body is exactly one frame whose window is at most
-  :data:`ZSTD_MAX_WINDOW_BYTES`, and decompression and validation run in the threadpool, never
-  on the event loop. At most ``ingest.max_inflight_batches`` requests are decoded or written at
-  once; the next is answered 429 with ``Retry-After``. Only the contract models are accepted,
-  so a raw value cannot arrive in a slot the schema does not have (spec 2.3 invariant 2). An
-  event whose ``observed_at`` lies outside the plausible range (ADR 0036) refuses the batch
-  with 422, so the edge parks it. Then the batch is claimed in the ledger (ADR 0034): a batch
-  already written is acknowledged as a duplicate, one another delivery is writing is a 503, and
-  otherwise the batch is written and marked done. A transient write failure releases the claim
-  and is a 503 so the edge retries; ClickHouse refusing the data itself is a 422. Every 503
-  carries ``Retry-After``.
+  :data:`ZSTD_MAX_WINDOW_BYTES` and whose output is at most ``ingest.max_decompression_ratio``
+  times its wire length (ADR 0073), and decompression and validation run in the threadpool,
+  never on the event loop. At most ``ingest.max_inflight_batches`` requests are decoded or
+  written at once; the next is answered 429 with ``Retry-After``. A body that has not fully
+  arrived within ``ingest.body_timeout_seconds`` is answered 408 and its slot released (ADR
+  0073). Only the contract models are accepted, so a raw value cannot arrive in a slot the
+  schema does not have (spec 2.3 invariant 2). An event whose ``observed_at`` or ``ingested_at``
+  lies outside the plausible range (ADR 0036, 0073) refuses the batch with 422, so the edge
+  parks it; so does a batch that would push a system past ``ingest.max_templates_per_system``
+  (ADR 0073). Then the batch is claimed in the ledger (ADR 0034): a batch already written is
+  acknowledged as a duplicate, one another delivery is writing is a 503, and otherwise the
+  batch is written and marked done. A transient write failure releases the claim and is a 503
+  so the edge retries; ClickHouse refusing the data itself is a 422. Every 503 carries
+  ``Retry-After``.
   Before the ledger's ``done`` mark the batch's distinct templates are upserted into
   ``templates`` (text, kind, first and last seen, count added) inside the same transaction
   (ADR 0056), so a retried batch never double-counts.
@@ -23,8 +27,10 @@ Endpoints, all internal (mutual TLS, never behind the ingress; see :mod:`.server
 - ``POST /internal/inventory``: one :class:`~carto_schema.inventory.EdgeInventory` (ADR 0050),
   validated against the contract (a tenant this core does not serve is a 422) and replaced as a
   whole in the metadata store: systems, sources without secrets, the payload and the field
-  policy pins.
-- ``GET /healthz``, ``GET /readyz`` (no detail in the body), ``GET /metrics`` (Prometheus text).
+  policy pins. An edge id the tenant has not recorded yet is refused with 422 once the tenant
+  holds ``ingest.max_edges_per_tenant`` edges (ADR 0073).
+- ``GET /healthz``, ``GET /readyz`` (no detail in the body; 503 once every in-flight slot has
+  been held longer than the body timeout), ``GET /metrics`` (Prometheus text).
 
 Errors are RFC 7807 problem documents (``application/problem+json``) that carry locations and
 messages but never the rejected input. Every response carries ``X-Request-Id`` (echoed when the
@@ -35,13 +41,13 @@ ids and counts.
 
 from __future__ import annotations
 
-import io
+import asyncio
 import re
 import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any, Final, Literal
 
 import structlog.contextvars
 import zstandard
@@ -60,7 +66,12 @@ from carto_common.mtls import ANY_ROLE, peer_role, role_allowed
 from carto_core.db.clickhouse import WriterError
 from carto_core.ingest.health import HealthStoreError, SourceHealthRecord
 from carto_core.ingest.ledger import ClaimState, LedgerEntry, LedgerError
-from carto_core.metadata import InMemoryMetadataStore, MetadataError, TemplateRecord
+from carto_core.metadata import (
+    InMemoryMetadataStore,
+    MetadataError,
+    MetadataLimitError,
+    TemplateRecord,
+)
 from carto_schema.ingest import IngestBatch, SourceHeartbeat
 from carto_schema.inventory import EdgeInventory
 
@@ -81,6 +92,7 @@ __all__ = [
     "REQUEST_ID_HEADER",
     "ROUTE_ROLES",
     "ZSTD_MAX_WINDOW_BYTES",
+    "InflightSlots",
     "IngestMetrics",
     "Problem",
     "RequestIdMiddleware",
@@ -110,7 +122,8 @@ honours it on a 429, capped, and backs off on its own after a 503."""
 BUSY_RETRY_AFTER_SECONDS: Final = 5
 """``Retry-After`` on the 503 for a batch another delivery is still writing (ADR 0034)."""
 MAX_RANGE_ERRORS: Final = 20
-"""Out-of-range events listed in one 422; the rest are counted in its detail."""
+"""Out-of-range event times listed in one 422; the rest are counted in its detail."""
+TimeColumn = Literal["observed_at", "ingested_at"]
 
 METRIC_NAMES: Final[tuple[tuple[str, str], ...]] = (
     ("carto_ingest_batches_total", "Batches accepted and written to ClickHouse."),
@@ -120,11 +133,23 @@ METRIC_NAMES: Final[tuple[tuple[str, str], ...]] = (
     ("carto_heartbeats_total", "Source heartbeats recorded."),
     ("carto_ingest_mtls_refused_total", "Requests refused for the client certificate's role."),
     ("carto_ingest_busy_total", "Requests answered 429 because too many were in flight."),
+    ("carto_ingest_body_timeout_total", "Requests answered 408: the body did not arrive in time."),
     ("carto_ingest_claims_busy_total", "Batches answered 503 because another delivery held them."),
     ("carto_ingest_claims_taken_over_total", "Stale ledger claims taken over and rewritten."),
-    ("carto_ingest_out_of_range_total", "Batches refused for an observed_at out of range."),
+    (
+        "carto_ingest_out_of_range_total",
+        "Batches refused for an observed_at or ingested_at out of range.",
+    ),
     ("carto_ingest_refused_total", "Batches refused because ClickHouse rejected their data."),
+    (
+        "carto_ingest_templates_refused_total",
+        "Batches refused because a system would exceed its template ceiling.",
+    ),
     ("carto_inventories_total", "Edge inventories recorded."),
+    (
+        "carto_ingest_edges_refused_total",
+        "Inventories refused because the tenant is at its edge ceiling.",
+    ),
 )
 ROUTE_ROLES: Final[dict[tuple[str, str], frozenset[str]]] = {
     ("POST", "/internal/ingest"): frozenset({"edge-gateway"}),
@@ -185,6 +210,52 @@ class IngestMetrics:
         return "\n".join(lines) + "\n"
 
 
+class InflightSlots:
+    """The in-flight bound of ADR 0043 section 2, with the time each slot was taken (ADR 0073).
+    A slot is only ever tried, never waited on, so this stays correct whichever event loop or
+    thread serves the request. :meth:`all_held_longer_than` is what ``/readyz`` asks: every
+    slot taken, and none of them younger than the body timeout, means the listener is wedged."""
+
+    __slots__ = ("_capacity", "_held", "_lock", "_next")
+
+    def __init__(self, capacity: int) -> None:
+        if capacity < 1:
+            msg = "capacity must be at least 1"
+            raise ValueError(msg)
+        self._capacity = capacity
+        self._lock = threading.Lock()
+        self._held: dict[int, datetime] = {}
+        self._next = 0
+
+    @property
+    def capacity(self) -> int:
+        return self._capacity
+
+    def held(self) -> int:
+        with self._lock:
+            return len(self._held)
+
+    def acquire(self, at: datetime) -> int | None:
+        """Take a slot at ``at``; the token to release it with, or ``None`` when all are taken."""
+        with self._lock:
+            if len(self._held) >= self._capacity:
+                return None
+            token = self._next
+            self._next += 1
+            self._held[token] = at
+            return token
+
+    def release(self, token: int) -> None:
+        with self._lock:
+            self._held.pop(token, None)
+
+    def all_held_longer_than(self, now: datetime, age: timedelta) -> bool:
+        with self._lock:
+            if len(self._held) < self._capacity:
+                return False
+            return all(now - taken > age for taken in self._held.values())
+
+
 class RequestIdMiddleware:
     """Echo a well-formed ``X-Request-Id`` or generate a ULID; bind it to the log context."""
 
@@ -211,7 +282,7 @@ class RequestIdMiddleware:
             structlog.contextvars.reset_contextvars(**tokens)
 
 
-def _zstd_frame_size(data: bytes) -> int:
+def _zstd_frame_size(data: bytes | bytearray) -> int:
     """The compressed size of the zstd frame at the start of ``data``, read from its block
     headers (RFC 8878 section 3.1.1). Raises :class:`zstandard.ZstdError` or ``ValueError`` on
     anything that is not a well-formed frame (a skippable frame included)."""
@@ -240,20 +311,23 @@ def _zstd_frame_size(data: bytes) -> int:
     return position
 
 
-def decompress_capped(data: bytes, limit: int) -> bytes:
+def decompress_capped(data: bytes | bytearray, limit: int, *, max_ratio: int) -> bytearray:
     """zstd-decompress ``data``: exactly one frame, a window of at most
-    :data:`ZSTD_MAX_WINDOW_BYTES`, at most ``limit`` bytes out. Anything after the frame (a
-    second frame, a skippable frame, stray bytes) and any malformed frame is a 400; a result
-    above ``limit`` is a 413."""
+    :data:`ZSTD_MAX_WINDOW_BYTES`, at most ``limit`` bytes out and at most ``max_ratio`` times
+    the whole wire length (ADR 0073), checked as each chunk comes out. Anything after the frame
+    (a second frame, a skippable frame, stray bytes) and any malformed frame is a 400; a result
+    past either cap is a 413. The input is read in place (the buffer protocol, no copy) and the
+    output is the one buffer it was decoded into, so a slot holds each body once."""
     try:
         if _zstd_frame_size(data) != len(data):
             raise Problem(400, "bad request", "a zstd body must be exactly one frame")
     except (zstandard.ZstdError, ValueError) as exc:
         raise Problem(400, "bad request", "malformed zstd body") from exc
+    ratio_cap = len(data) * max_ratio
     out = bytearray()
     decompressor = zstandard.ZstdDecompressor(max_window_size=ZSTD_MAX_WINDOW_BYTES)
     try:
-        with decompressor.stream_reader(io.BytesIO(data), read_across_frames=False) as reader:
+        with decompressor.stream_reader(data, read_across_frames=False) as reader:
             while True:
                 chunk = reader.read(_DECOMPRESS_CHUNK)
                 if not chunk:
@@ -261,30 +335,38 @@ def decompress_capped(data: bytes, limit: int) -> bytes:
                 out += chunk
                 if len(out) > limit:
                     raise Problem(413, "payload too large", "decompressed body exceeds the cap")
+                if len(out) > ratio_cap:
+                    raise Problem(
+                        413,
+                        "payload too large",
+                        "decompressed body exceeds the decompression ratio cap",
+                    )
     except zstandard.ZstdError as exc:
         raise Problem(400, "bad request", "malformed zstd body") from exc
-    return bytes(out)
+    return out
 
 
 def out_of_range_errors(
-    batch: IngestBatch, lower: datetime, upper: datetime
+    batch: IngestBatch, lower: datetime, upper: datetime, *, column: TimeColumn = "observed_at"
 ) -> tuple[list[dict[str, Any]], int]:
-    """The problem entries of the events whose ``observed_at`` lies outside ``[lower, upper]``
-    (ADR 0036), at most :data:`MAX_RANGE_ERRORS`, and how many there are. An entry names the
-    event's position and whether it is too old or in the future, never its time."""
+    """The problem entries of the events whose ``column`` (``observed_at``, ADR 0036, or
+    ``ingested_at``, ADR 0073) lies outside ``[lower, upper]``, at most
+    :data:`MAX_RANGE_ERRORS`, and how many there are. An entry names the event's position and
+    whether it is too old or in the future, never its time."""
     errors: list[dict[str, Any]] = []
     count = 0
     for index, event in enumerate(batch.events):
-        if lower <= event.observed_at <= upper:
+        value = event.observed_at if column == "observed_at" else event.ingested_at
+        if lower <= value <= upper:
             continue
         count += 1
         if len(errors) < MAX_RANGE_ERRORS:
-            reason = "too_old" if event.observed_at < lower else "future"
+            reason = "too_old" if value < lower else "future"
             errors.append(
                 {
-                    "loc": ["events", index, "observed_at"],
-                    "msg": "observed_at is outside the plausible range",
-                    "type": f"observed_at_{reason}",
+                    "loc": ["events", index, column],
+                    "msg": f"{column} is outside the plausible range",
+                    "type": f"{column}_{reason}",
                 }
             )
     return errors, count
@@ -352,22 +434,26 @@ def _validation_problem(exc: ValidationError) -> Problem:
     return Problem(422, "request body failed validation", "see errors", errors=errors)
 
 
-def _parse[T: BaseModel](model: type[T], data: bytes) -> T:
+def _parse[T: BaseModel](model: type[T], data: bytes | bytearray) -> T:
     try:
         return model.model_validate_json(data)
     except ValidationError as exc:
         raise _validation_problem(exc) from None
 
 
-def _decode[T: BaseModel](model: type[T], data: bytes, zstd: bool, limit: int) -> T:
-    """Decompress (when ``zstd``) and validate: CPU-bound, so it runs in the threadpool."""
+def _decode[T: BaseModel](
+    model: type[T], data: bytes | bytearray, zstd: bool, limit: int, max_ratio: int
+) -> T:
+    """Decompress (when ``zstd``) and validate: CPU-bound, so it runs in the threadpool. The
+    wire buffer is dropped as soon as the decompressed one exists."""
     if zstd:
-        data = decompress_capped(data, limit)
+        data = decompress_capped(data, limit, max_ratio=max_ratio)
     return _parse(model, data)
 
 
-async def _read_body(request: Request, listener: IngestListenerSettings) -> tuple[bytes, bool]:
-    """Read a body capped on the wire; return it with whether it is zstd-compressed."""
+async def _read_body(request: Request, listener: IngestListenerSettings) -> tuple[bytearray, bool]:
+    """Read a body capped on the wire; return the one buffer it was read into (no copy, ADR
+    0073) with whether it is zstd-compressed. The caller bounds how long this may take."""
     media_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
     if media_type and media_type != _JSON_MEDIA_TYPE:
         raise Problem(415, "unsupported media type", f"send {_JSON_MEDIA_TYPE}")
@@ -389,7 +475,7 @@ async def _read_body(request: Request, listener: IngestListenerSettings) -> tupl
             raise Problem(413, "payload too large", "body exceeds the wire cap")
     if not buffer:
         raise Problem(400, "bad request", "empty body")
-    return bytes(buffer), encoding == "zstd"
+    return buffer, encoding == "zstd"
 
 
 def create_app(
@@ -413,6 +499,7 @@ def create_app(
     tenant_id = settings.tenant_id
     retention = settings.retention
     claim_timeout = timedelta(seconds=listener.claim_timeout_seconds)
+    body_timeout = timedelta(seconds=listener.body_timeout_seconds)
     metrics = IngestMetrics()
 
     async def authorize(request: Request) -> None:
@@ -435,13 +522,14 @@ def create_app(
     )
     app.add_middleware(RequestIdMiddleware)
     app.state.metrics = metrics
-    # A threading semaphore, not an asyncio one: it is only ever tried, never waited on, and it
-    # stays correct whichever event loop or thread serves the request.
-    inflight = threading.BoundedSemaphore(listener.max_inflight_batches)
+    # Slots are only ever tried, never waited on (ADR 0043 section 2); each remembers when it
+    # was taken so /readyz can tell a wedged listener from a busy one (ADR 0073).
+    slots = InflightSlots(listener.max_inflight_batches)
 
     @contextmanager
     def admitted() -> Iterator[None]:
-        if not inflight.acquire(blocking=False):
+        token = slots.acquire(now())
+        if token is None:
             metrics.inc("carto_ingest_busy_total")
             raise Problem(
                 429,
@@ -452,11 +540,33 @@ def create_app(
         try:
             yield
         finally:
-            inflight.release()
+            slots.release(token)
 
     async def receive[T: BaseModel](request: Request, model: type[T]) -> T:
-        raw, zstd = await _read_body(request, listener)
-        return await run_in_threadpool(_decode, model, raw, zstd, listener.max_decompressed_bytes)
+        """Read the body under the body deadline (ADR 0073), then decode off the loop."""
+        try:
+            async with asyncio.timeout(listener.body_timeout_seconds):
+                raw, zstd = await _read_body(request, listener)
+        except TimeoutError:
+            metrics.inc("carto_ingest_body_timeout_total")
+            log.warning(
+                "request body timed out",
+                path=request.url.path,
+                timeout_seconds=listener.body_timeout_seconds,
+            )
+            raise Problem(
+                408,
+                "request timeout",
+                "the body did not arrive within the body timeout; send the request again",
+            ) from None
+        return await run_in_threadpool(
+            _decode,
+            model,
+            raw,
+            zstd,
+            listener.max_decompressed_bytes,
+            listener.max_decompression_ratio,
+        )
 
     def unavailable(title: str, retry_after: int = RETRY_AFTER_SECONDS) -> Problem:
         return Problem(
@@ -464,13 +574,20 @@ def create_app(
         )
 
     def check_range(batch: IngestBatch, at: datetime) -> None:
-        """ADR 0036: refuse the batch when an event's observed_at is implausible."""
+        """ADR 0036 and 0073: refuse the batch when an event's observed_at or ingested_at is
+        implausible. ingested_at is the replacing tables' version column (ADR 0034), so a value
+        far ahead of core's clock would win every merge; it gets the same range."""
         lower, upper = retention.observed_at_range(at)
         errors, count = out_of_range_errors(batch, lower, upper)
+        ingested_errors, ingested_count = out_of_range_errors(
+            batch, lower, upper, column="ingested_at"
+        )
+        errors = (errors + ingested_errors)[:MAX_RANGE_ERRORS]
+        count += ingested_count
         if count:
             metrics.inc("carto_ingest_out_of_range_total")
             log.warning(
-                "batch refused, observed_at out of range",
+                "batch refused, event time out of range",
                 tenant_id=batch.tenant_id,
                 source_id=batch.source_id,
                 batch_id=batch.batch_id,
@@ -478,13 +595,41 @@ def create_app(
             )
             raise Problem(
                 422,
-                "observed_at out of range",
-                f"{count} events lie outside the plausible range; see errors",
+                "event time out of range",
+                f"{count} events lie outside the plausible range (observed_at or ingested_at); "
+                "see errors",
                 errors=errors,
             )
 
+    def check_template_ceiling(records: list[TemplateRecord], context: dict[str, Any]) -> None:
+        """ADR 0073: refuse the batch before the claim when a system would hold more than
+        ``max_templates_per_system`` templates. A failed count is a 503, never an open door."""
+        ceiling = listener.max_templates_per_system
+        try:
+            over = templates.templates_over_ceiling(context["tenant_id"], records, ceiling=ceiling)
+        except MetadataError as exc:
+            log.warning("template count failed", error=type(exc).__name__, **context)
+            raise unavailable("metadata store unavailable") from exc
+        if over is None:
+            return
+        metrics.inc("carto_ingest_templates_refused_total")
+        log.warning("batch refused, template ceiling", system_id=over, ceiling=ceiling, **context)
+        raise Problem(
+            422,
+            "too many templates",
+            f"system {over} is at its template ceiling; the batch cannot be accepted as sent",
+            errors=[
+                {
+                    "loc": ["events"],
+                    "msg": "a system is at its template ceiling",
+                    "type": "too_many_templates",
+                }
+            ],
+        )
+
     def process_batch(batch: IngestBatch) -> bool:
-        """Range check, claim, write, mark done (ADR 0034, 0036). True for a duplicate."""
+        """Range check, template ceiling, claim, write, mark done (ADR 0034, 0036, 0073). True
+        for a duplicate."""
         received_at = now()
         check_range(batch, received_at)
         context = {
@@ -493,6 +638,8 @@ def create_app(
             "batch_id": batch.batch_id,
             "events": len(batch.events),
         }
+        records = batch_templates(batch)
+        check_template_ceiling(records, context)
         entry = LedgerEntry(
             batch.tenant_id, batch.batch_id, batch.source_id, len(batch.events), received_at
         )
@@ -526,7 +673,6 @@ def create_app(
                     422, "event store refused the batch", "the batch cannot be written as sent"
                 ) from exc
             raise unavailable("event store unavailable") from exc
-        records = batch_templates(batch)
 
         def record_templates(connection: Connection | None) -> None:
             templates.upsert_templates(batch.tenant_id, records, connection=connection)
@@ -615,8 +761,33 @@ def create_app(
                 "inventory tenant mismatch",
                 "inventory is for a tenant this core does not serve",
             )
+        received_at = now()
         try:
-            result = await run_in_threadpool(templates.replace_inventory, report, now())
+            result = await run_in_threadpool(
+                lambda: templates.replace_inventory(
+                    report, received_at, max_edges=listener.max_edges_per_tenant
+                )
+            )
+        except MetadataLimitError as exc:
+            metrics.inc("carto_ingest_edges_refused_total")
+            log.warning(
+                "inventory refused, edge ceiling",
+                tenant_id=report.tenant_id,
+                edge_id=report.edge_id,
+                ceiling=listener.max_edges_per_tenant,
+            )
+            raise Problem(
+                422,
+                "too many edges",
+                "the tenant is at its edge ceiling; the inventory cannot be recorded",
+                errors=[
+                    {
+                        "loc": ["edge_id"],
+                        "msg": "the tenant is at its edge ceiling",
+                        "type": "too_many_edges",
+                    }
+                ],
+            ) from exc
         except MetadataError as exc:
             log.warning(
                 "inventory store failed",
@@ -656,6 +827,10 @@ def create_app(
 
     @app.get("/readyz")
     async def readyz() -> Response:
+        if slots.all_held_longer_than(now(), body_timeout):
+            # Every slot has outlived the body deadline: nothing honest can get in (ADR 0073).
+            log.warning("not ready: every in-flight slot held past the body timeout")
+            return JSONResponse({"status": "unavailable"}, status_code=503)
         ready = await run_in_threadpool(
             lambda: writer.ping() and ledger.ping() and health.ping() and templates.ping()
         )

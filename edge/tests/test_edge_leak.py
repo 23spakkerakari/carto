@@ -395,6 +395,17 @@ def _environment(*paths: Path) -> list[str]:
     return sorted(variants, key=len, reverse=True)
 
 
+def _arrived_on_the_pinned_clock(sim: Path) -> None:
+    """The upload connector takes a file's mtime as ``received_at``, which becomes the events'
+    ``ingested_at``, and ingest-api bounds that to one day past its clock (ADR 0073). The
+    simulator and the probes write their files now, weeks after the pinned clock, so they are
+    stamped as having arrived on it; files already back-dated (the probe drops) keep theirs."""
+    moment = PINNED_NOW.timestamp()
+    for path in sim.rglob("*"):
+        if path.is_file() and path.stat().st_mtime > moment:
+            os.utime(path, (moment, moment))
+
+
 # --- tests -------------------------------------------------------------------------------------
 
 
@@ -440,6 +451,7 @@ def test_leak_small_run(scenario: str, tmp_path: Path, restore_logging: None) ->
     )
     config = tmp_path / "analyze.yaml"
     probes = _plant_probes(sim, layout, config)
+    _arrived_on_the_pinned_clock(sim)
     markers_file = tmp_path / "markers.json"
     planted = json.loads((sim / "ground_truth" / "markers.json").read_text(encoding="utf-8"))
     assert len(planted["secret_values"]) == 7, "the simulator planted no secrets (ADR 0068)"

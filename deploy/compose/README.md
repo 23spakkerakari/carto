@@ -90,7 +90,9 @@ port binds `127.0.0.1` (`CARTO_BIND`). The dev profile's values live in `dev.env
 variables in `.env` and never uses `dev.env`.
 
 `ingest-api`'s healthcheck is `carto-core healthcheck`, which presents the service's own
-certificate because the listener requires mutual TLS.
+certificate because the listener requires mutual TLS. Its `/readyz` also reports 503 once every
+in-flight slot has been held longer than `CARTO_INGEST__BODY_TIMEOUT_SECONDS` (default 30; ADR
+0073), so a wedged listener is restarted rather than left green.
 
 `sources.dev.yaml` points the edge at the simulator's output volume; copy it to `sources.yaml`
 and edit for a real pilot (see `docs/install/compose-pilot.md`).

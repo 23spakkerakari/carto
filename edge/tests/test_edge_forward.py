@@ -36,11 +36,12 @@ from carto_edge.config import CoreLinkSettings, SourceConfig, SourcesFile, Sourc
 from carto_edge.metrics import EdgeMetrics, default_metrics
 from carto_edge.net.http import build_ssl_context
 from carto_edge.pipeline import forward as forward_module
-from carto_edge.pipeline.buffer import DiskBuffer
+from carto_edge.pipeline.buffer import DiskBuffer, compress_batch
 from carto_edge.pipeline.forward import (
     HEARTBEAT_PATH,
     INGEST_PATH,
     PARK_STATUSES,
+    PARKED_PURGE_SECONDS,
     Forwarder,
     Heartbeater,
     SendReport,
@@ -373,6 +374,111 @@ def test_drain_gives_up_after_consecutive_failures(buffer: DiskBuffer) -> None:
     assert fwd.drain(max_failures=2) == 0
     assert len(sleeps) == 1
     assert buffer.depth() == 1
+
+
+# --- parked batches expire (ADR 0073) ----------------------------------------------------------
+
+
+def _park_at(buf: DiskBuffer, created_at: datetime) -> IngestBatch:
+    stored = batch()
+    row_id = buf.append_bytes(
+        compress_batch(stored),
+        source_id=stored.source_id,
+        batch_id=stored.batch_id,
+        events=len(stored.events),
+        created_at=created_at,
+    )
+    assert buf.park(row_id)
+    return stored
+
+
+def test_parked_batches_older_than_the_age_are_purged_and_younger_ones_stay(
+    buffer: DiskBuffer,
+) -> None:
+    """A persistent 422 parked every batch until the 20 GB buffer was full; parked rows now
+    expire after ``parked_max_age_days``. One warning per pass, count and oldest id only."""
+    old = _park_at(buffer, NOW - timedelta(days=7, seconds=1))
+    older = _park_at(buffer, NOW - timedelta(days=30))
+    young = _park_at(buffer, NOW - timedelta(days=6, hours=23))
+    pending = batch()
+    buffer.append(pending)
+    bytes_before = buffer.bytes()
+    purged_bytes = len(compress_batch(old)) + len(compress_batch(older))
+    metrics = default_metrics()
+    fwd = Forwarder(
+        buffer,
+        client_for(lambda _request: httpx.Response(503)),
+        metrics=metrics,
+        clock=lambda: NOW,
+        parked_max_age_days=7,
+    )
+    with structlog.testing.capture_logs() as logs:
+        assert fwd.purge_parked(force=True) == 2
+    assert buffer.parked() == 1
+    assert buffer.depth() == 1
+    assert buffer.bytes() == bytes_before - purged_bytes
+    assert metrics.get("carto_edge_parked_purged_total") == 2
+    (warning,) = [entry for entry in logs if entry["log_level"] == "warning"]
+    assert warning["event"] == "forward.parked_purged"
+    assert warning["purged"] == 2
+    assert warning["oldest_batch_id"] == older.batch_id
+    assert warning["max_age_days"] == 7
+    assert MARKER not in repr(logs)
+    assert young.batch_id not in repr(logs) and pending.batch_id not in repr(logs)
+    # Nothing to purge: no warning, no count.
+    with structlog.testing.capture_logs() as logs:
+        assert fwd.purge_parked(force=True) == 0
+    assert not [entry for entry in logs if entry["log_level"] == "warning"]
+    assert metrics.get("carto_edge_parked_purged_total") == 2
+
+
+def test_the_purge_runs_once_per_period_from_the_loop(buffer: DiskBuffer) -> None:
+    _park_at(buffer, NOW - timedelta(days=8))
+    ticks = {"now": 1000.0}
+    fwd = Forwarder(
+        buffer,
+        client_for(lambda _request: httpx.Response(503)),
+        metrics=default_metrics(),
+        clock=lambda: NOW,
+        parked_max_age_days=7,
+        monotonic=lambda: ticks["now"],
+    )
+    assert fwd.purge_parked() == 1, "the first pass runs at once"
+    _park_at(buffer, NOW - timedelta(days=8))
+    assert fwd.purge_parked() == 0, "within the period: nothing runs"
+    ticks["now"] += PARKED_PURGE_SECONDS
+    assert fwd.purge_parked() == 1
+    assert buffer.parked() == 0
+
+
+def test_run_purges_parked_batches_past_the_age(buffer: DiskBuffer) -> None:
+    _park_at(buffer, NOW - timedelta(days=8))
+    metrics = default_metrics()
+    fwd = Forwarder(
+        buffer,
+        client_for(lambda _request: httpx.Response(200, json={"accepted": 2})),
+        metrics=metrics,
+        clock=lambda: NOW,
+        parked_max_age_days=7,
+    )
+    stop = threading.Event()
+    thread = threading.Thread(target=fwd.run, args=(stop,), daemon=True)
+    thread.start()
+    deadline = time.monotonic() + 5.0
+    while buffer.parked() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    stop.set()
+    thread.join(timeout=2.0)
+    assert buffer.parked() == 0
+    assert metrics.get("carto_edge_parked_purged_total") == 1
+
+
+def test_the_parked_age_is_validated(buffer: DiskBuffer) -> None:
+    client = client_for(lambda _request: httpx.Response(503))
+    for days in (0, -1, 366):
+        with pytest.raises(ValueError, match="parked_max_age_days"):
+            Forwarder(buffer, client, metrics=default_metrics(), parked_max_age_days=days)
+    assert Forwarder(buffer, client, metrics=default_metrics()).parked_max_age_days == 7
 
 
 class FakeWriter:

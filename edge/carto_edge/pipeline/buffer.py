@@ -16,7 +16,9 @@ exact (ADR 0014). :meth:`DiskBuffer.is_above_backpressure` is what pull connecto
 down and push receivers map to 429; :meth:`DiskBuffer.is_full` is the hard stop (503, and
 :class:`BufferFullError` on ``append``). A batch that core refuses for good (a 4xx) is parked
 by :meth:`DiskBuffer.park` so the queue keeps moving; parked rows still count toward the cap
-and appear in the metrics until an operator clears them.
+and appear in the metrics until an operator clears them or the forwarder's housekeeping
+deletes those older than ``core.parked_max_age_days`` with :meth:`DiskBuffer.purge_parked`
+(ADR 0073), so a persistent refusal cannot fill the buffer with rows nobody will send.
 
 Nothing here logs; payloads are opaque bytes to this module.
 """
@@ -208,6 +210,31 @@ class DiskBuffer:
                 (STATE_PARKED, row_id, STATE_PENDING),
             )
             return cursor.rowcount > 0
+
+    def purge_parked(self, older_than: datetime) -> tuple[int, str | None]:
+        """Delete the parked rows created before ``older_than`` (ADR 0073); returns how many
+        and the batch id (a ULID, never content) of the oldest one removed. Pending rows are
+        never touched. The bytes are released once the delete is committed, as in :meth:`ack`."""
+        cutoff_ms = int(older_than.astimezone(UTC).timestamp() * 1000)
+        with self._lock:
+            self._conn.execute("BEGIN")
+            try:
+                rows = self._conn.execute(
+                    "SELECT batch_id, size FROM batches WHERE state = ? AND created_at_ms < ? "
+                    "ORDER BY created_at_ms, id",
+                    (STATE_PARKED, cutoff_ms),
+                ).fetchall()
+                if rows:
+                    self._conn.execute(
+                        "DELETE FROM batches WHERE state = ? AND created_at_ms < ?",
+                        (STATE_PARKED, cutoff_ms),
+                    )
+                self._conn.execute("COMMIT")
+            except sqlite3.Error:
+                self._conn.execute("ROLLBACK")
+                raise
+            self._bytes -= sum(int(row[1]) for row in rows)
+        return len(rows), (str(rows[0][0]) if rows else None)
 
     # -- reads ---------------------------------------------------------------------------------
 

@@ -7,10 +7,14 @@ upserts the batch's templates with the ledger's done mark (ADR 0056), records ed
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import io
 import json
+import math
 import re
 import threading
+import time
 import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -52,7 +56,7 @@ from carto_core.ingest.ledger import (
     LedgerEntry,
     LedgerError,
 )
-from carto_core.metadata import InMemoryMetadataStore, MetadataError
+from carto_core.metadata import InMemoryMetadataStore, MetadataError, TemplateRecord
 from carto_core.settings import MIB, CoreSettings, IngestListenerSettings
 from carto_schema.event import CanonicalEvent
 from carto_schema.ingest import IngestBatch, SourceHeartbeat, SourceStatus
@@ -62,6 +66,7 @@ NOW = datetime(2026, 10, 8, 12, 0, 0, tzinfo=UTC)
 KIB = 1024
 JSON = {"content-type": "application/json"}
 EXAMPLE_TOKENS = [identifier.token for identifier in CanonicalEvent.example().identifiers]
+INTERNAL_PATHS = ["/internal/ingest", "/internal/heartbeat", "/internal/inventory"]
 
 
 class FakeWriter:
@@ -135,13 +140,23 @@ def world() -> World:
     return _world()
 
 
-def _event(index: int = 0, observed_at: datetime | None = None) -> CanonicalEvent:
+def _event(
+    index: int = 0,
+    observed_at: datetime | None = None,
+    *,
+    ingested_at: datetime | None = None,
+    template_id: str | None = None,
+) -> CanonicalEvent:
     suffix = "ABCDEFGHJKMNPQRSTVWXYZ"[index]
     data = CanonicalEvent.example().model_dump() | {
         "event_id": f"01J9ZK8X5Q8V3N6M2T4R7W1Y0{suffix}"
     }
     if observed_at is not None:
         data["observed_at"] = observed_at
+    if ingested_at is not None:
+        data["ingested_at"] = ingested_at
+    if template_id is not None:
+        data["template_id"] = template_id
     return CanonicalEvent.model_validate(data)
 
 
@@ -360,6 +375,78 @@ def test_an_unreachable_ledger_is_503_before_anything_is_written() -> None:
     assert world.writer.batches == []
 
 
+# --- the per-system template ceiling (ADR 0073) ------------------------------------------------
+
+
+def _seed_templates(store: InMemoryMetadataStore, system_id: str, count: int) -> None:
+    example = CanonicalEvent.example()
+    store.upsert_templates(
+        "default",
+        [
+            TemplateRecord(
+                system_id=system_id,
+                template_id=f"tpl_seed_{index}",
+                template_text="seeded",
+                kind="row_change",
+                first_seen=example.observed_at,
+                last_seen=example.observed_at,
+                count=1,
+            )
+            for index in range(count)
+        ],
+    )
+
+
+def test_a_batch_that_would_push_a_system_past_the_template_ceiling_is_422() -> None:
+    """Edge-named template ids grow ``templates`` without bound; past the ceiling the batch is
+    refused before the claim, so the edge parks it and nothing is written."""
+    world = _world(_settings(max_templates_per_system=1_000))
+    _seed_templates(world.metadata, "sys_warehouse", 1_000)
+    payload = _payload([_event(0, template_id="tpl_new")])
+    response = _post(world, "/internal/ingest", payload)
+    body = _assert_problem(response, 422)
+    assert body["title"] == "too many templates"
+    assert "sys_warehouse" in body["detail"]
+    assert "tpl_new" not in response.text, "the template id is not echoed"
+    assert body["errors"] == [
+        {
+            "loc": ["events"],
+            "msg": "a system is at its template ceiling",
+            "type": "too_many_templates",
+        }
+    ]
+    assert world.writer.batches == []
+    assert world.ledger.rows == (), "refused before the claim"
+    assert len(world.metadata.list_templates("default", "sys_warehouse")) == 1_000
+    assert "carto_ingest_templates_refused_total 1\n" in world.client.get("/metrics").text
+
+
+def test_known_templates_are_accepted_at_the_ceiling_and_the_count_is_per_system() -> None:
+    world = _world(_settings(max_templates_per_system=1_000))
+    _seed_templates(world.metadata, "sys_warehouse", 999)
+    # One new template fills the system exactly: at the ceiling, not past it.
+    assert _post(world, "/internal/ingest", _payload([_event(0)])).status_code == 200
+    # The same template again adds no row: accepted.
+    assert _post(world, "/internal/ingest", _payload([_event(1)])).status_code == 200
+    # A batch with two new templates of the full system is refused as a whole.
+    payload = _payload([_event(2, template_id="tpl_a"), _event(3, template_id="tpl_b")])
+    _assert_problem(_post(world, "/internal/ingest", payload), 422)
+    assert len(world.writer.batches) == 2
+    assert len(world.metadata.list_templates("default", "sys_warehouse")) == 1_000
+
+
+def test_a_failed_template_count_is_503_not_an_open_door() -> None:
+    class CountDown(InMemoryMetadataStore):
+        def templates_over_ceiling(self, tenant_id: str, records: Any, *, ceiling: int) -> Any:
+            raise MetadataError("template count failed: OperationalError")
+
+    world = _world(metadata=CountDown())
+    response = _post(world, "/internal/ingest", _payload())
+    _assert_problem(response, 503)
+    assert response.headers["retry-after"] == "1"
+    assert world.writer.batches == []
+
+
 # --- the plausible observed_at range (ADR 0036) ------------------------------------------------
 
 
@@ -411,6 +498,54 @@ def test_a_422_lists_a_bounded_number_of_out_of_range_events(world: World) -> No
     body = _assert_problem(_post(world, "/internal/ingest", payload), 422)
     assert len(body["errors"]) == MAX_RANGE_ERRORS
     assert body["detail"].startswith(f"{MAX_RANGE_ERRORS + 2} events")
+
+
+# --- ingested_at is bounded like observed_at (ADR 0073) ----------------------------------------
+
+
+def test_ingested_at_at_the_ends_of_the_range_is_accepted(world: World) -> None:
+    """ingested_at is the replacing tables' version column (ADR 0034): a far-future value would
+    win every merge, so it is bounded to the observed_at range, one day ahead at most."""
+    lower, upper = RetentionSettings().observed_at_range(NOW)
+    payload = _payload([_event(0, ingested_at=lower), _event(1, ingested_at=upper)])
+    response = _post(world, "/internal/ingest", payload)
+    assert response.status_code == 200, response.text
+
+
+@pytest.mark.parametrize(
+    ("offset", "kind"),
+    [
+        (-timedelta(days=31, milliseconds=1), "ingested_at_too_old"),
+        (timedelta(days=1, milliseconds=1), "ingested_at_future"),
+        (datetime(2099, 1, 1, tzinfo=UTC) - NOW, "ingested_at_future"),
+    ],
+)
+def test_an_ingested_at_outside_the_range_refuses_the_batch_with_422(
+    world: World, offset: timedelta, kind: str
+) -> None:
+    payload = _payload([_event(0), _event(1, ingested_at=NOW + offset)])
+    response = _post(world, "/internal/ingest", payload)
+    body = _assert_problem(response, 422)
+    assert body["errors"] == [
+        {
+            "loc": ["events", 1, "ingested_at"],
+            "msg": "ingested_at is outside the plausible range",
+            "type": kind,
+        }
+    ]
+    assert payload["events"][1]["ingested_at"][:10] not in response.text, "the time is not echoed"
+    assert world.writer.batches == []
+    assert world.ledger.rows == (), "refused before the claim"
+    assert "carto_ingest_out_of_range_total 1\n" in world.client.get("/metrics").text
+
+
+def test_both_time_columns_are_listed_in_one_422_within_the_bound(world: World) -> None:
+    far = NOW + timedelta(days=30)
+    payload = _payload([_event(index, far, ingested_at=far) for index in range(MAX_RANGE_ERRORS)])
+    body = _assert_problem(_post(world, "/internal/ingest", payload), 422)
+    assert len(body["errors"]) == MAX_RANGE_ERRORS
+    assert body["detail"].startswith(f"{2 * MAX_RANGE_ERRORS} events")
+    assert {error["loc"][2] for error in body["errors"]} <= {"observed_at", "ingested_at"}
 
 
 # --- rejecting what is not the contract --------------------------------------------------
@@ -533,7 +668,7 @@ def _large_window_frame() -> bytes:
 
 def test_a_frame_asking_for_a_window_above_8_mib_is_refused() -> None:
     with pytest.raises(Problem) as info:
-        decompress_capped(_large_window_frame(), 16 * MIB)
+        decompress_capped(_large_window_frame(), 16 * MIB, max_ratio=10_000)
     assert info.value.status == 400
     assert ZSTD_MAX_WINDOW_BYTES == 8 * MIB
 
@@ -541,7 +676,73 @@ def test_a_frame_asking_for_a_window_above_8_mib_is_refused() -> None:
 def test_a_default_level_frame_is_well_inside_the_window_cap() -> None:
     data = json.dumps(_payload()).encode() * 2000
     frame = zstandard.ZstdCompressor(level=3).compress(data)
-    assert decompress_capped(frame, 64 * MIB) == data
+    assert decompress_capped(frame, 64 * MIB, max_ratio=10_000) == data
+
+
+# --- the decompression ratio cap (ADR 0073) ----------------------------------------------------
+
+
+def test_a_body_expanding_past_the_ratio_cap_is_413_before_the_absolute_cap() -> None:
+    """A ~100-byte frame may not expand to the 16 MiB absolute cap: the ratio against the
+    whole wire length bounds it first."""
+    world = _world(_settings(max_decompression_ratio=10))
+    data = b"[" + b"0," * (100 * KIB)
+    frame = zstandard.ZstdCompressor(level=3).compress(data)
+    assert len(frame) * 10 < len(data) < 16 * MIB, "past the ratio, under the absolute cap"
+    response = world.client.post(
+        "/internal/ingest", content=frame, headers=JSON | {"content-encoding": "zstd"}
+    )
+    body = _assert_problem(response, 413)
+    assert "ratio" in body["detail"]
+    assert world.writer.batches == []
+
+
+def test_the_ratio_cap_is_measured_against_the_whole_wire_length() -> None:
+    data = b"a" * (64 * KIB)
+    frame = zstandard.ZstdCompressor(level=3).compress(data)
+    fits = math.ceil(len(data) / len(frame))
+    assert decompress_capped(frame, MIB, max_ratio=fits) == data
+    with pytest.raises(Problem) as info:
+        decompress_capped(frame, MIB, max_ratio=fits - 1)
+    assert info.value.status == 413
+    assert "ratio" in info.value.detail
+
+
+def _varied_event(index: int) -> CanonicalEvent:
+    """An event as the edge produces them: its own ULID, time and HMAC tokens, so a batch of
+    them compresses like a real one and not like one event repeated."""
+    data = CanonicalEvent.example().model_dump()
+    data["event_id"] = new_ulid()
+    data["observed_at"] = NOW - timedelta(seconds=index)
+    for position, identifier in enumerate(data["identifiers"]):
+        digest = hashlib.sha256(f"{index}:{position}".encode()).digest()
+        identifier["token"] = "t1." + base64.urlsafe_b64encode(digest)[:22].decode()
+    return CanonicalEvent.model_validate(data)
+
+
+def test_an_ordinary_batch_is_far_below_the_default_ratio() -> None:
+    """A batch of edge-shaped events (ULIDs, times, HMAC tokens; one template) compresses
+    about 11x at zstd level 3 (ADR 0073), well under the default ratio cap of 100."""
+    events = [_varied_event(index) for index in range(2000)]
+    data = json.dumps(_payload(events)).encode()
+    frame = zstandard.ZstdCompressor(level=3).compress(data)
+    assert len(data) / len(frame) < 25
+    assert (
+        decompress_capped(
+            frame, 64 * MIB, max_ratio=IngestListenerSettings().max_decompression_ratio
+        )
+        == data
+    )
+
+
+def test_decompression_hands_back_one_buffer_without_a_copy() -> None:
+    """The decompressed body is returned as the buffer it was decoded into (one copy per slot,
+    ADR 0073), and the wire buffer may be a bytearray too."""
+    data = json.dumps(_payload()).encode()
+    frame = bytearray(zstandard.ZstdCompressor(level=3).compress(data))
+    out = decompress_capped(frame, MIB, max_ratio=100)
+    assert isinstance(out, bytearray)
+    assert out == data
 
 
 @pytest.mark.parametrize(
@@ -569,9 +770,9 @@ def test_a_frame_with_a_checksum_and_unknown_size_is_accepted() -> None:
     compressor = zstandard.ZstdCompressor(level=3, write_checksum=True)
     with compressor.stream_writer(buffer, closefd=False) as writer:
         writer.write(data)
-    assert decompress_capped(buffer.getvalue(), MIB) == data
+    assert decompress_capped(buffer.getvalue(), MIB, max_ratio=100) == data
     with pytest.raises(Problem):
-        decompress_capped(buffer.getvalue()[:-1], MIB)
+        decompress_capped(buffer.getvalue()[:-1], MIB, max_ratio=100)
 
 
 def test_decompression_and_validation_run_off_the_event_loop(
@@ -643,6 +844,124 @@ def test_batches_in_flight_are_bounded_and_the_rest_get_429() -> None:
     assert first["response"].status_code == 200
     again = client.post("/internal/ingest", content=json.dumps(_payload()).encode(), headers=JSON)
     assert again.status_code == 200, again.text
+
+
+# --- the body deadline and stalled slots (ADR 0073) --------------------------------------------
+
+STALL_MARKER = b'{"tenant_id": "STALLMARKER'
+"""The partial body a trickling client sends; it must never be echoed."""
+
+
+def _asgi_scope(path: str) -> dict[str, Any]:
+    return {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "https",
+        "path": path,
+        "raw_path": path.encode(),
+        "root_path": "",
+        "query_string": b"",
+        "headers": [(b"content-type", b"application/json"), (b"host", b"ingest-api")],
+        "client": ("127.0.0.1", 40000),
+        "server": ("127.0.0.1", 8443),
+        "state": {},
+    }
+
+
+async def _stalled_post(app: Any, path: str) -> tuple[int, dict[str, str], bytes]:
+    """POST ``path`` with a body that starts and never finishes, like a trickling client: one
+    chunk, then a receive that waits for ever."""
+    sent: list[dict[str, Any]] = []
+    chunks = [{"type": "http.request", "body": STALL_MARKER, "more_body": True}]
+    stall = asyncio.Event()
+
+    async def receive() -> dict[str, Any]:
+        if chunks:
+            return chunks.pop(0)
+        await stall.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message: dict[str, Any]) -> None:
+        sent.append(message)
+
+    await app(_asgi_scope(path), receive, send)
+    start = next(message for message in sent if message["type"] == "http.response.start")
+    body = b"".join(m.get("body", b"") for m in sent if m["type"] == "http.response.body")
+    headers = {key.decode(): value.decode() for key, value in start["headers"]}
+    return int(start["status"]), headers, body
+
+
+@pytest.mark.parametrize("path", INTERNAL_PATHS)
+def test_a_body_that_never_arrives_is_408_and_the_slot_is_freed(path: str) -> None:
+    """Eight trickling connections would otherwise hold every in-flight slot for ever while
+    health stayed green (spec 2.3 invariant 8: timeouts on every input)."""
+    settings = _settings(body_timeout_seconds=1, max_inflight_batches=1)
+    writer = FakeWriter()
+    app = create_app(
+        settings, writer, InMemoryBatchLedger(), InMemorySourceHealthStore(), clock=lambda: NOW
+    )
+    role_app = ActAsRole(app, "edge-gateway")
+    started = time.monotonic()
+    status, headers, body = asyncio.run(_stalled_post(role_app, path))
+    assert status == 408
+    assert time.monotonic() - started < 30
+    assert headers["content-type"].startswith(PROBLEM_CONTENT_TYPE)
+    problem = json.loads(body)
+    assert problem["status"] == 408
+    assert problem["request_id"] == headers["x-request-id"]
+    assert b"STALLMARKER" not in body
+    assert app.state.metrics.get("carto_ingest_body_timeout_total") == 1
+    assert app.state.metrics.get("carto_ingest_errors_total") == 1
+    assert app.state.metrics.get("carto_ingest_busy_total") == 0
+    # The one slot is free again: an honest batch is accepted at once.
+    client = TestClient(role_app)
+    response = client.post(
+        "/internal/ingest", content=json.dumps(_payload()).encode(), headers=JSON
+    )
+    assert response.status_code == 200, response.text
+    assert len(writer.batches) == 1
+
+
+def test_readyz_is_503_once_every_slot_has_been_held_past_the_body_timeout() -> None:
+    """Slots held longer than the body deadline by every request means the listener is wedged;
+    the probe says so instead of staying green (no detail in the body, spec 12)."""
+    clock = {"now": NOW}
+    writer = BlockingWriter()
+    settings = _settings(max_inflight_batches=1, body_timeout_seconds=30)
+    app = create_app(
+        settings,
+        writer,
+        InMemoryBatchLedger(),
+        InMemorySourceHealthStore(),
+        clock=lambda: clock["now"],
+    )
+    client = TestClient(ActAsRole(app, "edge-gateway"))
+    first: dict[str, Any] = {}
+
+    def send_first() -> None:
+        first["response"] = client.post(
+            "/internal/ingest", content=json.dumps(_payload()).encode(), headers=JSON
+        )
+
+    thread = threading.Thread(target=send_first)
+    thread.start()
+    try:
+        assert writer.entered.wait(10)
+        assert client.get("/readyz").status_code == 200, "held, but not yet past the deadline"
+        clock["now"] = NOW + timedelta(seconds=30)
+        assert client.get("/readyz").status_code == 200, "the bound is exclusive"
+        clock["now"] = NOW + timedelta(seconds=31)
+        stalled = client.get("/readyz")
+        assert stalled.status_code == 503
+        assert stalled.json() == {"status": "unavailable"}
+        assert client.get("/healthz").status_code == 200, "liveness is unchanged"
+    finally:
+        writer.release.set()
+        thread.join(10)
+    assert first["response"].status_code == 200
+    assert client.get("/readyz").status_code == 200
 
 
 # --- heartbeats --------------------------------------------------------------------------------
@@ -732,13 +1051,34 @@ def test_inventory_of_another_tenant_or_off_contract_is_422(world: World) -> Non
 
 def test_an_unavailable_metadata_store_is_503_for_inventories() -> None:
     class Down(InMemoryMetadataStore):
-        def replace_inventory(self, inventory: Any, received_at: datetime) -> Any:
+        def replace_inventory(
+            self, inventory: Any, received_at: datetime, *, max_edges: int | None = None
+        ) -> Any:
             raise MetadataError("inventory replace failed: OperationalError")
 
     world = _world(metadata=Down())
     response = _post(world, "/internal/inventory", _inventory())
     _assert_problem(response, 503)
     assert response.headers["retry-after"] == "1"
+
+
+def test_a_new_edge_beyond_the_tenant_ceiling_is_422_and_nothing_is_recorded() -> None:
+    """``edge_inventories`` is keyed by an edge_id the body names (ADR 0050); past the ceiling
+    a new edge is refused and the inventory's systems and sources are not written either."""
+    world = _world(_settings(max_edges_per_tenant=1))
+    assert _post(world, "/internal/inventory", _inventory()).status_code == 200
+    second = _inventory(edge_id="edge-two", systems=[{"id": "sys_two", "name": "Two"}], sources=[])
+    response = _post(world, "/internal/inventory", second)
+    body = _assert_problem(response, 422)
+    assert body["title"] == "too many edges"
+    assert body["errors"] == [
+        {"loc": ["edge_id"], "msg": "the tenant is at its edge ceiling", "type": "too_many_edges"}
+    ]
+    assert [system.id for system in world.metadata.list_systems("default")] == ["sys_warehouse"]
+    assert set(world.metadata.inventories) == {("default", "edge-gateway")}
+    assert "carto_ingest_edges_refused_total 1\n" in world.client.get("/metrics").text
+    # The known edge still reports; a known edge is never refused by the ceiling.
+    assert _post(world, "/internal/inventory", _inventory()).status_code == 200
 
 
 # --- health, readiness, metrics, request ids ---------------------------------------------------

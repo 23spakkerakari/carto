@@ -178,6 +178,32 @@ def test_listener_caps_are_bounded_and_consistent() -> None:
         IngestListenerSettings(port=0)
 
 
+def test_ingest_deadline_ratio_and_row_ceilings_have_sane_defaults() -> None:
+    """ADR 0073: every limit on the ingest path is a validated setting."""
+    listener = IngestListenerSettings()
+    assert listener.body_timeout_seconds == 30
+    assert listener.max_decompression_ratio == 200
+    assert listener.max_templates_per_system == 50_000
+    assert listener.max_edges_per_tenant == 64
+
+
+@pytest.mark.parametrize(
+    ("name", "low", "high"),
+    [
+        ("body_timeout_seconds", 1, 600),
+        ("max_decompression_ratio", 2, 10_000),
+        ("max_templates_per_system", 1_000, 1_000_000),
+        ("max_edges_per_tenant", 1, 10_000),
+    ],
+)
+def test_ingest_deadline_ratio_and_row_ceilings_are_bounded(name: str, low: int, high: int) -> None:
+    assert getattr(IngestListenerSettings.model_validate({name: low}), name) == low
+    assert getattr(IngestListenerSettings.model_validate({name: high}), name) == high
+    for value in (low - 1, high + 1, 0, -1):
+        with pytest.raises(ValidationError):
+            IngestListenerSettings.model_validate({name: value})
+
+
 def test_login_rate_settings_are_positive_and_the_ceiling_covers_one_address() -> None:
     api = ApiSettings(insecure_http=True)
     assert api.login_rate_per_minute_per_ip == 10

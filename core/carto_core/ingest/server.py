@@ -94,6 +94,8 @@ def build_uvicorn_config(
         # h11, recording each connection's certificate role for the routes (ADR 0031).
         http=peer_role_h11_protocol(),
         h11_max_incomplete_event_size=16 * 1024,
+        # uvicorn has no deadline for a body that trickles in; the app enforces
+        # ingest.body_timeout_seconds on every internal route (ADR 0073).
         limit_concurrency=256,
         server_header=False,
         proxy_headers=False,

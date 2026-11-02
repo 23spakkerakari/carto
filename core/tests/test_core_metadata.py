@@ -19,6 +19,7 @@ from carto_core.metadata import (
     FieldRecord,
     InMemoryMetadataStore,
     InventoryResult,
+    MetadataLimitError,
     MetadataStore,
     TemplateRecord,
     pin_matches,
@@ -141,6 +142,49 @@ def test_template_upserts_add_counts_and_widen_the_seen_range(store: InMemoryMet
     assert store.list_templates("default", "sys_pay") == []
     assert store.list_templates("other") == []
     assert store.upsert_templates("default", [], connection=None) == 0
+
+
+def test_templates_over_ceiling_counts_new_ids_per_system_in_one_pass(
+    store: InMemoryMetadataStore,
+) -> None:
+    """ADR 0073: the ceiling is on rows a system would hold after the batch; known ids add
+    nothing, another system's rows do not count, and the first system over it is named."""
+    store.upsert_templates("default", [template(template_id=f"tpl_{index}") for index in range(3)])
+    known = template(template_id="tpl_1")
+    new = template(template_id="tpl_new")
+    other = template(template_id="tpl_x", system_id="sys_pay")
+    assert store.templates_over_ceiling("default", [known, new], ceiling=4) is None
+    assert store.templates_over_ceiling("default", [known, new], ceiling=3) == "sys_orders"
+    assert store.templates_over_ceiling("default", [known, known], ceiling=3) is None
+    assert store.templates_over_ceiling("default", [other, other], ceiling=1) is None
+    assert store.templates_over_ceiling("default", [other, new], ceiling=3) == "sys_orders"
+    assert store.templates_over_ceiling("other", [new, other], ceiling=1) is None
+    assert store.templates_over_ceiling("default", [], ceiling=1) is None
+    with pytest.raises(ValueError, match="ceiling"):
+        store.templates_over_ceiling("default", [new], ceiling=0)
+
+
+def test_a_new_edge_past_the_tenant_ceiling_is_refused_and_nothing_changes(
+    store: InMemoryMetadataStore,
+) -> None:
+    """ADR 0073: ``edge_inventories`` is keyed by the body's edge_id; a known edge may always
+    report, a new one only under the ceiling, and a refused inventory writes nothing."""
+    assert store.replace_inventory(inventory(), NOW, max_edges=1).systems == 2
+    assert store.replace_inventory(inventory(), NOW, max_edges=1).systems == 2, "known edge"
+    second = inventory(
+        edge_id="edge-two",
+        systems=[InventorySystem(id="sys_two", name="Two")],
+        sources=[],
+        field_policies=[],
+    )
+    with pytest.raises(MetadataLimitError, match="edge"):
+        store.replace_inventory(second, NOW, max_edges=1)
+    assert [system.id for system in store.list_systems("default")] == ["sys_orders", "sys_pay"]
+    assert set(store.inventories) == {("default", "edge-gateway")}
+    assert store.replace_inventory(second, NOW, max_edges=2).systems == 1
+    assert store.replace_inventory(inventory(), NOW).systems == 2, "no ceiling when unset"
+    with pytest.raises(ValueError, match="max_edges"):
+        store.replace_inventory(inventory(), NOW, max_edges=0)
 
 
 def test_edge_columns_and_profiler_columns_never_overwrite_each_other(
@@ -377,3 +421,12 @@ def test_postgres_statements_are_fixed_text_with_bound_parameters() -> None:
     assert "class = EXCLUDED" not in profile_upsert and "policy = EXCLUDED" not in profile_upsert
     assert "LEFT JOIN source_health" in str(metadata_module._SOURCES)
     assert "FOR UPDATE" not in str(metadata_module._PIN_FIELDS)
+    # ADR 0073: one grouped count per batch for the template ceiling, one count per inventory
+    # for the edge ceiling; both are plain SELECTs with bound lists.
+    counts = str(metadata_module._TEMPLATE_COUNTS)
+    assert "GROUP BY system_id" in counts and "= ANY(:systems)" in counts
+    assert "FILTER (WHERE" in counts and "= ANY(:pairs)" in counts
+    edges = str(metadata_module._EDGE_COUNTS)
+    assert (
+        edges.startswith("SELECT") and "FROM edge_inventories WHERE tenant_id = :tenant_id" in edges
+    )

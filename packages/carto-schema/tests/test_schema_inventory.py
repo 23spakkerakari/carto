@@ -13,6 +13,7 @@ import pytest
 from pydantic import ValidationError
 
 from carto_schema.inventory import (
+    MAX_CONFIG_LIST_ITEMS,
     SECRET_REF_SCHEMES,
     InventorySource,
     config_key_is_secret,
@@ -107,6 +108,24 @@ def test_config_key_is_secret_follows_the_logging_rule() -> None:
 def test_a_config_value_with_a_value_shape_is_refused(config: dict[str, Any]) -> None:
     info = _refused(_source(config=config))
     assert "a value" in str(info.value)
+
+
+def test_a_config_list_is_capped_in_length() -> None:
+    """ADR 0073: a config list had no length cap, so one inventory could carry an unbounded
+    number of strings into ``sources.config_json``; 64 items is more than any connector lists."""
+    assert MAX_CONFIG_LIST_ITEMS == 64
+    full = [f"table_{index}" for index in range(MAX_CONFIG_LIST_ITEMS)]
+    assert InventorySource.model_validate(_source(config={"tables": full})).config == {
+        "tables": full
+    }
+    info = _refused(_source(config={"tables": [*full, "one_more"]}))
+    locations = [tuple(error["loc"]) for error in info.value.errors()]
+    assert locations, "refused"
+    # pydantic reports one entry per member of the ConfigValue union it tried; every one of
+    # them sits under the key, none under an item.
+    assert all(location[:2] == ("config", "tables") for location in locations)
+    assert all(not isinstance(part, int) for location in locations for part in location[2:])
+    assert "one_more" not in str(info.value)
 
 
 def test_the_configuration_the_edge_sends_still_passes() -> None:

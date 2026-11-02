@@ -16,7 +16,12 @@
   them would park the whole buffer within seconds, and fixing the configuration would recover
   nothing. 429 honours ``Retry-After`` (seconds, capped); 5xx, any other status and transport
   errors back off exponentially with jitter (:func:`carto_edge.net.retry.backoff_delay`) up to
-  ``retry_max_seconds``, and the row stays.
+  ``retry_max_seconds``, and the row stays. Parked rows expire: once per
+  :data:`PARKED_PURGE_SECONDS` the loop's housekeeping (:meth:`Forwarder.purge_parked`)
+  deletes those older than ``parked_max_age_days`` (``core.parked_max_age_days``, ADR 0073),
+  counts them in ``carto_edge_parked_purged_total`` and logs one warning per pass with the
+  count and the oldest batch id only; a persistent refusal cannot fill the buffer with rows
+  nobody will ever send.
 - :class:`SourceHealth` keeps, per source, ``last_success_at``, ``lag_seconds``, the
   consecutive error count and the records read (spec 8.1 "Health"); the status is ``ok`` after a
   successful read, ``degraded`` after one or two consecutive errors and ``failing`` from three.
@@ -52,7 +57,7 @@ import threading
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Final
 
@@ -87,7 +92,9 @@ __all__ = [
     "INGEST_PATH",
     "INVENTORY_PATH",
     "MAX_BACKOFF_ATTEMPT",
+    "MAX_PARKED_AGE_DAYS",
     "MIN_RETRY_WAIT_SECONDS",
+    "PARKED_PURGE_SECONDS",
     "PARK_STATUSES",
     "SECRET_KEY_WORDS",
     "Forwarder",
@@ -122,6 +129,10 @@ BACKOFF_BASE_SECONDS: Final = 0.5
 FAILING_AFTER_ERRORS: Final = 3
 MIN_RETRY_WAIT_SECONDS: Final = 0.05
 MAX_BACKOFF_ATTEMPT: Final = 32
+PARKED_PURGE_SECONDS: Final = 3600.0
+"""Period of the forwarder's parked-row housekeeping (ADR 0073): hourly, like the runtime's."""
+DEFAULT_PARKED_MAX_AGE_DAYS: Final = 7
+MAX_PARKED_AGE_DAYS: Final = 365
 _JSON: Final = "application/json"
 
 Clock = Callable[[], datetime]
@@ -207,7 +218,10 @@ class Forwarder:
         "_buffer",
         "_client",
         "_clock",
+        "_last_purge",
         "_metrics",
+        "_monotonic",
+        "_parked_max_age_days",
         "_retry_max",
         "_rng",
         "_sleep",
@@ -223,9 +237,14 @@ class Forwarder:
         sleep: Callable[[float], None] = time.sleep,
         retry_max_seconds: float = 60.0,
         rng: Callable[[], float] = random.random,
+        parked_max_age_days: int = DEFAULT_PARKED_MAX_AGE_DAYS,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         if retry_max_seconds < BACKOFF_BASE_SECONDS:
             msg = f"retry_max_seconds must be at least {BACKOFF_BASE_SECONDS}"
+            raise ValueError(msg)
+        if not 1 <= parked_max_age_days <= MAX_PARKED_AGE_DAYS:
+            msg = f"parked_max_age_days must be between 1 and {MAX_PARKED_AGE_DAYS}"
             raise ValueError(msg)
         self._buffer = buffer
         self._client = client
@@ -235,9 +254,45 @@ class Forwarder:
         self._retry_max = retry_max_seconds
         self._rng = rng
         self._attempt = 0
+        self._parked_max_age_days = parked_max_age_days
+        self._monotonic = monotonic
+        self._last_purge: float | None = None
+        metrics.counter(
+            "carto_edge_parked_purged_total",
+            "Parked batches deleted from the disk buffer past parked_max_age_days (ADR 0073).",
+        )
 
     def __repr__(self) -> str:
-        return f"Forwarder(retry_max_seconds={self._retry_max})"
+        return (
+            f"Forwarder(retry_max_seconds={self._retry_max}, "
+            f"parked_max_age_days={self._parked_max_age_days})"
+        )
+
+    @property
+    def parked_max_age_days(self) -> int:
+        return self._parked_max_age_days
+
+    def purge_parked(self, *, force: bool = False) -> int:
+        """Housekeeping (module docstring): delete the parked batches older than
+        ``parked_max_age_days``. Runs at most once per :data:`PARKED_PURGE_SECONDS` unless
+        ``force``, and at once on the first call; returns the rows deleted. The one warning per
+        pass carries the count and the oldest batch id, never a payload (spec 2.3 invariant 7)."""
+        tick = self._monotonic()
+        last = self._last_purge
+        if not force and last is not None and tick - last < PARKED_PURGE_SECONDS:
+            return 0
+        self._last_purge = tick
+        cutoff = self._clock() - timedelta(days=self._parked_max_age_days)
+        purged, oldest = self._buffer.purge_parked(cutoff)
+        if purged:
+            self._metrics.inc("carto_edge_parked_purged_total", purged)
+            log.warning(
+                "forward.parked_purged",
+                purged=purged,
+                oldest_batch_id=oldest,
+                max_age_days=self._parked_max_age_days,
+            )
+        return purged
 
     def _backoff(self) -> float:
         # Bounded so 2**attempt cannot overflow during a long core outage; the cap rules anyway.
@@ -330,6 +385,10 @@ class Forwarder:
                 self.refresh_gauges()
             except Exception as exc:  # gauges are best effort; delivery goes on
                 log.warning("forward.gauges_error", error=type(exc).__name__)
+            try:
+                self.purge_parked()
+            except Exception as exc:  # a failed purge is retried next period
+                log.warning("forward.purge_error", error=type(exc).__name__)
             if report.idle:
                 stop.wait(IDLE_WAIT_SECONDS)
             elif report.failed:

@@ -230,6 +230,45 @@ class IngestListenerSettings(_Frozen):
             "with Retry-After, which bounds the memory that decoded batches take."
         ),
     )
+    body_timeout_seconds: int = Field(
+        default=30,
+        ge=1,
+        le=600,
+        description=(
+            "Deadline for receiving a whole request body (ADR 0073). A body still arriving "
+            "when it passes is answered 408 and its in-flight slot released, so a trickling "
+            "client cannot hold a slot for ever; /readyz reports 503 once every slot has been "
+            "held longer than this."
+        ),
+    )
+    max_decompression_ratio: int = Field(
+        default=200,
+        ge=2,
+        le=10_000,
+        description=(
+            "Largest decompressed-to-wire size ratio of a zstd body (ADR 0073), checked while "
+            "decompressing against the whole wire length, so a frame of a few bytes cannot "
+            "expand to max_decompressed_bytes. The edge's batches compress about 5 to 20 times."
+        ),
+    )
+    max_templates_per_system: int = Field(
+        default=50_000,
+        ge=1_000,
+        le=1_000_000,
+        description=(
+            "Ceiling on templates rows per (tenant, system) (ADR 0073). A batch that would push "
+            "a system past it is refused with 422 before anything is written; the edge parks it."
+        ),
+    )
+    max_edges_per_tenant: int = Field(
+        default=64,
+        ge=1,
+        le=10_000,
+        description=(
+            "Ceiling on edge_inventories rows per tenant (ADR 0073). An inventory from an edge "
+            "id not seen before is refused with 422 once the tenant holds this many edges."
+        ),
+    )
     claim_timeout_seconds: int = Field(
         default=120,
         ge=30,

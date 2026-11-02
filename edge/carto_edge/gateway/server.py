@@ -245,7 +245,11 @@ def _serve(settings: EdgeSettings, runtime: EdgeRuntime) -> int:
         client = build_core_client(core) if core.url is not None else None
         if client is not None:
             forwarder = Forwarder(
-                buffer, client, metrics=metrics, retry_max_seconds=core.retry_max_seconds
+                buffer,
+                client,
+                metrics=metrics,
+                retry_max_seconds=core.retry_max_seconds,
+                parked_max_age_days=core.parked_max_age_days,
             )
             heartbeater = Heartbeater(
                 client, settings.tenant_id, runtime.sources, buffer, health, metrics=metrics

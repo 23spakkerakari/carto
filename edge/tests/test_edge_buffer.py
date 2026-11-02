@@ -4,7 +4,7 @@ parking and the round trip of the compressed wire form (spec 8.5, ADR 0014)."""
 from __future__ import annotations
 
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -127,6 +127,42 @@ def test_park_keeps_bytes_but_leaves_queue(tmp_path: Path) -> None:
         assert buf.oldest().id == second  # type: ignore[union-attr]
         assert buf.bytes() > 0
         assert buf.ack([first]) == 1  # an operator can still clear it
+
+
+def test_purge_parked_removes_old_parked_rows_and_their_bytes(tmp_path: Path) -> None:
+    """ADR 0073: a parked row older than the age is deleted and its bytes released; a younger
+    parked row and an old pending row stay (pending rows are core's to acknowledge)."""
+    old_at = NOW - timedelta(days=8)
+    with DiskBuffer(tmp_path / "b.sqlite", max_bytes=10_000_000, backpressure_ratio=0.8) as buf:
+        old_batch, young_batch, pending_batch = _batch(), _batch(), _batch()
+        old_id = buf.append_bytes(
+            compress_batch(old_batch),
+            source_id="src_wms_db",
+            batch_id=old_batch.batch_id,
+            events=2,
+            created_at=old_at,
+        )
+        young_id = buf.append(young_batch)  # created at NOW
+        buf.append_bytes(
+            compress_batch(pending_batch),
+            source_id="src_wms_db",
+            batch_id=pending_batch.batch_id,
+            events=2,
+            created_at=old_at,
+        )
+        assert buf.park(old_id) and buf.park(young_id)
+        before = buf.bytes()
+        old_size = len(compress_batch(old_batch))
+        assert buf.purge_parked(NOW - timedelta(days=7)) == (1, old_batch.batch_id)
+        assert buf.parked() == 1
+        assert buf.depth() == 1, "the old pending row is not touched"
+        assert buf.bytes() == before - old_size
+        assert buf.purge_parked(NOW - timedelta(days=7)) == (0, None)
+        assert buf.purge_parked(NOW + timedelta(seconds=1)) == (1, young_batch.batch_id)
+        assert buf.parked() == 0
+        assert buf.bytes() == len(compress_batch(pending_batch))
+    with DiskBuffer(tmp_path / "b.sqlite", max_bytes=10_000_000, backpressure_ratio=0.8) as again:
+        assert again.bytes() == len(compress_batch(pending_batch)), "the delete was committed"
 
 
 def test_rejects_bad_limits(tmp_path: Path) -> None:

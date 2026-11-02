@@ -37,6 +37,7 @@ from carto_schema.event import (
 )
 
 __all__ = [
+    "MAX_CONFIG_LIST_ITEMS",
     "MAX_INVENTORY_PINS",
     "MAX_INVENTORY_SOURCES",
     "MAX_INVENTORY_SYSTEMS",
@@ -55,6 +56,9 @@ MAX_INVENTORY_PINS: Final = 4096
 MAX_CONFIG_KEYS: Final = 64
 MAX_CONFIG_KEY_LEN: Final = 64
 MAX_CONFIG_VALUE_LEN: Final = 1024
+MAX_CONFIG_LIST_ITEMS: Final = 64
+"""Items in one config list value (ADR 0073): a list had no length cap, so one inventory could
+carry an unbounded number of strings into ``sources.config_json``."""
 MAX_SECRET_REF_LEN: Final = 1024
 
 # The secret_ref rule and the secret-key rule mirror ``carto_common.settings`` and
@@ -168,9 +172,11 @@ ConfigText = Annotated[
     str, Field(max_length=MAX_CONFIG_VALUE_LEN), AfterValidator(_require_config_value)
 ]
 """A config string value: bounded and under the value-shape rule of an attribute value."""
-ConfigValue = ConfigText | int | float | bool | None | list[ConfigText]
-"""A connector configuration value as shown in the console: scalars and lists of strings only,
-no nesting, so a secret cannot hide inside a structure core would not look at."""
+ConfigList = Annotated[list[ConfigText], Field(max_length=MAX_CONFIG_LIST_ITEMS)]
+"""A config list value: at most :data:`MAX_CONFIG_LIST_ITEMS` bounded strings."""
+ConfigValue = ConfigText | int | float | bool | None | ConfigList
+"""A connector configuration value as shown in the console: scalars and bounded lists of
+strings only, no nesting, so a secret cannot hide inside a structure core would not look at."""
 
 
 class InventorySystem(ContractModel):

@@ -21,6 +21,13 @@ Who writes what (ADR 0056):
   ``upsert_fields`` applies them again. A source the edge reported before and no longer lists
   is marked disabled, not deleted.
 
+Two ceilings bound what the edge can grow (ADR 0073, spec 2.3 invariant 8): templates are named
+by the edge, so :meth:`MetadataStore.templates_over_ceiling` tells ``ingest-api`` in one grouped
+query whether a batch would push a system past ``ingest.max_templates_per_system``, before the
+batch is claimed or written; ``edge_inventories`` is keyed by the body's ``edge_id``, so
+:meth:`MetadataStore.replace_inventory` refuses a new edge past ``max_edges`` with
+:class:`MetadataLimitError` inside its transaction, and nothing of that inventory is written.
+
 A pin names a field as ``system/template/path`` or ``system/*/path`` (any template, spec 8.3).
 :class:`InMemoryMetadataStore` is the reference and the test double; :class:`PostgresMetadataStore`
 uses SQLAlchemy Core ``text`` with ``ON CONFLICT`` on one engine. Every statement is fixed text
@@ -58,6 +65,7 @@ __all__ = [
     "InMemoryMetadataStore",
     "InventoryResult",
     "MetadataError",
+    "MetadataLimitError",
     "MetadataNotFoundError",
     "MetadataStaleError",
     "MetadataStore",
@@ -86,6 +94,11 @@ class MetadataNotFoundError(MetadataError):
 
 class MetadataStaleError(MetadataError):
     """``expected_version`` did not match the row's ``updated_at`` (optimistic concurrency)."""
+
+
+class MetadataLimitError(MetadataError):
+    """A per-tenant ceiling would be exceeded (ADR 0073); the write was refused and nothing
+    changed. The message names the ceiling, never the input."""
 
 
 _EPOCH: Final = datetime(1970, 1, 1, tzinfo=UTC)
@@ -234,6 +247,20 @@ def _page(limit: int) -> int:
     return max(1, min(int(limit), MAX_PAGE))
 
 
+def _templates_by_system(records: Iterable[TemplateRecord]) -> dict[str, set[str]]:
+    """The distinct template ids a batch carries, per system, in first-appearance order."""
+    wanted: dict[str, set[str]] = {}
+    for record in records:
+        wanted.setdefault(record.system_id, set()).add(record.template_id)
+    return wanted
+
+
+def _check_ceiling(value: int, name: str) -> None:
+    if value < 1:
+        msg = f"{name} must be at least 1"
+        raise ValueError(msg)
+
+
 @runtime_checkable
 class MetadataStore(Protocol):
     def upsert_templates(
@@ -247,6 +274,14 @@ class MetadataStore(Protocol):
         transaction) so the increment and the batch's ``done`` mark commit together."""
         ...
 
+    def templates_over_ceiling(
+        self, tenant_id: str, records: Iterable[TemplateRecord], *, ceiling: int
+    ) -> str | None:
+        """The first system whose ``templates`` rows would exceed ``ceiling`` once ``records``
+        were upserted (ADR 0073), or ``None`` when every system fits. Ids the system already
+        holds add nothing. One grouped query per call, whatever the batch size."""
+        ...
+
     def upsert_fields(self, tenant_id: str, records: Iterable[FieldRecord]) -> int:
         """The edge-owned columns, with the kept pins applied; never the profiler's."""
         ...
@@ -256,8 +291,13 @@ class MetadataStore(Protocol):
         identifier."""
         ...
 
-    def replace_inventory(self, inventory: EdgeInventory, received_at: datetime) -> InventoryResult:
-        """Systems, then sources, the payload, and the pins over the matching fields."""
+    def replace_inventory(
+        self, inventory: EdgeInventory, received_at: datetime, *, max_edges: int | None = None
+    ) -> InventoryResult:
+        """Systems, then sources, the payload, and the pins over the matching fields. With
+        ``max_edges``, an ``edge_id`` the tenant has not recorded yet is refused with
+        :class:`MetadataLimitError` once the tenant holds that many edges, and nothing of the
+        inventory is written (ADR 0073); a known edge always replaces its copy."""
         ...
 
     def list_systems(self, tenant_id: str) -> list[SystemRecord]: ...
@@ -364,6 +404,22 @@ class InMemoryMetadataStore:
                 written += 1
         return written
 
+    def templates_over_ceiling(
+        self, tenant_id: str, records: Iterable[TemplateRecord], *, ceiling: int
+    ) -> str | None:
+        _check_ceiling(ceiling, "ceiling")
+        wanted = _templates_by_system(records)
+        with self._lock:
+            for system_id, ids in wanted.items():
+                held = {
+                    template_id
+                    for (tenant, system, template_id) in self._templates
+                    if tenant == tenant_id and system == system_id
+                }
+                if len(held | ids) > ceiling:
+                    return system_id
+        return None
+
     def upsert_fields(self, tenant_id: str, records: Iterable[FieldRecord]) -> int:
         written = 0
         with self._lock:
@@ -433,9 +489,20 @@ class InMemoryMetadataStore:
                 written += 1
         return written
 
-    def replace_inventory(self, inventory: EdgeInventory, received_at: datetime) -> InventoryResult:
+    def replace_inventory(
+        self, inventory: EdgeInventory, received_at: datetime, *, max_edges: int | None = None
+    ) -> InventoryResult:
         tenant = inventory.tenant_id
+        if max_edges is not None:
+            _check_ceiling(max_edges, "max_edges")
         with self._lock:
+            if max_edges is not None and (tenant, inventory.edge_id) not in self._inventories:
+                held = sum(1 for (owner, _edge) in self._inventories if owner == tenant)
+                if held >= max_edges:
+                    msg = (
+                        "edge ceiling reached: the tenant already holds the maximum number of edges"
+                    )
+                    raise MetadataLimitError(msg)
             for system in inventory.systems:
                 self._systems[tenant, system.id] = SystemRecord(
                     id=system.id,
@@ -726,6 +793,18 @@ _TEMPLATES = sqlalchemy.text(
     "last_seen, count FROM templates WHERE tenant_id = :tenant_id "
     "AND (:any_system OR system_id = :system_id) ORDER BY system_id, id"
 )
+_TEMPLATE_COUNTS = sqlalchemy.text(
+    "SELECT system_id, COUNT(*) AS total, "
+    "COUNT(*) FILTER (WHERE system_id || '/' || id = ANY(:pairs)) AS known "
+    "FROM templates WHERE tenant_id = :tenant_id AND system_id = ANY(:systems) "
+    "GROUP BY system_id"
+)
+"""ADR 0073: per system of a batch, the rows it holds and how many of the batch's
+``system/template`` pairs are among them, in one query."""
+_EDGE_COUNTS = sqlalchemy.text(
+    "SELECT COUNT(*) AS total, COUNT(*) FILTER (WHERE edge_id = :edge_id) AS known "
+    "FROM edge_inventories WHERE tenant_id = :tenant_id"
+)
 
 
 def _json(value: object) -> str:
@@ -909,6 +988,30 @@ class PostgresMetadataStore:
             connection.execute(_UPSERT_TEMPLATE, rows)
         return len(rows)
 
+    def templates_over_ceiling(
+        self, tenant_id: str, records: Iterable[TemplateRecord], *, ceiling: int
+    ) -> str | None:
+        _check_ceiling(ceiling, "ceiling")
+        wanted = _templates_by_system(records)
+        if not wanted:
+            return None
+        pairs = [
+            f"{system_id}/{template_id}"
+            for system_id, ids in wanted.items()
+            for template_id in sorted(ids)
+        ]
+        rows = self._rows(
+            _TEMPLATE_COUNTS,
+            {"tenant_id": tenant_id, "systems": list(wanted), "pairs": pairs},
+            "template count",
+        )
+        counts = {str(row.system_id): (int(row.total), int(row.known)) for row in rows}
+        for system_id, ids in wanted.items():
+            total, known = counts.get(system_id, (0, 0))
+            if total - known + len(ids) > ceiling:
+                return system_id
+        return None
+
     def _pins(self, connection: Connection, tenant_id: str) -> list[InventoryFieldPolicy]:
         return _pins_from(connection.execute(_PINS, {"tenant_id": tenant_id}).all())
 
@@ -1001,10 +1104,26 @@ class PostgresMetadataStore:
             raise MetadataError(msg) from exc
         return len(rows)
 
-    def replace_inventory(self, inventory: EdgeInventory, received_at: datetime) -> InventoryResult:
+    def replace_inventory(
+        self, inventory: EdgeInventory, received_at: datetime, *, max_edges: int | None = None
+    ) -> InventoryResult:
         tenant = inventory.tenant_id
+        if max_edges is not None:
+            _check_ceiling(max_edges, "max_edges")
         try:
             with self._engine.begin() as connection:
+                if max_edges is not None:
+                    # First in the transaction: a refused inventory writes nothing (the raise
+                    # is not a driver error, so it leaves the except below alone and rolls back).
+                    edges = connection.execute(
+                        _EDGE_COUNTS, {"tenant_id": tenant, "edge_id": inventory.edge_id}
+                    ).one()
+                    if int(edges.known) == 0 and int(edges.total) >= max_edges:
+                        msg = (
+                            "edge ceiling reached: the tenant already holds the maximum number "
+                            "of edges"
+                        )
+                        raise MetadataLimitError(msg)
                 if inventory.systems:
                     connection.execute(
                         _UPSERT_SYSTEM,
