@@ -31,8 +31,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
         with:
           enable-cache: true
           python-version: "3.12"
@@ -44,6 +44,12 @@ jobs:
         run: uv run ruff format --check .
       - name: Types (mypy --strict)
         run: uv run mypy
+      # Both scenarios before the tests: the simulator-gated tests (`needs_sim`) skip silently
+      # when sim-out/shop is missing (ADR 0072).
+      - name: Simulator scenario A (14 days) and scenario C (28 days)
+        run: |
+          make sim SCENARIO=shop DAYS=14 SEED=1
+          make sim SCENARIO=people_ops DAYS=28 SEED=1
       - name: Tests (unit and property; integration tests run in their own job)
         run: >
           uv run pytest -m "not integration" --cov --cov-report=xml --cov-report=term
@@ -53,14 +59,11 @@ jobs:
         run: uv run python tools/ci/annotate.py junit pytest-report.xml
       - name: JSON Schema drift check
         run: uv run carto-schema check --dir packages/carto-schema/schemas
-      - name: Simulator scenario A (14 days)
-        run: make sim SCENARIO=shop DAYS=14 SEED=1
       - name: Eval harness (scoring self-check, M0 path)
         run: make eval SCENARIO=shop DAYS=14 SEED=1
       - name: Eval with the engine, in memory (spec 18.4; analyzer, load, discover, map, score)
         run: |
           make eval-engine SCENARIO=shop DAYS=14 SEED=1 ENGINE=memory EVAL_OUT=eval/reports/engine
-          make sim SCENARIO=people_ops DAYS=28 SEED=1
           make eval-engine SCENARIO=people_ops DAYS=28 SEED=1 ENGINE=memory EVAL_OUT=eval/reports/engine
       - name: Simulator output summary
         run: |
@@ -71,12 +74,12 @@ jobs:
           cat eval/reports/engine/shop.md >> "$GITHUB_STEP_SUMMARY"
           echo "## Eval report (engine, people_ops 28 days)" >> "$GITHUB_STEP_SUMMARY"
           cat eval/reports/engine/people_ops.md >> "$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: eval-report
           path: eval/reports/
           if-no-files-found: error
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: coverage
           path: coverage.xml
@@ -90,8 +93,8 @@ jobs:
       run:
         working-directory: web
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version-file: web/.nvmrc
           cache: npm
@@ -112,7 +115,7 @@ jobs:
         run: npx playwright install --with-deps chromium
       - name: End-to-end tests with axe and the XSS corpus (threat 4)
         run: npm run e2e
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: failure()
         with:
           name: playwright-report
@@ -124,29 +127,38 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
         with:
           enable-cache: true
           python-version: "3.12"
       - name: Install workspace
         run: uv sync --locked --all-packages
-      - name: Simulator scenario A (14 days)
-        run: make sim SCENARIO=shop DAYS=14 SEED=1
+      - name: Simulator scenario A (14 days) and scenario C (28 days)
+        run: |
+          make sim SCENARIO=shop DAYS=14 SEED=1
+          make sim SCENARIO=people_ops DAYS=28 SEED=1
       - name: Docker-backed integration tests (PostgreSQL, MySQL, ClickHouse)
         run: uv run pytest -m integration -q --junitxml=integration-report.xml
       - name: Annotate integration test failures
         if: failure()
         run: uv run python tools/ci/annotate.py junit integration-report.xml
       - name: Offline analyzer over scenario A
-        run: make analyze SCENARIO=shop 2>&1 | tee analyze.log
-      - name: Leak test (spec 18.3)
-        run: make leak SCENARIO=shop 2>&1 | tee leak.log
+        run: make analyze SCENARIO=shop 2>&1 | tee analyze-shop.log
+      - name: Leak test over scenario A (spec 18.3)
+        run: make leak SCENARIO=shop 2>&1 | tee leak-shop.log
+      - name: Offline analyzer over scenario C
+        run: make analyze SCENARIO=people_ops 2>&1 | tee analyze-people_ops.log
+      - name: Leak test over scenario C (spec 18.3)
+        run: make leak SCENARIO=people_ops 2>&1 | tee leak-people_ops.log
       - name: Annotate analyzer and leak test failures
         if: failure()
         run: |
-          python3 tools/ci/annotate.py tail analyze.log --title "make analyze" --lines 40
-          python3 tools/ci/annotate.py tail leak.log --title "make leak" --lines 80
+          for scenario in shop people_ops; do
+            [ -f "analyze-$scenario.log" ] && python3 tools/ci/annotate.py tail "analyze-$scenario.log" --title "make analyze SCENARIO=$scenario" --lines 40
+            [ -f "leak-$scenario.log" ] && python3 tools/ci/annotate.py tail "leak-$scenario.log" --title "make leak SCENARIO=$scenario" --lines 80
+          done
+          true
       - name: Throughput benchmark (spec 17, informative on shared runners)
         run: make bench SCENARIO=shop | tee bench.txt
       - name: Gateway path benchmark (ADR 0028, informative on shared runners)
@@ -157,7 +169,7 @@ jobs:
           cat bench.txt bench-gateway.txt >> "$GITHUB_STEP_SUMMARY"
           echo "::notice title=bench pipeline::$(grep -E '^  events ' bench.txt | tr -s ' ')"
           echo "::notice title=bench gateway::$(grep -E '^  forwarded ' bench-gateway.txt | tr -s ' ')"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: bundle-manifest
           path: |
@@ -170,10 +182,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
       - name: Build carto-edge
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           file: deploy/docker/base.Dockerfile
@@ -186,7 +198,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: Build carto-core
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           file: deploy/docker/base.Dockerfile
@@ -204,11 +216,20 @@ jobs:
           core_help="$(docker run --rm --read-only --cap-drop ALL --security-opt no-new-privileges carto-core:ci --help)"
           sed -n 1,5p <<< "$edge_help"
           sed -n 1,5p <<< "$core_help"
-      - name: Trivy image scan
-        uses: aquasecurity/trivy-action@v0.36.0
+      - name: Trivy image scan (carto-edge)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           scan-type: image
           image-ref: carto-edge:ci
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+      - name: Trivy image scan (carto-core)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: carto-core:ci
           scanners: vuln
           severity: HIGH,CRITICAL
           ignore-unfixed: true
@@ -219,16 +240,47 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
-      # Both push-route proxies (ADR 0032) run in every command of this job.
+      # Both push-route proxies (ADR 0032) run in every command of this job. dev.env carries the
+      # Dex values of the dev profile; compose.yaml itself defaults to production values (ADR
+      # 0072). The job reaches the published ports from the runner, so the loopback binding holds.
       COMPOSE: >-
-        docker compose -f deploy/compose/compose.yaml --profile push-otlp --profile push-webhooks
+        docker compose -f deploy/compose/compose.yaml --env-file deploy/compose/dev.env
+        --profile push-otlp --profile push-webhooks
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Build the service images
         run: make images
+      # carto-edge and carto-core are scanned in the images job; these three are built only here.
+      - name: Trivy image scan (carto-ctl)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: carto-ctl:dev
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+      - name: Trivy image scan (carto-simulator)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: carto-simulator:dev
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+      - name: Trivy image scan (carto-web)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: carto-web:dev
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
       - name: Generate the database passwords and the dev secrets
         run: |
-          for s in pg_password ch_password pg_ingest_password pg_app_password pg_worker_password oidc_client_secret; do
+          for s in pg_password ch_password ch_reader_password pg_ingest_password pg_app_password pg_worker_password oidc_client_secret; do
             openssl rand -hex 24 | tr -d '\r\n' > "deploy/compose/secrets/$s"
           done
       - name: Generate a throwaway certificate for the webhook proxy and the console
@@ -376,8 +428,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
         with:
           enable-cache: true
           python-version: "3.12"
@@ -389,8 +441,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
         with:
           enable-cache: true
           python-version: "3.12"
@@ -412,9 +464,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     container:
-      image: semgrep/semgrep
+      image: semgrep/semgrep:1.183.0@sha256:2e45517a85e13a9cca14a2a00df6bb48affd66b8ebfae1b0991cd57578362fb0
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Rule self-tests (spec 18.3)
         run: semgrep --test --metrics=off tools/semgrep
       - name: Read-only connector rule over connector modules (spec 8.1, ADR 0008)
@@ -432,20 +484,22 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Scan the lockfile
         run: |
-          docker run --rm -v "$PWD:/src" ghcr.io/google/osv-scanner:latest scan source --lockfile /src/uv.lock
+          docker run --rm -v "$PWD:/src" \
+            ghcr.io/google/osv-scanner:v2.7.0@sha256:4f3b7e2c64b9d38a5febc5a7e4a3dfef1d1362f726dea7a2ef4762b46469fcd0 \
+            scan source --lockfile /src/uv.lock
 
   gitleaks:
     name: gitleaks
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
-      - uses: gitleaks/gitleaks-action@v2
+      - uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Annotate gitleaks findings (rule, file and line; values redacted)
@@ -463,8 +517,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: aquasecurity/trivy-action@v0.36.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           scan-type: fs
           scan-ref: .

@@ -8,13 +8,17 @@
 #
 # Build args select the member to install and the console script to run:
 #   docker build -f deploy/docker/base.Dockerfile --build-arg MEMBER=edge --build-arg ENTRY=carto-edge .
+#
+# Base images are pinned by digest (spec 14.8, ADR 0072); Renovate moves the digests with the
+# patch releases (renovate.json, `docker:pinDigests`). The repository's .dockerignore keeps
+# caches, tests, secrets and generated data out of the build context.
 
-ARG PYTHON_IMAGE=python:3.12-slim-bookworm
+ARG PYTHON_IMAGE=python:3.12-slim-bookworm@sha256:e697c81897302a4c4333bade000d98038fbb21eb064f8ee1fd42d02ebcd9d337
 
 FROM ${PYTHON_IMAGE} AS builder
 ARG MEMBER
 ENV UV_LINK_MODE=copy UV_COMPILE_BYTECODE=1 UV_PYTHON_DOWNLOADS=never UV_PROJECT_ENVIRONMENT=/opt/carto
-COPY --from=ghcr.io/astral-sh/uv:0.9 /uv /usr/local/bin/uv
+COPY --from=ghcr.io/astral-sh/uv:0.9.30@sha256:538e0b39736e7feae937a65983e49d2ab75e1559d35041f9878b7b7e51de91e4 /uv /usr/local/bin/uv
 WORKDIR /src
 COPY pyproject.toml uv.lock .python-version ./
 COPY packages ./packages

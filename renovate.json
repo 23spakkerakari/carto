@@ -3,6 +3,7 @@
   "extends": [
     "config:recommended",
     "helpers:pinGitHubActionDigests",
+    "docker:pinDigests",
     ":pinDevDependencies"
   ],
   "schedule": ["before 6am on monday"],
@@ -15,6 +16,13 @@
     {
       "matchManagers": ["pep621"],
       "rangeStrategy": "bump"
+    },
+    {
+      "description": "Base and scanner images stay on their pinned line; Renovate moves the digest and the patch (ADR 0072)",
+      "matchManagers": ["dockerfile", "docker-compose", "github-actions"],
+      "matchDatasources": ["docker"],
+      "matchUpdateTypes": ["major"],
+      "enabled": false
     }
   ]
 }

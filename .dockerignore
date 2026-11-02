@@ -1,0 +1,28 @@
+# Build context for deploy/docker/base.Dockerfile (ADR 0072). It COPYs pyproject.toml, uv.lock,
+# .python-version, packages/, edge/, core/, simulator/, eval/ and tools/; everything else, and
+# anything below that is a cache, a test, a secret or generated data, stays out of the image.
+.git
+.github
+.venv
+**/__pycache__
+**/.pytest_cache
+.mypy_cache
+.ruff_cache
+.hypothesis
+**/tests
+sim-out
+eval/reports
+legacy
+docs
+web/node_modules
+web/dist
+web/dist-e2e
+deploy/compose/secrets
+deploy/compose/proxy-tls
+*.carto
+*.db
+.env*
+coverage.xml
+.coverage
+requirements-export.txt
+sbom*.json

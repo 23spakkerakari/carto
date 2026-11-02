@@ -18,20 +18,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
         with:
           enable-cache: true
           python-version: "3.12"
       - run: uv sync --locked --all-packages
       - name: Generate CycloneDX SBOM
-        uses: anchore/sbom-action@v0
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           path: .
           format: cyclonedx-json
           output-file: sbom.cdx.json
           upload-artifact: false
-      - uses: sigstore/cosign-installer@v3
+      - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
       - name: Sign the SBOM (keyless)
         run: cosign sign-blob --yes --bundle sbom.cdx.json.sigstore.json sbom.cdx.json
       - name: Verify the signature
@@ -41,7 +41,7 @@ jobs:
             --certificate-identity-regexp "^https://github.com/${{ github.repository }}/" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             sbom.cdx.json
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: sbom-${{ github.sha }}
           path: |

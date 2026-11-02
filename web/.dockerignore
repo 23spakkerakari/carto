@@ -1,0 +1,13 @@
+# Build context for web/deploy/Dockerfile (ADR 0072): `npm ci` from the lockfile, then
+# `npm run build` (tsc -b, vite build, scripts/check-build.mjs) and deploy/nginx.conf.
+node_modules
+dist
+dist-e2e
+coverage
+test-results
+playwright-report
+blob-report
+.vite
+e2e
+*.local
+.env*

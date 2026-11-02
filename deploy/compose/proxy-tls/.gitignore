@@ -1,2 +1,4 @@
-tls.crt
-tls.key
+# The certificate and key never enter git (ADR 0072): everything but this file and the README.
+*
+!.gitignore
+!README.md

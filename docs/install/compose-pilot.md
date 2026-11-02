@@ -430,6 +430,7 @@ Server: through the availability group listener; carto connects with
 | `sslmode` | `verify-full` | PostgreSQL libpq mode |
 | `ssl` | `true` | MySQL: TLS with certificate verification |
 | `encrypt`, `trust_server_certificate`, `driver` | `true`, `false`, `ODBC Driver 18 for SQL Server` | SQL Server |
+| `insecure_transport` | `false` | Admin flag (spec 8.1): a `sslmode` below `verify-ca`, `ssl: false`, `encrypt: false` or `trust_server_certificate: true` is refused without it. With it the gateway writes a `source.insecure_transport` audit row naming the keys and logs a warning each time it enables the source. Leave it off |
 | `ca_file` | none | CA bundle for the server certificate |
 | `poll_seconds` | 60 | 5 to 86,400 |
 | `query_timeout_seconds`, `connect_timeout_seconds` | 30, 10 | Timeouts |
@@ -490,6 +491,7 @@ token in Vault as the whole secret value.
 | `max_concurrency`, `backfill_chunk_minutes` | 2, 60 | Backfill protection for the search head |
 | `verify_tls`, `ca_file` | `true`, none | Certificate verification and a custom CA |
 | `allow_plaintext` | `false` | Admin flag to allow `http://`; leave it off |
+| `insecure_transport` | `false` | Admin flag (spec 8.1): `verify_tls: false` or `allow_plaintext: true` is refused without it. With it the gateway writes a `source.insecure_transport` audit row naming the keys and logs a warning each time it enables the source. Leave it off |
 | `timeout_seconds`, `requests_per_second` | 120, 2 | Request timeout and rate limit |
 | `dedupe_size`, `max_windows_per_read` | 100,000, 288 | Deduplication memory; windows per poll |
 | `failure_threshold`, `breaker_reset_seconds` | 5, 60 | Circuit breaker |
@@ -599,9 +601,16 @@ Copy the template [`otel/collector.yaml`](../../otel/collector.yaml) to
 `deploy/compose/collector.yaml` and edit it:
 
 - One receiver per source, each setting the `carto.source_id` resource attribute to the source
-  id above; applications that send OTLP must set that resource attribute themselves. Records
-  without it are dropped by the `filter/require_source` processor, and the gateway rejects
+  id above: the log receivers through their `resource` operator, the OTLP receiver through the
+  `resource/otlp` processor of its own `logs/otlp` pipeline, which overwrites whatever the
+  sender put there. The collector names the source, never the sender, so an application that
+  can reach a receiver cannot write into another source (ADR 0072). Records that still lack the
+  attribute are dropped by the `filter/require_source` processor, and the gateway rejects
   records whose id is not an enabled `otlp` source.
+- The collector runs inside the edge trust zone (spec 5.2): the syslog, HEC and OTLP receivers
+  carry REPLACE-marked TLS blocks with a `client_ca_file` (mutual TLS) and the OTLP receivers
+  also require the bearer token of the `bearertokenauth` extension, so nothing reaches a
+  receiver in clear or without a certificate from the CA you name there.
 - Keep the receivers you use in `service.pipelines.logs.receivers` and delete the others.
 - The `otlphttp/edge` exporter uses `ca_file`, `cert_file` and `key_file` from the
   `pki-otel-collector` volume (`/etc/carto/pki/to-edge-gateway-ca.crt`, `to-edge-gateway.crt`,
@@ -673,10 +682,11 @@ COMPOSE="docker compose -f deploy/compose/compose.yaml -f deploy/compose/compose
 
 ### Push routes (ADR 0032)
 
-Two proxies, each off until you enable its profile, are the only services that publish a port
+Two proxies, each off until you enable its profile, publish a port besides the console's `web`
 (spec 14.5). Both run `nginxinc/nginx-unprivileged` as uid 10001 with a read-only root
-filesystem, and both join a non-internal `ingress` network so the port can be published: decide
-who reaches them with host firewall rules.
+filesystem, and both join a non-internal `ingress` network so the port can be published. The
+port binds `127.0.0.1` until you set `CARTO_BIND` to the interface your senders reach; see
+"Ports" under Security notes for the binding and the firewall rules that apply to it.
 
 **`proxy-otlp`** (`--profile push-otlp`, port `CARTO_OTLP_PORT`, default 4318) passes the TLS
 connection through to `edge-gateway` unopened, so the gateway checks the collector's own
@@ -782,9 +792,12 @@ A raw identifier, a name or a secret in these logs is a security defect: report 
 
 ## The dev profile with the simulator
 
-`make dev` is the development stack, not a pilot: it builds the images, creates the two password
-files, and runs `docker compose -f deploy/compose/compose.yaml --profile dev up --remove-orphans`
-in the foreground. The `simulator` service runs `carto-sim live --scenario shop --days 2 --speed
+`make dev` is the development stack, not a pilot: it builds the images, creates the password
+files, and runs `docker compose -f deploy/compose/compose.yaml --env-file deploy/compose/dev.env
+--profile dev up --remove-orphans` in the foreground. `dev.env` holds the Dex values of the dev
+profile (plain-HTTP back-channel, `email` claim, the four bindings); `compose.yaml` itself
+defaults to the production values of "Login" below, so a pilot never passes that file (ADR
+0072). The `simulator` service runs `carto-sim live --scenario shop --days 2 --speed
 60 --out /data/sim`, replaying two simulated days of scenario A into the `sim-data` volume in
 about 48 minutes (see "Live mode" in [simulator/README.md](../../simulator/README.md)). The
 collector tails the five log sources with `otel/collector.dev.yaml`, the gateway watches the
@@ -829,8 +842,8 @@ spec 14.1). Set in the pilot `.env`:
 | `CARTO_OIDC_CLIENT_ID` | The client id registered at the provider (default `carto-console`). |
 | `deploy/compose/secrets/oidc_client_secret` | The client secret, as a file (never an environment value). |
 | `CARTO_OIDC_GROUPS_CLAIM` | The ID token claim that carries group names (default `groups`; ask the provider to include it). |
-| `CARTO_OIDC_GROUP_ROLES` | JSON mapping group names to roles `admin`, `integration_engineer`, `business_viewer`, `auditor` (spec 14.2), applied once to `role_bindings` when the table is empty. |
-| `CARTO_OIDC_BACKCHANNEL_URL`, `CARTO_OIDC_ALLOW_HTTP` | Leave unset for a real provider: the api then reaches the issuer directly over HTTPS. |
+| `CARTO_OIDC_GROUP_ROLES` | JSON mapping group names to roles `admin`, `integration_engineer`, `business_viewer`, `auditor` (spec 14.2), applied once to `role_bindings` when the table is empty. Unset, nothing is seeded and nobody can act until an admin binds a group. |
+| `CARTO_OIDC_BACKCHANNEL_URL`, `CARTO_OIDC_ALLOW_HTTP` | Leave unset: the api reaches the issuer directly over HTTPS and refuses a plain `http://` issuer. `compose.yaml` defaults to these values; only `deploy/compose/dev.env` (passed by `make dev` and CI) sets the Dex ones (ADR 0072). |
 
 A user whose groups match no binding can sign in but may do nothing (deny by default); an
 admin changes bindings in M6's Admin screen, for now in `role_bindings`. Sessions idle out after
@@ -839,7 +852,10 @@ in M6; until then the console needs the provider.
 
 In the `dev` profile the stack runs Dex (ADR 0052) under the console origin at `/dex`, with
 four users bound by email: `admin@carto.local`, `engineer@carto.local`, `viewer@carto.local`,
-`auditor@carto.local`, password `password`. Dex is never part of a customer install.
+`auditor@carto.local`, password `password`. Those values (`CARTO_OIDC_ALLOW_HTTP=true`, the
+`http://dex:5556/dex` back-channel, the `email` claim and the four bindings) live in
+`deploy/compose/dev.env`, which `make dev` passes with `--env-file`; `compose.yaml` never sets
+them. Dex is never part of a customer install.
 
 ### First look
 
@@ -1028,12 +1044,22 @@ other mismatch still stops the gateway.
   ownership of their data directory and then drop to their own user, so those two get back
   `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `SETGID` and `SETUID` only. `volumes-init` runs as root with
   `CHOWN` only and no network; the other one-shot jobs and the simulator have no network either.
-- **Ports.** `compose.yaml` publishes no port on the host. All services sit on the `core` and
-  `edge` networks, both `internal: true`; `ingest-api` is the only service on both. Inside the
-  stack: `ingest-api` and `edge-gateway` on 8443 (mutual TLS), PostgreSQL 5432, ClickHouse 8123
-  (HTTP, the interface carto uses), and the collector's health check (13133) and metrics (8888)
-  on its loopback only. Your override
-  adds egress for `edge-gateway` (step 8).
+- **Ports.** Three services publish a port, each bound to `127.0.0.1` unless `CARTO_BIND` names
+  another address (ADR 0072): `web` on `CARTO_WEB_PORT` (8080, the console origin) and, only
+  when their profile is enabled, `proxy-otlp` on `CARTO_OTLP_PORT` (4318) and `proxy-webhooks`
+  on `CARTO_WEBHOOK_PORT` (8443). With the default binding the console is reachable from the
+  VM itself (an SSH tunnel, `ssh -L 8080:127.0.0.1:8080 <vm>`, gives a workstation the same
+  view) and no push route accepts traffic from the network. To open them, set `CARTO_BIND` in
+  `.env` to the address of the interface you mean (`CARTO_BIND=10.0.5.20`; `0.0.0.0` is every
+  interface) and filter it there: Docker programs its published ports into the `nat` and
+  `FORWARD` chains, so rules in the host's `INPUT` chain (plain ufw or firewalld rules) do not
+  apply to them; put the rules in the `DOCKER-USER` chain, in firewalld's `docker` zone, or in
+  the cloud security group in front of the VM. Everything else sits on the `core` and `edge`
+  networks, both `internal: true`; `ingest-api` is the only service on both. Inside the stack:
+  `ingest-api`, `api` and `edge-gateway` on 8443 (mutual TLS), PostgreSQL 5432, ClickHouse 8123
+  (HTTP, the interface carto uses), Dex 5556 (dev profile only), and the collector's health
+  check (13133) and metrics (8888) on its loopback only. Your override adds egress for
+  `edge-gateway` (step 8).
 - **Mutual TLS.** Each listener requires a client certificate signed by its own CA (TLS 1.2
   minimum), so a caller meant for another listener fails the handshake. The CA keys live on the
   `pki-ca` volume, which only `pki-init` mounts, so no running service can mint certificates.
@@ -1059,9 +1085,11 @@ other mismatch still stops the gateway.
 - **Logs.** The gateway writes its own access line (method, route template, status, duration);
   the raw path and query string are never logged, and the HTTP client libraries are held at
   WARNING because their INFO lines carry full URLs (spec 14.12).
-- **Images.** The runtime base is `python:3.12-slim-bookworm` with `/bin/sh` kept for the
-  entrypoint shim. Distroless bases pinned by digest, cosign signatures and SLSA provenance
-  arrive in M6.
+- **Images.** The runtime base is `python:3.12-slim-bookworm`, pinned by digest like the uv,
+  Node and nginx images (Renovate moves the digests), with `/bin/sh` kept for the entrypoint
+  shim; `.dockerignore` files keep tests, caches, secrets and generated data out of the build
+  context, and CI scans every image it builds with Trivy (ADR 0072). Distroless bases, cosign
+  signatures and SLSA provenance arrive in M6.
 
 ## Deferred to M6
 
@@ -1069,7 +1097,7 @@ other mismatch still stops the gateway.
 | --- | --- |
 | Helm chart, Kubernetes NetworkPolicies, Pod Security Standard `restricted` | 5.5, 14.5, 14.6 |
 | Signed images and SBOMs with verification (`carto-ctl verify-signatures`) | 14.8 |
-| TLS to PostgreSQL and ClickHouse; per-service database users | 14.4 |
+| TLS to PostgreSQL and ClickHouse; the migrate-created per-service ClickHouse users (an INSERT-only `carto_ingest`); until then the stack ships the owner `carto` for `migrate`, `ingest-api` and `worker` and the read-only `carto_reader` for `api` (ADR 0071) | 14.4 |
 | AWS KMS, Azure Key Vault, GCP KMS; `aws-sm://`, `azure-kv://`, `gcp-sm://` | 8.4, 14.3 (ADR 0012, 0013) |
 | Automated certificate rotation (cert-manager on Kubernetes) | 14.4 |
 | Backups, restore drill (`carto-ctl drill restore`), support bundle (`carto-ctl support-bundle`) | 14.11, 16 |

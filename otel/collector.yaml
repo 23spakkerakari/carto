@@ -1,13 +1,28 @@
 # OpenTelemetry Collector Contrib configuration template for carto (spec 8.1.2, 5.3).
 #
-# Upstream build, configuration only, no custom code. The collector tails log files, receives
-# syslog, Splunk HEC and OTLP, keeps a persistent queue on disk, and forwards OTLP/HTTP logs to
-# edge-gateway over mutual TLS. Every receiver sets the `carto.source_id` resource attribute so
-# edge-gateway knows which configured source a record belongs to (the id must match a source of
-# type `otlp` in sources.yaml).
+# Upstream build (otel/opentelemetry-collector-contrib, the version deploy/compose/compose.yaml
+# runs), configuration only, no custom code. The collector tails log files, receives syslog,
+# Splunk HEC and OTLP, keeps a persistent queue on disk, and forwards OTLP/HTTP logs to
+# edge-gateway over mutual TLS.
+#
+# Trust zone (spec 5.2, ADR 0072). The collector must run inside the edge trust zone: on the
+# host that holds the log files, or on a segment that only the senders below can reach. Its
+# network receivers are ingress from other processes, so each carries a REPLACE-marked TLS block
+# with a client CA (mutual TLS: a sender without a certificate from that CA never gets past the
+# handshake) and the OTLP receivers also require the bearer token of the `bearertokenauth`
+# extension. Nothing here listens in clear.
+#
+# `carto.source_id` names the configured source a record belongs to (a source of type `otlp` in
+# sources.yaml). This pipeline sets it per receiver and never takes it from the sender: the log
+# receivers through their `resource` operator, the OTLP receiver through the `resource/otlp`
+# processor of its own pipeline, which overwrites whatever the sender put there. Anyone who can
+# reach a receiver could otherwise write into any source. edge-gateway still rejects an id that
+# is not an enabled `otlp` source, and `filter/require_source` drops a record that reached the
+# exporter without an id (a misconfigured receiver), so the gateway never guesses (spec 2.3
+# invariant 3).
 #
 # Replace the values marked REPLACE. Keep the collector on the same host or network segment as
-# the log files; it is part of the edge trust zone (spec 5.2).
+# the log files.
 #
 # A collector on another host than the Compose stack reaches edge-gateway through proxy-otlp
 # (profile push-otlp, ADR 0032), which passes the TLS connection through to the gateway. Its
@@ -27,6 +42,13 @@ extensions:
       directory: /var/lib/otelcol/storage
   health_check:
     endpoint: 127.0.0.1:13133
+  # Server-side bearer token for the OTLP receivers: senders put `Authorization: Bearer <token>`
+  # on every request, on top of their client certificate. One token per collector, in a file the
+  # collector user can read and nobody else (0600). The `basicauth` extension (htpasswd file) is
+  # the alternative for senders that only speak basic auth; wire it the same way.
+  bearertokenauth:
+    scheme: Bearer
+    filename: /etc/otelcol/otlp-sender.token # REPLACE: the token your OTLP senders present
 
 receivers:
   # Application log files (spec 8.1.2 filelog with multiline support). One receiver per source.
@@ -43,31 +65,57 @@ receivers:
       carto.source_id: src_orders_log # REPLACE: matches sources.yaml
     operators: [] # keep records raw; edge-gateway parses (spec 8.2)
 
-  # Syslog (RFC 5424 over TCP; use rfc3164 for older senders).
+  # Syslog (RFC 5424 over TCP; use rfc3164 for older senders). TLS with a client CA: RFC 5425
+  # transport, so only senders holding a certificate from that CA can connect.
   syslog:
     tcp:
       listen_address: 0.0.0.0:5140
+      tls:
+        cert_file: /etc/otelcol/syslog.crt # REPLACE: a server certificate your syslog senders trust
+        key_file: /etc/otelcol/syslog.key # REPLACE
+        client_ca_file: /etc/otelcol/syslog-senders-ca.crt # REPLACE: the CA that issued the senders' client certificates
+        min_version: "1.2"
     protocol: rfc5424
     storage: file_storage
     resource:
       carto.source_id: src_syslog # REPLACE
 
-  # Splunk HEC push from systems that already speak HEC.
+  # Splunk HEC push from systems that already speak HEC. The receiver does not check HEC tokens,
+  # so the client CA is what authenticates a sender.
   splunk_hec:
     endpoint: 0.0.0.0:8088
     tls:
       cert_file: /etc/otelcol/hec.crt # REPLACE: a server certificate your HEC senders trust
       key_file: /etc/otelcol/hec.key # REPLACE
+      client_ca_file: /etc/otelcol/hec-senders-ca.crt # REPLACE: the CA that issued the senders' client certificates
+      min_version: "1.2"
     resource:
       carto.source_id: src_hec # REPLACE
 
-  # OTLP from applications already instrumented with OpenTelemetry (logs only, spec 2.2).
+  # OTLP from applications already instrumented with OpenTelemetry (logs only, spec 2.2). One
+  # receiver, one `resource/otlp` processor and one `logs/otlp` pipeline per source: copy the
+  # three with other ports and another id for a second OTLP source. Senders authenticate with a
+  # client certificate and the bearer token; the source id they send is overwritten.
   otlp:
     protocols:
       http:
         endpoint: 0.0.0.0:4318
+        tls:
+          cert_file: /etc/otelcol/otlp.crt # REPLACE: a server certificate your OTLP senders trust
+          key_file: /etc/otelcol/otlp.key # REPLACE
+          client_ca_file: /etc/otelcol/otlp-senders-ca.crt # REPLACE: the CA that issued the senders' client certificates
+          min_version: "1.2"
+        auth:
+          authenticator: bearertokenauth
       grpc:
         endpoint: 0.0.0.0:4317
+        tls:
+          cert_file: /etc/otelcol/otlp.crt # REPLACE
+          key_file: /etc/otelcol/otlp.key # REPLACE
+          client_ca_file: /etc/otelcol/otlp-senders-ca.crt # REPLACE
+          min_version: "1.2"
+        auth:
+          authenticator: bearertokenauth
 
 processors:
   memory_limiter:
@@ -78,8 +126,14 @@ processors:
     send_batch_size: 1000
     send_batch_max_size: 2000
     timeout: 2s
-  # Records that arrive through the OTLP receiver must declare their source themselves; drop
-  # anything without a carto.source_id so edge-gateway never guesses (spec 2.3 invariant 3).
+  # The collector names the OTLP source; a `carto.source_id` the sender set is overwritten.
+  resource/otlp:
+    attributes:
+      - key: carto.source_id
+        value: src_otlp_apps # REPLACE: matches sources.yaml
+        action: upsert
+  # A record without carto.source_id can only come from a misconfigured receiver; drop it so
+  # edge-gateway never guesses (spec 2.3 invariant 3).
   filter/require_source:
     error_mode: ignore
     logs:
@@ -111,7 +165,7 @@ exporters:
       queue_size: 10000
 
 service:
-  extensions: [file_storage, health_check]
+  extensions: [file_storage, health_check, bearertokenauth]
   telemetry:
     logs:
       level: info
@@ -119,7 +173,13 @@ service:
       level: basic
       address: 127.0.0.1:8888
   pipelines:
+    # Receivers that stamp the source id themselves (the `resource` operator).
     logs:
-      receivers: [filelog/orders, syslog, splunk_hec, otlp]
+      receivers: [filelog/orders, syslog, splunk_hec]
       processors: [memory_limiter, filter/require_source, batch]
+      exporters: [otlphttp/edge]
+    # OTLP gets its own pipeline so `resource/otlp` applies to it alone.
+    logs/otlp:
+      receivers: [otlp]
+      processors: [memory_limiter, resource/otlp, filter/require_source, batch]
       exporters: [otlphttp/edge]

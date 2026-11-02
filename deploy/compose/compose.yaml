@@ -18,18 +18,27 @@
 #   key-init      carto-ctl key init --if-missing (local KMS; production uses Vault Transit)
 #   migrate       carto-core migrate
 #
-# Push routes (ADR 0032), each off until its profile is enabled; they are the only services that
-# publish a port (spec 14.5):
+# Push routes (ADR 0032), each off until its profile is enabled; with `web` they are the only
+# services that publish a port (spec 14.5):
 #   proxy-otlp      --profile push-otlp       TCP passthrough on CARTO_OTLP_PORT (4318) for
 #                                              collectors holding a `carto-ctl pki issue` cert
 #   proxy-webhooks  --profile push-webhooks   HTTPS on CARTO_WEBHOOK_PORT (8443), certificate in
 #                                              ./proxy-tls, forwarded to the gateway as `proxy`
 #
+# Every published port binds the loopback interface unless CARTO_BIND names another address
+# (ADR 0072): Docker's published ports bypass the host's INPUT firewall chain, so a pilot sets
+# CARTO_BIND to the interface it means and filters it in the FORWARD/DOCKER-USER chain.
+#
+# The defaults in this file are production values (ADR 0072): an https:// issuer reached
+# directly, the `groups` claim, no bootstrap role bindings. The `dev` profile's values (Dex
+# under the console origin, roles bound by email) live in dev.env; `make dev` and CI pass
+# `--env-file deploy/compose/dev.env`. A pilot never uses dev.env.
+#
 # Every service has mem_limit, cpus and pids_limit (spec 14.6, 2.3 invariant 8), sized for the
 # pilot VM of spec 5.5; ClickHouse reads its cgroup limit and keeps its own memory under it.
 #
 # First run:   make dev
-# Tear down:   docker compose -f deploy/compose/compose.yaml down -v
+# Tear down:   make dev-down
 
 name: carto
 
@@ -76,6 +85,8 @@ secrets:
     file: ./secrets/pg_password
   ch_password:
     file: ./secrets/ch_password
+  ch_reader_password:
+    file: ./secrets/ch_reader_password
   pg_ingest_password:
     file: ./secrets/pg_ingest_password
   pg_app_password:
@@ -124,7 +135,15 @@ services:
       CLICKHOUSE_USER: carto
       CLICKHOUSE_PASSWORD_FILE: /run/secrets/ch_password
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "0"
-    secrets: [ch_password]
+    secrets: [ch_password, ch_reader_password]
+    # The read-only carto_reader of users.d/carto.xml takes its password from this variable
+    # (`from_env`, ADR 0071): read from the secret file inside the container, never from the
+    # Compose environment, the way the dex service reads its client secret.
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - >-
+        CARTO_CH_READER_PASSWORD="$$(cat /run/secrets/ch_reader_password)"
+        exec /entrypoint.sh
     volumes:
       - ch-data:/var/lib/clickhouse
       # One file into users.d; the directory itself is a tmpfs because the image's entrypoint
@@ -280,6 +299,9 @@ services:
       pki-init: { condition: service_completed_successfully }
     environment:
       <<: *core-env
+      # The console reads ClickHouse only (ADR 0071): the read-only user.
+      CARTO_CLICKHOUSE__USER: carto_reader
+      CARTO_CLICKHOUSE__PASSWORD_FILE: /run/secrets/ch_reader_password
       CARTO_POSTGRES__USER: carto_app
       CARTO_POSTGRES__PASSWORD_FILE: /run/secrets/pg_app_password
       CARTO_API__HOST: 0.0.0.0
@@ -289,21 +311,25 @@ services:
       # Its own listener CA signs its server certificate and the web proxy's client one.
       CARTO_API__TLS_CERT_FILE: /etc/carto/pki/listener.crt
       CARTO_API__TLS_KEY_FILE: /etc/carto/pki/listener.key
-      # Login through the identity provider named in .env; the dev profile runs Dex under the
-      # console origin (/dex) and the api reaches it over the core network (ADR 0052).
+      # Login through the identity provider named in .env (docs/install/compose-pilot.md,
+      # "Login"). The defaults are production values (ADR 0072): the issuer is reached directly
+      # over HTTPS (the settings refuse an empty back-channel, so its default is the issuer
+      # itself, which rewrites nothing), plain http:// is refused, groups come from the `groups`
+      # claim and no role binding is seeded. dev.env sets the Dex values of the dev profile
+      # (ADR 0052): Dex under the console origin at /dex, reached over the core network through
+      # the back-channel, and roles bound by the email claim because Dex's static users carry
+      # no groups.
       CARTO_API__OIDC__ISSUER: ${CARTO_OIDC_ISSUER:-https://localhost:8080/dex}
-      CARTO_API__OIDC__BACKCHANNEL_URL: ${CARTO_OIDC_BACKCHANNEL_URL:-http://dex:5556/dex}
-      CARTO_API__OIDC__ALLOW_HTTP_ISSUER: ${CARTO_OIDC_ALLOW_HTTP:-true}
+      CARTO_API__OIDC__BACKCHANNEL_URL: ${CARTO_OIDC_BACKCHANNEL_URL:-${CARTO_OIDC_ISSUER:-https://localhost:8080/dex}}
+      CARTO_API__OIDC__ALLOW_HTTP_ISSUER: ${CARTO_OIDC_ALLOW_HTTP:-false}
       CARTO_API__OIDC__CLIENT_ID: ${CARTO_OIDC_CLIENT_ID:-carto-console}
       CARTO_API__OIDC__CLIENT_SECRET_FILE: /run/secrets/oidc_client_secret
-      # Dex's static users carry no groups, so the dev stack binds roles by the email claim;
-      # a customer provider uses its groups claim (the default) and its own group names.
-      CARTO_API__OIDC__GROUPS_CLAIM: ${CARTO_OIDC_GROUPS_CLAIM:-email}
+      CARTO_API__OIDC__GROUPS_CLAIM: ${CARTO_OIDC_GROUPS_CLAIM:-groups}
       CARTO_API__OIDC__SCOPES: ${CARTO_OIDC_SCOPES:-openid profile email}
-      CARTO_API__BOOTSTRAP_GROUP_ROLES: ${CARTO_OIDC_GROUP_ROLES:-{"admin@carto.local":"admin","engineer@carto.local":"integration_engineer","viewer@carto.local":"business_viewer","auditor@carto.local":"auditor"}}
+      CARTO_API__BOOTSTRAP_GROUP_ROLES: ${CARTO_OIDC_GROUP_ROLES:-{}}
       CARTO_API__CLIENT_CA_FILE: /etc/carto/pki/listener-ca.crt
       CARTO_API__REQUIRE_CLIENT_CERT: "true"
-    secrets: [pg_app_password, ch_password, oidc_client_secret]
+    secrets: [pg_app_password, ch_reader_password, oidc_client_secret]
     volumes:
       - pki-api:/etc/carto/pki:ro
     command: ["api"]
@@ -340,10 +366,11 @@ services:
       dockerfile: deploy/Dockerfile
     <<: *hardening
     tmpfs: ["/tmp:size=64m", "/var/cache/nginx:size=32m"]
-    # The console origin: the one published port besides the push proxies (spec 14.5).
+    # The console origin: the one published port besides the push proxies (spec 14.5), bound
+    # to the loopback interface unless CARTO_BIND names another one (ADR 0072).
     networks: [core, ingress]
     ports:
-      - "${CARTO_WEB_PORT:-8080}:8443"
+      - "${CARTO_BIND:-127.0.0.1}:${CARTO_WEB_PORT:-8080}:8443"
     depends_on:
       api: { condition: service_healthy }
     volumes:
@@ -469,7 +496,7 @@ services:
     networks: [edge, ingress]
     depends_on:
       edge-gateway: { condition: service_started }
-    ports: ["${CARTO_OTLP_PORT:-4318}:4318"]
+    ports: ["${CARTO_BIND:-127.0.0.1}:${CARTO_OTLP_PORT:-4318}:4318"]
     entrypoint: ["nginx", "-g", "daemon off;"]
     volumes:
       - ./proxy/otlp.conf:/etc/nginx/nginx.conf:ro
@@ -486,7 +513,7 @@ services:
     depends_on:
       edge-gateway: { condition: service_started }
       pki-init: { condition: service_completed_successfully }
-    ports: ["${CARTO_WEBHOOK_PORT:-8443}:8443"]
+    ports: ["${CARTO_BIND:-127.0.0.1}:${CARTO_WEBHOOK_PORT:-8443}:8443"]
     entrypoint: ["nginx", "-g", "daemon off;"]
     volumes:
       - ./proxy/webhooks.conf:/etc/nginx/nginx.conf:ro

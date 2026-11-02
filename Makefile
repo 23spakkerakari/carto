@@ -110,13 +110,23 @@ images: ## Build the service images (edge, core, ctl, simulator) from deploy/doc
 > docker build -f deploy/docker/base.Dockerfile --build-arg MEMBER=simulator --build-arg ENTRY=carto-sim -t carto-simulator:dev .
 > docker build -f web/deploy/Dockerfile -t carto-web:dev web
 
+# The dev profile's identity-provider values live in deploy/compose/dev.env (ADR 0072);
+# compose.yaml itself carries production defaults.
+COMPOSE_DEV := docker compose -f deploy/compose/compose.yaml --env-file deploy/compose/dev.env --profile dev
+
 dev: images ## Compose stack + simulator live mode (spec Section 20)
-> @for s in pg_password ch_password pg_ingest_password pg_app_password pg_worker_password oidc_client_secret; do test -s deploy/compose/secrets/$$s || openssl rand -hex 24 | tr -d '\r\n' > deploy/compose/secrets/$$s; done
-> @test -s deploy/compose/proxy-tls/tls.crt || openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 365 -subj /CN=localhost -addext subjectAltName=DNS:localhost -keyout deploy/compose/proxy-tls/tls.key -out deploy/compose/proxy-tls/tls.crt 2>/dev/null && chmod 644 deploy/compose/proxy-tls/tls.key
-> docker compose -f deploy/compose/compose.yaml --profile dev up --remove-orphans
+> @# Compose bind-mounts each secret file as it is on the host, so the container uids (postgres
+> @# 999, clickhouse 101, carto 10001) must be able to read it: the file is created under umask
+> @# 077 and then opened to 0644, while the directory's 0700 keeps other host users out (ADR 0072).
+> @chmod 700 deploy/compose/secrets
+> @(umask 077; for s in pg_password ch_password ch_reader_password pg_ingest_password pg_app_password pg_worker_password oidc_client_secret; do test -s deploy/compose/secrets/$$s || { openssl rand -hex 24 | tr -d '\r\n' > deploy/compose/secrets/$$s && chmod 644 deploy/compose/secrets/$$s; }; done)
+> @# Dev-only self-signed pair for localhost; its key is readable by the proxies' uid 10001
+> @# (0644). A pilot installs its own pair and keeps the key 0600 (proxy-tls/README.md).
+> @test -s deploy/compose/proxy-tls/tls.crt || (umask 077; openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 365 -subj /CN=localhost -addext subjectAltName=DNS:localhost -keyout deploy/compose/proxy-tls/tls.key -out deploy/compose/proxy-tls/tls.crt 2>/dev/null && chmod 644 deploy/compose/proxy-tls/tls.key deploy/compose/proxy-tls/tls.crt)
+> $(COMPOSE_DEV) up --remove-orphans
 
 dev-down: ## Stop the Compose stack and remove its volumes
-> docker compose -f deploy/compose/compose.yaml --profile dev down -v --remove-orphans
+> $(COMPOSE_DEV) down -v --remove-orphans
 
 release: ## Build, sign and publish images (cosign signing of images and provenance wire up in M6; release.yml signs the SBOM on main)
 > @echo "make release: build images with 'make images'; registry push, cosign image signatures and SLSA provenance arrive in M6 (docs/plans/M1.md, Deferred)."
