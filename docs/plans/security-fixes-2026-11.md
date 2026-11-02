@@ -145,6 +145,27 @@ once at the end.
   hardening anchor and the absence of `ports:` on every service except the three proxies;
   `make dev` writes secret files with `umask 077`.
 
+## Pull requests
+
+Two PRs, both targeting `m3-trace-spec`, because the M3 demo cut (`m3-demo`) rewrites the
+decision routes, `EntityRepository.set_name`, `compose.yaml` and CI at the same time.
+
+- PR-1, branch `security-fixes-1`: packages H, T, E and C plus `uv.lock`, cherry-picked from
+  `security-fixes`. Touches no file the demo changes. Opens as soon as `make check` and
+  `make sec` are green.
+- PR-2, branch `security-fixes`: packages A, D and G, rebased onto `m3-trace-spec` after the
+  demo PR lands. Checklist for that rebase, none of which may be skipped:
+  1. Migration 0006 `down_revision` becomes `"0005"` (the demo's trace migration); the linear
+     history test's comment and the ADR 0071 note are updated to match.
+  2. `routes_links._decide` and `EntityPortAdapter.patch`: the demo enqueues a full assembly
+     inside the decision route; the audit hook of ADR 0070 must run in the same transaction as
+     that enqueue.
+  3. `EntityRepository.set_name` takes both the demo's `expected_version` and this branch's
+     `on_write`.
+  4. `make eval-engine` on both scenarios re-run on the rebased branch; deltas recorded.
+  5. ADR 0060, `docs/plans/M3-demo.md` and `CLAUDE.md` say `fix-c2` is already merged through
+     PR-1 so nobody merges it twice.
+
 ## Deferred
 
 Filled in as packages land: anything a package could not build, with its reason and ADR
