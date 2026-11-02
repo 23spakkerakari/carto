@@ -52,7 +52,8 @@ import, lint or test it.
   2026-10-19: scenario A meets every spec 18.4 target; scenario C meets four of five (exact and
   bridge recall 0.80, two legacy links under the distinct floor at that volume; founder call in
   the demo note). CI green on all eleven jobs on 2026-10-20 (pushed as `m2-map-discovery-built`
-  at 2cb3bd0 because the rebased milestone branch needs the user's force push). Acceptance
+  at 2cb3bd0 until the user's force push of 2026-11-02, which made `m2-map-discovery` that
+  same history at 1e1b2d4). Acceptance
   waits on that founder call and the partner gate; `fix-c2` reaches the line through
   `security-fixes-1` (merged there on 2026-11-02), never separately. Next: M3 trace (write
   docs/plans/M3.md first).
