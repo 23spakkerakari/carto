@@ -67,7 +67,11 @@ import, lint or test it.
   (docs/plans/M3-demo.md): the subset of M3 a demo video needs (assembler, graph rollup, map
   and trace screens, tokenize-for-search, a manual-hop preview badge); reveal, batches, skew,
   composite merge keys, load tests and scenario C stay in M3 proper. ADRs 0060 to 0066
-  as listed in the plan. Its PR targets `m3-trace-spec`.
+  as listed in the plan. Its PR targets `m3-trace-spec`. Wave 0 (package A-lite) built
+  2026-11-02 (ADRs 0060, 0061, 0062, 0064, 0066): migrations 0005 and 0009, the membership
+  store queries, the assembly index, the graph repository, stable entity ids, the pass lock,
+  the API views and search permission, React Flow. Next: wave 1 (B-lite assembler, C-lite
+  graph pass, D-lite signer and edge client, H-lite edge tokenize).
 - Spec direction 2026-10-21 on branch `spec-data-layer` (ADR 0059, proposed): hosted data layer,
   business rules and hosted deployment as v2 (spec 22.2 to 22.4); partial failures, stale data
   and missed events into M4 (spec 10.1, 10.2); partner questions 9 to 25 in spec 23 open.
