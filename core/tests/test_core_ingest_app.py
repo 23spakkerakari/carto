@@ -864,3 +864,89 @@ def test_ingest_health_accepts_any_install_certificate(world: World) -> None:
     client = TestClient(ActAsRole(inner, None))
     assert client.get("/healthz").status_code == 200
     assert client.get("/metrics").status_code == 200
+
+
+# --- value shapes at the contract (ADR 0069) --------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("slot", "text"),
+    [
+        ("attribute", "jane.doe@example.com"),
+        ("attribute", "password=hunter2"),
+        ("attribute", "0123456789abcdef0123456789abcdef"),
+        ("template", "order 123e4567-e89b-12d3-a456-426614174000 shipped"),
+        ("template", "key AKIAIOSFODNN7EXAMPLE used"),
+        ("template", "bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.SflKxwRJSMeKKF2QT4fwpMeJf36"),
+    ],
+)
+def test_a_value_shape_in_an_attribute_or_a_template_is_a_422_so_the_edge_parks_the_batch(
+    world: World, slot: str, text: str
+) -> None:
+    payload = _payload()
+    event = payload["events"][0]
+    if slot == "attribute":
+        event["attributes"]["status"] = text
+    else:
+        event["template_text"] = text
+    response = _post(world, "/internal/ingest", payload)
+    body = _assert_problem(response, 422)
+    assert body["errors"] and all(set(error) == {"loc", "msg", "type"} for error in body["errors"])
+    for part in (
+        "jane",
+        "example.com",
+        "hunter2",
+        "0123456789abcdef",
+        "123e4567",
+        "IOSFODNN",
+        "eyJ",
+    ):
+        assert part not in response.text
+    assert world.writer.batches == []
+    assert world.ledger.entries == ()
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"secret_ref": "hunter2"},
+        {"config": {"url": "postgres://carto:hunter2@db.internal/orders"}},
+        {"config": {"password": "hunter2"}},
+        {"config": {"hosts": ["a.internal", "ops@example.com"]}},
+    ],
+)
+def test_an_inventory_carrying_a_secret_is_422_and_nothing_is_recorded(
+    world: World, change: dict[str, Any]
+) -> None:
+    payload = _inventory()
+    payload["sources"][0].update(change)
+    response = _post(world, "/internal/inventory", payload)
+    _assert_problem(response, 422)
+    for part in ("hunter2", "ops@", "example.com"):
+        assert part not in response.text
+    if "password" in json.dumps(change):
+        assert "password" not in response.text, "the key is not echoed either"
+    assert world.metadata.list_systems("default") == []
+    assert world.metadata.get_source("default", "src_wms_db") is None
+
+
+def test_an_inventory_with_hostnames_schedules_paths_and_lists_is_recorded(world: World) -> None:
+    config = {
+        "host": "db.internal",
+        "port": 5432,
+        "poll_seconds": 30,
+        "verify_tls": True,
+        "tables": ["purchase_orders", "order_lines"],
+        "path": "local:///var/spool/carto/upload",
+        "dsn": "postgres://carto@db.internal/orders",
+        "ssh_key_path": "/etc/carto/edge.key",
+    }
+    payload = _inventory()
+    payload["sources"][0]["config"] = config
+    payload["sources"][0]["secret_ref"] = "local:///run/secrets/wms"  # noqa: S105 - a reference
+    response = _post(world, "/internal/inventory", payload)
+    assert response.status_code == 200, response.text
+    source = world.metadata.get_source("default", "src_wms_db")
+    assert source is not None
+    assert source.config == config
+    assert source.secret_ref == "local:///run/secrets/wms"  # noqa: S105 - a reference name

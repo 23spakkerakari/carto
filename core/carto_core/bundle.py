@@ -42,7 +42,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
 import zstandard
-from pydantic import TypeAdapter, ValidationError
+from pydantic import ConfigDict, TypeAdapter, ValidationError
 
 from carto_common.crypto import CryptoError, VerifyKey, b64url_decode
 from carto_common.ids import derive_ulid
@@ -95,8 +95,11 @@ MAX_LINE_BYTES: Final = 4 * 1024 * 1024
 """Longest event line accepted: a maximal canonical event is well under 1 MiB."""
 MAX_METADATA_FILE_BYTES: Final = 64 * 1024 * 1024
 """``templates.json`` and ``fields.json`` cap: thousands of fields are a few MiB."""
-_TEMPLATES_ADAPTER: Final = TypeAdapter(list[BundleTemplate])
-_FIELDS_ADAPTER: Final = TypeAdapter(list[BundleField])
+# The list adapters hide the input in their errors the way the models do: a refused template
+# or field name must not reach a log through the chained cause (spec 2.3 invariant 7).
+_HIDE_INPUT: Final = ConfigDict(hide_input_in_errors=True)
+_TEMPLATES_ADAPTER: Final = TypeAdapter(list[BundleTemplate], config=_HIDE_INPUT)
+_FIELDS_ADAPTER: Final = TypeAdapter(list[BundleField], config=_HIDE_INPUT)
 DEFAULT_CHUNK_SIZE: Final = MAX_EVENTS_PER_BATCH
 DEFAULT_CLAIM_TIMEOUT: Final = timedelta(seconds=120)
 """The ``ingest.claim_timeout_seconds`` default (ADR 0034)."""

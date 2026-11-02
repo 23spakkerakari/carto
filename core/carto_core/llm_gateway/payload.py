@@ -6,9 +6,11 @@ secrets. The builders here read through :class:`MetadataReader`, which can only 
 :class:`~.schemas.FieldSummary` objects (field path, system name, top shapes, template text,
 low-cardinality attribute values), so there is no code path from ``events`` to a payload. On
 top of the reader's contract the builders clean every text (control and format characters
-removed, whitespace collapsed, lengths clipped to the schema bounds), replace any token-shaped
-substring in a text with ``<*>`` and drop any attribute value that is one, as defence in depth
-against a reader that returns one by mistake or a log line that quotes one.
+removed, whitespace collapsed, lengths clipped to the schema bounds), replace any value shape
+in a text (a carto token, an email address, a UUID, a long hex or digit run, a JWT, an AWS key
+id, a PEM block, a URL password, a secret-named key's value: :func:`carto_schema.event.
+mask_value_shapes`, ADR 0069) with ``<*>`` and drop any attribute value that carries one, as
+defence in depth against a reader that returns one by mistake or a log line that quotes one.
 
 The PostgreSQL reader is the orchestrator's (packages A/B/C own the tables). It is expected to
 read ``fields.id``, ``fields.path``, ``fields.system_id`` joined to ``systems.name``,
@@ -43,6 +45,8 @@ from carto_core.llm_gateway.schemas import (
     LabelFieldRequest,
     NameEntityRequest,
 )
+from carto_schema.event import PLACEHOLDER, mask_value_shapes, value_shape
+from carto_schema.forms import shape
 
 __all__ = [
     "TOKEN_SEARCH",
@@ -128,7 +132,7 @@ class FieldRecord:
             field_id=self.field_id[:_MAX_FIELD_ID_LEN],
             path=clean_text(self.path, _MAX_PATH_LEN),
             system_name=clean_text(self.system_name, _MAX_SYSTEM_NAME_LEN),
-            top_shapes=_clean_values(self.top_shapes)[:_MAX_SHAPES],
+            top_shapes=_clean_shapes(self.top_shapes),
             template_text=clean_text(self.template_text, MAX_TEMPLATE_TEXT_LEN),
             attributes=[a for a in attributes if a.key and a.values][:_MAX_ATTRIBUTES],
         )
@@ -159,27 +163,53 @@ class InMemoryMetadataReader:
         ]
 
 
-def clean_text(text: str, limit: int) -> str:
-    """Normalise to NFC, drop control and format characters, replace any token-shaped
-    substring with the template placeholder ``<*>``, collapse whitespace, clip."""
-    normalised = TOKEN_SEARCH.sub("<*>", unicodedata.normalize("NFC", text))
+def _plain_text(text: str) -> str:
+    """Normalise to NFC, drop control and format characters, collapse whitespace. Done before
+    the value shapes are looked for, so a format character cannot split a shape in two."""
+    normalised = unicodedata.normalize("NFC", text)
     kept = "".join(
         " " if char in "\t\n\r" else char
         for char in normalised
         if unicodedata.category(char) not in {"Cc", "Cf", "Cs", "Co", "Cn"} or char in "\t\n\r"
     )
-    return _WHITESPACE.sub(" ", kept).strip()[:limit]
+    return _WHITESPACE.sub(" ", kept).strip()
+
+
+def clean_text(text: str, limit: int) -> str:
+    """Normalise to NFC, drop control and format characters, collapse whitespace, replace any
+    value shape (a token, an email, a UUID, a long hex or digit run, a JWT, a key, a PEM block,
+    a URL password, a secret-named key's value) with the template placeholder ``<*>``, clip."""
+    return mask_value_shapes(_plain_text(text))[:limit]
 
 
 def _clean_values(values: Iterable[str]) -> list[str]:
+    """Attribute values that carry no value shape at all, cleaned; one that does is dropped
+    rather than masked, since a bare placeholder tells the model nothing."""
     cleaned: list[str] = []
     for value in values:
-        if TOKEN_SEARCH.search(value):
+        text = _plain_text(value)
+        if TOKEN_SEARCH.search(text) or value_shape(text) is not None or PLACEHOLDER in text:
             continue
-        text = clean_text(value, _MAX_ATTRIBUTE_VALUE_LEN)
+        text = text[:_MAX_ATTRIBUTE_VALUE_LEN]
         if text and text not in cleaned:
             cleaned.append(text)
         if len(cleaned) == MAX_ATTRIBUTE_VALUES:
+            break
+    return cleaned
+
+
+def _clean_shapes(values: Iterable[str]) -> list[str]:
+    """Top shapes, cleaned. A string :func:`carto_schema.forms.shape` maps to itself
+    (``AAA-9999-999999``) is a shape and its runs of ``9`` are not digit runs; anything else
+    is dropped when it carries a token or a value shape, never masked into a half-shape."""
+    cleaned: list[str] = []
+    for value in values:
+        text = _plain_text(value)[:_MAX_SHAPE_LEN]
+        if shape(text) != text and (TOKEN_SEARCH.search(text) or value_shape(text) is not None):
+            continue
+        if text and text not in cleaned:
+            cleaned.append(text)
+        if len(cleaned) == _MAX_SHAPES:
             break
     return cleaned
 
@@ -194,12 +224,11 @@ def _bounded(summary: FieldSummary, extra: Sequence[AttributeSummary]) -> FieldS
             attributes.append(AttributeSummary(key=key, values=values))
         if len(attributes) == _MAX_ATTRIBUTES:
             break
-    shapes = _clean_values(summary.top_shapes)[:_MAX_SHAPES]
     return FieldSummary(
         field_id=summary.field_id[:_MAX_FIELD_ID_LEN],
         path=clean_text(summary.path, _MAX_PATH_LEN),
         system_name=clean_text(summary.system_name, _MAX_SYSTEM_NAME_LEN),
-        top_shapes=[shape[:_MAX_SHAPE_LEN] for shape in shapes],
+        top_shapes=_clean_shapes(summary.top_shapes),
         template_text=clean_text(summary.template_text, MAX_TEMPLATE_TEXT_LEN),
         attributes=attributes,
     )
