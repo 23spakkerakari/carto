@@ -14,8 +14,12 @@ commands with every release, so the check names what is allowed:
   implicit ``search`` unless the text starts with ``|`` (a generating command). Inside brackets
   the first word is taken as a command (``appendpipe`` and ``foreach`` run it as one), unless
   it is a ``key=value`` term or a quoted string. Macros (backquoted names) are refused: they
-  expand to text the check cannot see. Anything the scanner cannot read with certainty (an
-  unterminated quote, an unbalanced bracket, an empty stage) is refused.
+  expand to text the check cannot see. ``from`` may read only ``datamodel:`` and ``lookup:``
+  datasets: ``from savedsearch:<name>`` runs a saved search the check cannot see, the same
+  thing the refused ``savedsearch`` command does. Anything the scanner cannot read with
+  certainty (an unterminated quote, an unbalanced bracket, an empty stage, an unquoted
+  backslash right before ``|``, ``[``, ``]`` or a backtick, which Splunk may not treat as an
+  escape) is refused.
 - :func:`is_read_capability` accepts ``search``, ``rtsearch``, the ``list_*`` and ``get_*``
   families and a few named read capabilities (:data:`READ_CAPABILITIES`); every other
   capability makes the token write-capable.
@@ -148,6 +152,10 @@ READ_CAPABILITY_PREFIXES: Final = ("list_", "get_")
 
 MAX_DEPTH: Final = 8
 _COMMAND: Final = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_FROM_DATASET: Final = re.compile(r"\s*(datamodel|lookup)\s*[:(]", re.IGNORECASE)
+"""The dataset kinds ``from`` may read: ``datamodel:<name>`` and ``lookup:<name>`` (also the
+function form ``lookup(<name>)``). ``savedsearch:<name>`` is not among them."""
+_ESCAPE_DELIMITERS: Final = frozenset("|[]`")
 
 
 class SearchCheckError(InvalidConfigError):
@@ -169,6 +177,18 @@ def _skip_quoted(text: str, start: int) -> int:
     raise SearchCheckError(msg)
 
 
+def _check_escape(text: str, index: int) -> None:
+    """An unquoted backslash before a delimiter is refused: the scanner would read one stage
+    where Splunk may run two (2026-11-01 review, M13)."""
+    following = text[index + 1 : index + 2]
+    if following in _ESCAPE_DELIMITERS:
+        msg = (
+            "an unquoted backslash before '|', '[', ']' or a backtick is not allowed: carto "
+            "cannot be sure how Splunk splits the search"
+        )
+        raise SearchCheckError(msg)
+
+
 def _matching_bracket(text: str, start: int) -> int:
     """Index of the ``]`` that closes the ``[`` at ``start``."""
     depth = 0
@@ -179,6 +199,7 @@ def _matching_bracket(text: str, start: int) -> int:
             index = _skip_quoted(text, index)
             continue
         if char == "\\":
+            _check_escape(text, index)
             index += 2
             continue
         if char == "[":
@@ -205,6 +226,7 @@ def _stages(text: str) -> list[tuple[str, list[str]]]:
             current.append(text[index:end])
             index = end
         elif char == "\\":
+            _check_escape(text, index)
             current.append(text[index : index + 2])
             index += 2
         elif char == "`":
@@ -245,6 +267,18 @@ def _implicit_search(stage: str) -> bool:
     return "=" in first or first.startswith(('"', "(", "[", "-", "*"))
 
 
+def _check_from_dataset(stage: str) -> None:
+    """``from`` reads a dataset by kind; only data models and lookups are datasets carto can
+    see through (2026-11-01 review, H1)."""
+    rest = stage.lstrip()[len("from") :]
+    if _FROM_DATASET.match(rest) is None:
+        msg = (
+            "'from' may read only 'datamodel:' and 'lookup:' datasets (ADR 0037); "
+            "'from savedsearch:' runs a saved search carto cannot check"
+        )
+        raise SearchCheckError(msg)
+
+
 def _walk(text: str, *, nested: bool, depth: int, found: list[str]) -> None:
     if depth > MAX_DEPTH:
         msg = f"the search nests subsearches deeper than {MAX_DEPTH}"
@@ -267,6 +301,8 @@ def _walk(text: str, *, nested: bool, depth: int, found: list[str]) -> None:
                 "ask for a read-only command to be added"
             )
             raise SearchCheckError(msg)
+        if name == "from":
+            _check_from_dataset(stage)
         found.append(name)
         for subsearch in subsearches:
             _walk(subsearch, nested=True, depth=depth + 1, found=found)

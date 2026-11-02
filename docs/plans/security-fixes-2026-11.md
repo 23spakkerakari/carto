@@ -94,11 +94,11 @@ once at the end.
 - L1 and L2 ride along: `access_log=False` on the api listener; a failed login writes an
   `auth.login_failed` audit row with the step and no claim values.
 
-### G. Database grants (`core/migrations/postgres/versions/0005_*.py`, `deploy/compose/clickhouse/users.d`)
+### G. Database grants (`core/migrations/postgres/versions/0006_*.py`, `deploy/compose/clickhouse/users.d`)
 
-- M9. Migration 0005 grants `DELETE ON ingest_batches TO carto_ingest`; the grant test is
+- M9. Migration 0006 (0005 belongs to the M3 demo branch) grants `DELETE ON ingest_batches TO carto_ingest`; the grant test is
   amended; a role-connected integration test exercises release and prune as `carto_ingest`.
-- M11. Migration 0005 revokes `sessions`, `login_attempts`, `users`, `role_bindings` from
+- M11. Migration 0006 revokes `sessions`, `login_attempts`, `users`, `role_bindings` from
   `carto_worker` (it keeps `SELECT` on `settings`), and puts the `audit_log` trigger pair on
   `llm_calls` with `SELECT, INSERT` only for both roles.
 - M10. `users.d/carto.xml` defines a `carto_reader` user (readonly profile, password from the
