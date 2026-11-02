@@ -264,8 +264,47 @@ def test_needs_a_secret_ref() -> None:
 
 def test_plaintext_needs_the_admin_flag(caplog: pytest.LogCaptureFixture) -> None:
     with caplog.at_level(logging.WARNING):
-        make(Splunk(), {"base_url": "http://splunk.example:8089", "allow_plaintext": True})
+        make(
+            Splunk(),
+            {
+                "base_url": "http://splunk.example:8089",
+                "allow_plaintext": True,
+                "insecure_transport": True,
+            },
+        )
     assert any("plaintext" in record.getMessage() for record in caplog.records)
+
+
+# Spec 8.1: verification cannot be disabled without an audited admin flag (ADR 0067).
+WEAKENED = [
+    ({"verify_tls": False}, "verify_tls"),
+    ({"base_url": "http://splunk.example:8089", "allow_plaintext": True}, "allow_plaintext"),
+]
+
+
+@pytest.mark.parametrize(("config", "key"), WEAKENED, ids=[key for _, key in WEAKENED])
+def test_weakened_transport_needs_insecure_transport(config: dict[str, object], key: str) -> None:
+    with pytest.raises(InvalidConfigError) as info:
+        make(Splunk(), config)
+    message = str(info.value)
+    assert key in message
+    assert "insecure_transport" in message
+    assert "splunk.example" not in message  # the key is named, never a value
+
+
+@pytest.mark.parametrize(("config", "key"), WEAKENED, ids=[key for _, key in WEAKENED])
+def test_insecure_transport_accepts_and_names_the_weakened_keys(
+    config: dict[str, object], key: str
+) -> None:
+    connector = make(Splunk(), {**config, "insecure_transport": True})
+    assert connector.config.weakened_transport == (key,)
+
+
+def test_verified_transport_needs_no_flag() -> None:
+    connector = make(Splunk(), {"verify_tls": True, "ca_file": "/etc/carto/ca/splunk.pem"})
+    assert not connector.config.insecure_transport
+    assert connector.config.weakened_transport == ()
+    assert make(Splunk(), {"insecure_transport": True}).config.weakened_transport == ()
 
 
 async def test_read_without_cursor_covers_the_last_settled_window_of_index_time() -> None:

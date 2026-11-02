@@ -91,7 +91,13 @@ from carto_edge.pipeline.model import CursorCheckpoint, RawRecord, ReadItem
 from carto_edge.secrets import Credentials, SecretError, parse_credentials
 from carto_schema.event import EventKind
 
-__all__ = ["ConnectionPlan", "SqlConfig", "SqlConnector", "SqlQueryConfig"]
+__all__ = [
+    "VERIFYING_SSLMODES",
+    "ConnectionPlan",
+    "SqlConfig",
+    "SqlConnector",
+    "SqlQueryConfig",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +110,8 @@ DRIVERS: Final[dict[str, str]] = {
 MAX_ERROR_CHARS: Final = 200
 
 SslMode = Literal["disable", "allow", "prefer", "require", "verify-ca", "verify-full"]
+VERIFYING_SSLMODES: Final[frozenset[str]] = frozenset({"verify-ca", "verify-full"})
+"""The libpq modes that verify the server certificate; the others need ``insecure_transport``."""
 ConnectionPlan = dict[str, Any] | str
 """psycopg / PyMySQL keyword arguments, or the pyodbc connection string."""
 DbapiConnect = Callable[[str, ConnectionPlan], Any]
@@ -158,6 +166,11 @@ class SqlConfig(ConnectorConfig):
     ssl: bool = Field(default=True, description="MySQL: TLS with certificate verification.")
     encrypt: bool = Field(default=True, description="SQL Server: Encrypt=yes.")
     trust_server_certificate: bool = False
+    insecure_transport: bool = Field(
+        default=False,
+        description="Admin flag (spec 8.1, ADR 0067): accept a weakened transport setting; the "
+        "gateway audits and warns when it enables the source.",
+    )
     driver: str = Field(default="ODBC Driver 18 for SQL Server", min_length=1, max_length=128)
     ca_file: str | None = Field(default=None, max_length=4096)
     poll_seconds: int = Field(default=60, ge=5, le=86_400)
@@ -188,6 +201,33 @@ class SqlConfig(ConnectorConfig):
         names = [query.name for query in self.queries]
         if len(set(names)) != len(names):
             msg = "query names must be unique"
+            raise ValueError(msg)
+        return self
+
+    @property
+    def weakened_transport(self) -> tuple[str, ...]:
+        """The keys, by name, that set this dialect's transport below certificate verification
+        (spec 8.1). Empty for the defaults; the scheduler audits a non-empty tuple at enable."""
+        weakened: list[str] = []
+        if self.dialect == "postgresql" and self.sslmode not in VERIFYING_SSLMODES:
+            weakened.append("sslmode")
+        if self.dialect == "mysql" and not self.ssl:
+            weakened.append("ssl")
+        if self.dialect == "mssql":
+            if not self.encrypt:
+                weakened.append("encrypt")
+            if self.trust_server_certificate:
+                weakened.append("trust_server_certificate")
+        return tuple(weakened)
+
+    @model_validator(mode="after")
+    def _weakened_transport_needs_the_flag(self) -> SqlConfig:
+        weakened = self.weakened_transport
+        if weakened and not self.insecure_transport:
+            msg = (
+                f"{', '.join(weakened)}: weakens transport security (spec 8.1); "
+                "set insecure_transport: true to accept it (audited, warned)"
+            )
             raise ValueError(msg)
         return self
 

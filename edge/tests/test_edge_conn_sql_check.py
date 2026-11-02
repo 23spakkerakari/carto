@@ -6,6 +6,8 @@ from __future__ import annotations
 import pytest
 
 from carto_edge.connectors.base import InvalidConfigError, ResolvedHost
+from carto_edge.connectors.registry import validate_config_model
+from carto_edge.connectors.sql import SqlConfig
 from carto_edge.connectors.sql_dialects import (
     ALLOWED_FUNCTION_TYPES,
     ALLOWED_FUNCTIONS,
@@ -619,3 +621,100 @@ def test_mssql_privilege_queries_and_findings() -> None:
         [{"sysadmin": 1, "db_owner": 0, "db_datawriter": None, "db_ddladmin": 0}],
     ) == ["login has the sysadmin attribute"]
     assert isinstance(queries[0], PrivilegeQuery)
+
+
+# ---------------------------------------------------------------------------------------------
+# transport (spec 8.1: verification cannot be disabled without an audited admin flag; ADR 0067)
+# ---------------------------------------------------------------------------------------------
+
+QUERY_BLOCK = [
+    {
+        "name": "purchase_orders",
+        "sql": APPENDIX_A,
+        "watermark_column": "updated_at",
+        "primary_key": "id",
+    }
+]
+
+
+def sql_config(dialect: str, **overrides: object) -> dict[str, object]:
+    return {
+        "dialect": dialect,
+        "host": "db.internal.example",
+        "database": "wms",
+        "queries": QUERY_BLOCK,
+        **overrides,
+    }
+
+
+WEAKENED = [
+    ("postgresql", "sslmode", "disable"),
+    ("postgresql", "sslmode", "allow"),
+    ("postgresql", "sslmode", "prefer"),
+    ("postgresql", "sslmode", "require"),
+    ("mysql", "ssl", False),
+    ("mssql", "encrypt", False),
+    ("mssql", "trust_server_certificate", True),
+]
+
+
+@pytest.mark.parametrize(("dialect", "key", "value"), WEAKENED)
+def test_weakened_transport_needs_the_admin_flag(dialect: str, key: str, value: object) -> None:
+    with pytest.raises(InvalidConfigError) as info:
+        validate_config_model(SqlConfig, sql_config(dialect, **{key: value}), "src_db")
+    message = str(info.value)
+    assert key in message
+    assert "insecure_transport" in message
+    assert str(value) not in message.replace(key, "")  # the key is named, never its value
+
+
+@pytest.mark.parametrize(("dialect", "key", "value"), WEAKENED)
+def test_the_admin_flag_accepts_weakened_transport_and_names_the_keys(
+    dialect: str, key: str, value: object
+) -> None:
+    config = validate_config_model(
+        SqlConfig, sql_config(dialect, insecure_transport=True, **{key: value}), "src_db"
+    )
+    assert config.insecure_transport
+    assert config.weakened_transport == (key,)
+
+
+def test_several_weakened_keys_are_all_named() -> None:
+    with pytest.raises(InvalidConfigError, match=r"encrypt.*trust_server_certificate"):
+        validate_config_model(
+            SqlConfig,
+            sql_config("mssql", encrypt=False, trust_server_certificate=True),
+            "src_db",
+        )
+    config = validate_config_model(
+        SqlConfig,
+        sql_config("mssql", encrypt=False, trust_server_certificate=True, insecure_transport=True),
+        "src_db",
+    )
+    assert config.weakened_transport == ("encrypt", "trust_server_certificate")
+
+
+@pytest.mark.parametrize(
+    ("dialect", "overrides"),
+    [
+        ("postgresql", {}),
+        ("postgresql", {"sslmode": "verify-ca"}),
+        ("postgresql", {"sslmode": "verify-full"}),
+        ("mysql", {}),
+        ("mssql", {}),
+        # A key another dialect reads does not weaken this one's transport.
+        ("postgresql", {"ssl": False, "encrypt": False}),
+        ("mysql", {"sslmode": "disable"}),
+    ],
+)
+def test_verified_transport_needs_no_flag(dialect: str, overrides: dict[str, object]) -> None:
+    config = validate_config_model(SqlConfig, sql_config(dialect, **overrides), "src_db")
+    assert not config.insecure_transport
+    assert config.weakened_transport == ()
+
+
+def test_the_flag_alone_changes_nothing() -> None:
+    config = validate_config_model(
+        SqlConfig, sql_config("postgresql", insecure_transport=True), "src_db"
+    )
+    assert config.weakened_transport == ()

@@ -53,9 +53,10 @@ from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from types import MappingProxyType
-from typing import Final
+from typing import Final, Protocol, runtime_checkable
 
 from carto_common.logging import get_logger
+from carto_edge.audit import SYSTEM_ACTOR
 from carto_edge.config import SourceConfig
 from carto_edge.connectors.base import (
     ConnectorContext,
@@ -81,6 +82,7 @@ __all__ = [
     "CHUNK_RECORDS",
     "ERROR_BACKOFF_BASE_SECONDS",
     "ERROR_BACKOFF_CAP_SECONDS",
+    "INSECURE_TRANSPORT_ACTION",
     "PULL_SOURCE_TYPES",
     "PollReport",
     "PollScheduler",
@@ -90,6 +92,10 @@ CHUNK_RECORDS: Final = 500
 BACKPRESSURE_WAIT_SECONDS: Final = 1.0
 ERROR_BACKOFF_BASE_SECONDS: Final = 5.0
 ERROR_BACKOFF_CAP_SECONDS: Final = 600.0
+INSECURE_TRANSPORT_ACTION: Final = "source.insecure_transport"
+"""The edge audit action written once per enable of a source whose connector config
+accepted a weakened transport setting through ``insecure_transport`` (spec 8.1, ADR
+0067); ``details.keys`` names the keys, never their values."""
 
 Clock = Callable[[], datetime]
 ConnectorBuilder = Callable[[SourceConfig, ConnectorContext], ReadConnector]
@@ -99,6 +105,15 @@ log = get_logger(component="carto_edge.scheduler")
 
 def _utc_now() -> datetime:
     return datetime.now(UTC)
+
+
+@runtime_checkable
+class _TransportConfig(Protocol):
+    """A connector config that can name its weakened transport keys (``SqlConfig``,
+    ``SplunkConfig``). Any other config block has nothing to audit."""
+
+    @property
+    def weakened_transport(self) -> tuple[str, ...]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,7 +239,35 @@ class PollScheduler:
             log.info(
                 "scheduler.source_enabled", source_id=source_id, read_only=result.read_only.value
             )
+            await self._audit_transport(source_id)
         return result
+
+    def _weakened_transport(self, source_id: str) -> tuple[str, ...]:
+        """The transport keys the source's config set below verification, by name."""
+        source = self._sources[source_id]
+        config = self._connectors[source_id].validate_config(source.config)
+        if isinstance(config, _TransportConfig):
+            return tuple(config.weakened_transport)
+        return ()
+
+    async def _audit_transport(self, source_id: str) -> None:
+        """Spec 8.1: a weakened transport is accepted only by the admin flag, "audited and shown
+        as a warning". One audit row and one warning per enable (this method runs only from an
+        enabling ``check``), not per poll (ADR 0067). The row names keys, never values."""
+        keys = self._weakened_transport(source_id)
+        if not keys:
+            return
+        source = self._sources[source_id]
+        details = {"connector": source.type.value, "keys": list(keys)}
+        await asyncio.to_thread(
+            self._runtime.audit.record, INSECURE_TRANSPORT_ACTION, SYSTEM_ACTOR, source_id, details
+        )
+        log.warning(
+            "scheduler.insecure_transport",
+            source_id=source_id,
+            connector=source.type.value,
+            keys=list(keys),
+        )
 
     def _refused(self, source_id: str, result: TestResult, attempt: int, delay: float) -> None:
         self._metrics.inc("carto_edge_connector_errors_total", source_id=source_id)

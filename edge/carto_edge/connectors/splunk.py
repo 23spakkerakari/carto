@@ -51,7 +51,7 @@ from typing import Any, ClassVar, Final
 from urllib.parse import quote, urlsplit
 
 import httpx
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 
 from carto_edge.config import SourceConfig
 from carto_edge.connectors.base import (
@@ -142,6 +142,11 @@ class SplunkConfig(ConnectorConfig):
     verify_tls: bool = True
     ca_file: str | None = Field(default=None, max_length=4096)
     allow_plaintext: bool = Field(default=False, description="Admin flag: allow http://.")
+    insecure_transport: bool = Field(
+        default=False,
+        description="Admin flag (spec 8.1, ADR 0067): accept verify_tls false or "
+        "allow_plaintext true; the gateway audits and warns when it enables the source.",
+    )
     timeout_seconds: float = Field(default=120.0, gt=0, le=3600)
     requests_per_second: float = Field(default=2.0, gt=0, le=100)
     dedupe_size: int = Field(default=100_000, ge=1000, le=10_000_000)
@@ -185,6 +190,28 @@ class SplunkConfig(ConnectorConfig):
         except SearchCheckError as exc:
             raise ValueError(str(exc)) from exc
         return text
+
+    @property
+    def weakened_transport(self) -> tuple[str, ...]:
+        """The keys, by name, that set the transport below certificate verification (spec
+        8.1). Empty for the defaults; the scheduler audits a non-empty tuple at enable."""
+        weakened: list[str] = []
+        if not self.verify_tls:
+            weakened.append("verify_tls")
+        if self.allow_plaintext:
+            weakened.append("allow_plaintext")
+        return tuple(weakened)
+
+    @model_validator(mode="after")
+    def _weakened_transport_needs_the_flag(self) -> SplunkConfig:
+        weakened = self.weakened_transport
+        if weakened and not self.insecure_transport:
+            msg = (
+                f"{', '.join(weakened)}: weakens transport security (spec 8.1); "
+                "set insecure_transport: true to accept it (audited, warned)"
+            )
+            raise ValueError(msg)
+        return self
 
 
 def _iso(moment: datetime) -> str:
@@ -337,6 +364,9 @@ class SplunkConnector:
         client = self._client_or_open()
 
         def build() -> httpx.Request:
+            # The one POST a connector may send: Splunk's documented search export (spec 8.1.3,
+            # ADR 0041 item 4). It reads; the search head keeps nothing. The rule in
+            # tools/semgrep matches build_request("POST", ...) and this is its only exception.
             return client.build_request(  # nosemgrep: carto-connector-read-only
                 "POST", EXPORT_PATH, data=dict(params), headers=self._auth_headers()
             )

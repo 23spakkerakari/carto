@@ -5,6 +5,11 @@
 # CI runs this rule over edge/carto_edge/connectors/ only (ADR 0008 for the path): writing a
 # local output file is normal elsewhere (the simulator, the schema export CLI, the eval reports)
 # and forbidden inside a connector. The self-test next to this file is required by 18.3.
+#
+# The patterns name the call forms the connectors actually use (ADR 0067): httpx
+# build_request + send, SQLAlchemy execute(text(...)) and exec_driver_sql, asyncssh SFTP open
+# modes and command execution, pathlib and os file mutation. A rule that only knew .post() and
+# cursor.execute("...") matched nothing in the Splunk and SQL connectors.
 rules:
   - id: carto-connector-read-only
     message: >-
@@ -35,6 +40,24 @@ rules:
       - pattern: $C.link(...)
       - pattern: $C.write_text(...)
       - pattern: $C.write_bytes(...)
+      - pattern: os.replace(...)
+      - pattern: shutil.move(...)
+      - pattern: shutil.copyfile(...)
+      - pattern: shutil.copy2(...)
+      - pattern: shutil.copytree(...)
+      # Opening a file for writing: SFTPClient.open(path, mode), pathlib Path.open(mode) and
+      # the builtin. A mode is a short string of r, w, a, x, b, t and +; one with w, a, x or +
+      # writes.
+      - pattern: $C.open($P, "=~/^[rbt]*[wax+][rwaxbt+]*$/", ...)
+      - pattern: $C.open($P, mode="=~/^[rbt]*[wax+][rwaxbt+]*$/", ...)
+      - pattern: $C.open("=~/^[rbt]*[wax+][rwaxbt+]*$/", ...)
+      - pattern: $C.open(mode="=~/^[rbt]*[wax+][rwaxbt+]*$/", ...)
+      - pattern: open($P, "=~/^[rbt]*[wax+][rwaxbt+]*$/", ...)
+      - pattern: open($P, mode="=~/^[rbt]*[wax+][rwaxbt+]*$/", ...)
+      # Command execution on an SSH connection (asyncssh SSHClientConnection)
+      - pattern: $C.run(...)
+      - pattern: $C.create_process(...)
+      - pattern: $C.create_subprocess(...)
       # HTTP methods other than GET and HEAD toward source APIs
       - pattern: $C.post(...)
       - pattern: $C.patch(...)
@@ -43,10 +66,30 @@ rules:
       - pattern: $C.request("PUT", ...)
       - pattern: $C.request("PATCH", ...)
       - pattern: $C.request("DELETE", ...)
+      - pattern: $C.request(method="POST", ...)
+      - pattern: $C.request(method="PUT", ...)
+      - pattern: $C.request(method="PATCH", ...)
+      - pattern: $C.request(method="DELETE", ...)
+      # httpx: client.build_request(method, ...) then client.send(request) (the Splunk
+      # connector). The documented search export POST carries the one nosemgrep comment.
+      - pattern: $C.build_request("POST", ...)
+      - pattern: $C.build_request("PUT", ...)
+      - pattern: $C.build_request("PATCH", ...)
+      - pattern: $C.build_request("DELETE", ...)
+      - pattern: $C.build_request(method="POST", ...)
+      - pattern: $C.build_request(method="PUT", ...)
+      - pattern: $C.build_request(method="PATCH", ...)
+      - pattern: $C.build_request(method="DELETE", ...)
       # SQL DML and DDL
       # Semgrep regex strings have no \b, so the keyword boundary is spelled out (updated_at in a
       # SELECT must not match).
       - pattern: $C.execute("=~/(?i)^\s*(insert|update|delete|drop|alter|create|truncate|merge|grant|revoke|replace|call|exec)([^a-z0-9_]|$)/", ...)
+      # SQLAlchemy core: connection.execute(text(sql)) and exec_driver_sql(sql) (the SQL
+      # connector); the sa / sqlalchemy prefixes cover the other import spellings.
+      - pattern: $C.execute(text("=~/(?i)^\s*(insert|update|delete|drop|alter|create|truncate|merge|grant|revoke|replace|call|exec)([^a-z0-9_]|$)/"), ...)
+      - pattern: $C.execute(sa.text("=~/(?i)^\s*(insert|update|delete|drop|alter|create|truncate|merge|grant|revoke|replace|call|exec)([^a-z0-9_]|$)/"), ...)
+      - pattern: $C.execute(sqlalchemy.text("=~/(?i)^\s*(insert|update|delete|drop|alter|create|truncate|merge|grant|revoke|replace|call|exec)([^a-z0-9_]|$)/"), ...)
+      - pattern: $C.exec_driver_sql("=~/(?i)^\s*(insert|update|delete|drop|alter|create|truncate|merge|grant|revoke|replace|call|exec)([^a-z0-9_]|$)/", ...)
       - pattern: $C.executemany(...)
       - pattern: $C.copy(...)
       - pattern: $C.copy_expert(...)
