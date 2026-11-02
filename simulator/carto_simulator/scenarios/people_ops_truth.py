@@ -568,6 +568,7 @@ def build_marker_set(
     identifier_values: dict[str, set[str]],
     actor_values: set[str] | None = None,
     amount_values: set[str] | None = None,
+    secret_values: set[str] | None = None,
 ) -> MarkerSet:
     return MarkerSet(
         marker_tokens=sorted(marker_tokens),
@@ -577,6 +578,7 @@ def build_marker_set(
         },
         actor_values=sorted(actor_values or ()),
         amount_values=sorted(amount_values or ()),
+        secret_values=sorted(secret_values or ()),
     )
 
 

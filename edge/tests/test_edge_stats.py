@@ -343,3 +343,64 @@ def test_reservoir_is_reproducible_per_field_and_differs_across_fields() -> None
 
     assert samples("sys_a/tpl_1/region") == samples("sys_a/tpl_1/region")
     assert samples("sys_a/tpl_1/region") != samples("sys_a/tpl_1/status")
+
+
+# ---------------------------------------------------------------------------------------------
+# Sticky flags (ADR 0068)
+# ---------------------------------------------------------------------------------------------
+
+
+def test_sticky_flags_round_trip_and_version_one_loads_with_both_false() -> None:
+    assert SNAPSHOT_VERSION == 2
+    stats = FieldStats(sample_size=8)
+    stats.observe("a")
+    assert not stats.high_cardinality_seen and not stats.detector_hits_seen
+    stats.high_cardinality_seen = True
+    stats.detector_hits_seen = True
+    snapshot = stats.snapshot()
+    assert snapshot["high_cardinality_seen"] is True
+    assert snapshot["detector_hits_seen"] is True
+    restored = FieldStats.restore(snapshot, sample_size=8)
+    assert restored.high_cardinality_seen and restored.detector_hits_seen
+    # A version 1 field snapshot has no flags.
+    legacy = {key: value for key, value in snapshot.items() if not key.endswith("_seen")}
+    old = FieldStats.restore(legacy, sample_size=8)
+    assert not old.high_cardinality_seen and not old.detector_hits_seen
+    with pytest.raises(StatsFormatError):
+        FieldStats.restore({**snapshot, "high_cardinality_seen": 1}, sample_size=8)
+
+
+def test_store_note_sets_flags_marks_dirty_and_survives_save_and_load(tmp_path: Path) -> None:
+    path = tmp_path / "field_stats.json"
+    store = FieldStatsStore(sample_size=8, path=path)
+    ref = "sys_a/tpl_000000000001/order_id"
+    store.note(ref, high_cardinality=True)  # unknown ref: ignored
+    store.observe(ref, "SO-0000001")
+    store.save()
+    store.note(ref, high_cardinality=True)
+    assert store.maybe_flush(now=10_000.0)  # dirty again after the flag changed
+    store.note(ref, detector_hits=True)
+    store.save()
+    loaded = FieldStatsStore(sample_size=8, path=path)
+    assert loaded.load() is True
+    stats = loaded.get(ref)
+    assert stats is not None
+    assert stats.high_cardinality_seen and stats.detector_hits_seen
+
+
+def test_store_loads_a_version_one_snapshot(tmp_path: Path) -> None:
+    store = FieldStatsStore(sample_size=8)
+    store.observe("sys_a/tpl_000000000001/status", "CREATED")
+    snapshot = store.snapshot()
+    snapshot["version"] = 1
+    for field_data in snapshot["fields"].values():
+        del field_data["high_cardinality_seen"]
+        del field_data["detector_hits_seen"]
+    other = FieldStatsStore(sample_size=8)
+    other.restore(snapshot)
+    stats = other.get("sys_a/tpl_000000000001/status")
+    assert stats is not None
+    assert stats.count == 1
+    assert not stats.high_cardinality_seen and not stats.detector_hits_seen
+    with pytest.raises(StatsFormatError):
+        other.restore({**snapshot, "version": 3})

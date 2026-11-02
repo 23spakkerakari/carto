@@ -895,3 +895,112 @@ def test_kept_sample_values_are_truncated_and_clean() -> None:
     assert summary["policy"] == "keep"
     assert all(len(value) <= 256 for value in summary["sample_values"])
     assert "RELEASED" in summary["sample_values"]
+
+
+# ---------------------------------------------------------------------------------------------
+# Ratchet (ADR 0068): cardinality and detector hits never fall back to keep
+# ---------------------------------------------------------------------------------------------
+
+
+def _alphabetic(n: int) -> list[str]:
+    """``n`` distinct 11-character alphabetic values (no digit run, no whitespace)."""
+    return [
+        f"customer{chr(97 + i % 26)}{chr(97 + (i // 26) % 26)}{chr(97 + (i // 676) % 26)}"
+        for i in range(n)
+    ]
+
+
+def test_flooded_identifier_stays_tokenized() -> None:
+    """The review's flood: 900 distinct values over 1,000 rows make an identifier; 4,000 rows
+    of ``ok`` then drown the distinct ratio and fill the reservoir. The field stays tokenized."""
+    classifier = make()
+    distinct = _alphabetic(900)
+    ref = feed(classifier, "note", [distinct[i % 900] for i in range(1_000)])
+    first = classifier.decide(ref, "note")
+    assert first.field_class is FieldClass.IDENTIFIER
+    assert first.reason == "identifier"
+    feed(classifier, "note", ["ok"] * 4_000)
+    stats = classifier._stats.get(ref)  # the live figures the ratchet overrides
+    assert stats is not None
+    settings = classifier.settings
+    assert stats.distinct_estimate <= settings.distinct_ratio * stats.non_null_count
+    assert stats.distinct_estimate <= settings.distinct_threshold
+    assert stats.value_count("ok") >= 3  # rule 6 would keep it without the ratchet
+    assert stats.high_cardinality_seen
+    with structlog.testing.capture_logs() as logs:
+        after = classifier.decide(ref, "note")
+    assert after.field_class is FieldClass.IDENTIFIER
+    assert after.policy is Policy.TOKENIZE
+    assert after.forms == IDENTIFIER_FORMS
+    assert after.reason == "identifier:ratchet"
+    assert not any(entry["event"] == "field_reclassified" for entry in logs)
+
+
+def test_genuine_enum_still_becomes_keep() -> None:
+    values = [f"STATE_{chr(65 + i % 20)}" for i in range(2_000)]
+    classifier = make()
+    ref = feed(classifier, "state", values)
+    decision = classifier.decide(ref, "state")
+    assert decision.field_class is FieldClass.LOW_CARD_ATTRIBUTE
+    assert decision.policy is Policy.KEEP
+    assert decision.reason == "low_card"
+    stats = classifier._stats.get(ref)
+    assert stats is not None
+    assert not stats.high_cardinality_seen
+    assert not stats.detector_hits_seen
+    feed(classifier, "state", values)
+    assert classifier.decide(ref, "state").policy is Policy.KEEP
+
+
+def test_detector_hits_ratchet_survives_a_restart_and_a_flood() -> None:
+    """A name seen early sets ``detector_hits_seen``; after a restart the reservoir starts
+    empty and a flood of ``ok`` fills it, yet rule 6 still drops the field."""
+    detector = StubDetector(lambda line: line == "Maria Lopez")
+    settings = ClassifySettings()
+    store = FieldStatsStore.from_settings(settings)
+    classifier = Classifier(settings, (), detector, store)
+    ref = feed(classifier, "note", [["ok", "pending", "Maria Lopez"][i % 3] for i in range(300)])
+    assert classifier.decide(ref, "note").policy is Policy.DROP
+    stats = store.get(ref)
+    assert stats is not None
+    assert stats.detector_hits_seen
+    snapshot = store.snapshot()
+    restarted = FieldStatsStore.from_settings(settings)
+    restarted.restore(snapshot)
+    again = Classifier(settings, (), detector, restarted)
+    feed(again, "note", ["ok", "pending"] * 500)
+    restored = restarted.get(ref)
+    assert restored is not None
+    assert "Maria Lopez" not in restored.samples  # the reservoir holds only the flood
+    decision = again.decide(ref, "note")
+    assert decision.field_class is FieldClass.LOW_CARD_ATTRIBUTE
+    assert decision.policy is Policy.DROP
+    assert decision.reason == "low_card:pii_hits"
+
+
+def test_ratchet_flags_persist_across_a_restart_for_identifiers() -> None:
+    settings = ClassifySettings()
+    store = FieldStatsStore.from_settings(settings)
+    classifier = Classifier(settings, (), RegexDetector(), store)
+    ref = feed(classifier, "ref", _alphabetic(900))
+    assert classifier.decide(ref, "ref").field_class is FieldClass.IDENTIFIER
+    restarted = FieldStatsStore.from_settings(settings)
+    restarted.restore(store.snapshot())
+    again = Classifier(settings, (), RegexDetector(), restarted)
+    feed(again, "ref", ["ok"] * 4_000)
+    decision = again.decide(ref, "ref")
+    assert decision.policy is Policy.TOKENIZE
+    assert decision.reason == "identifier:ratchet"
+
+
+def test_pin_to_keep_still_wins_over_the_ratchet() -> None:
+    pin = FieldPolicyPin(
+        field=f"{SYS}/*/code", field_class="low_card_attribute", policy="keep", reason="admin"
+    )
+    classifier = make(pins=[pin])
+    ref = feed(classifier, "code", _alphabetic(900))
+    assert classifier.decide(ref, "code").policy is Policy.KEEP
+    feed(classifier, "code", ["ok"] * 4_000)
+    decision = classifier.decide(ref, "code")
+    assert decision.policy is Policy.KEEP
+    assert decision.pinned

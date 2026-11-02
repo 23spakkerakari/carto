@@ -311,6 +311,12 @@ class MarkerSet(_Model):
         description="Order amounts as emitted (two decimals, and JSON's float rendering); "
         "spec 8.3 rule 4: never in clear.",
     )
+    secret_values: list[str] = Field(
+        default_factory=list,
+        description="Secret-shaped values planted into noise lines (an AWS access key id, a "
+        "bearer token, a password assigned in prose, a PEM header and key body, a DSN with "
+        "userinfo and its password); spec 8.3 rule 1: never in clear (ADR 0068).",
+    )
 
 
 class Manifest(_Model):

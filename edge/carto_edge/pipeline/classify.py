@@ -38,6 +38,16 @@ The rules of spec 8.3 run in order:
 Admin pins (``FieldPolicyPin``, matched on the exact ``field_ref`` or ``system/*/path``)
 override rules 2 to 8, never rule 1.
 
+**Ratchet (ADR 0068).** Rules 5 and 6 are recomputed from live figures, and a flood of one
+constant value would drown the distinct ratio and wash the reservoir, so a field that was an
+identifier, or carried PII, would fall to ``keep``. Two sticky flags on the field's statistics
+stop that: ``high_cardinality_seen`` is set the first time rule 5's test is true after
+quarantine and rule 5 treats the field as high cardinality whenever the live test or the flag
+says so (reason ``identifier:ratchet`` when only the flag does); ``detector_hits_seen`` is set
+whenever the detector hit a sample and rule 6 drops (``low_card:pii_hits``) while it is set.
+Both persist with the statistics and nothing unsets them; an admin pin still decides for the
+non-PII classes as before.
+
 **Form families.** ``forms`` names form families, not final form names: ``digits`` stands for
 ``digits.0`` to ``digits.2`` (one per digit run, spec 8.4) and ``phonetic`` for ``phonetic.0``
 to ``phonetic.7`` (one per name token). The tokenizer expands a family per value; an exact form
@@ -902,6 +912,8 @@ class Classifier:
         if pii_class is not None:
             return FieldDecision(pii_class, Policy.DROP, reason="pii:name", samples_seen=non_null)
         verdict = self._verdict(ref, samples, non_null)
+        if verdict.hit_samples and stats is not None and not stats.detector_hits_seen:
+            self._stats.note(ref, detector_hits=True)  # sticky (ADR 0068)
         if (
             verdict.samples
             and verdict.hit_samples / verdict.samples >= PII_HIT_SHARE
@@ -960,11 +972,14 @@ class Classifier:
                 FieldClass.UNKNOWN, Policy.DROP, reason="quarantine", samples_seen=non_null
             )
 
-        # Rule 5: identifiers.
+        # Rule 5: identifiers. The live test ratchets (ADR 0068): once true, always true.
         distinct = stats.distinct_estimate
-        high_cardinality = (
+        live_high_cardinality = (
             distinct > settings.distinct_threshold or distinct > settings.distinct_ratio * non_null
         )
+        if live_high_cardinality and not stats.high_cardinality_seen:
+            self._stats.note(ref, high_cardinality=True)
+        high_cardinality = live_high_cardinality or stats.high_cardinality_seen
         if (
             high_cardinality
             and settings.identifier_min_len <= stats.length_mean <= settings.identifier_max_len
@@ -977,11 +992,12 @@ class Classifier:
                 FieldClass.IDENTIFIER,
                 Policy.TOKENIZE,
                 IDENTIFIER_FORMS,
-                reason="identifier",
+                reason="identifier" if live_high_cardinality else "identifier:ratchet",
                 samples_seen=non_null,
             )
 
-        # Rule 6: low-cardinality attributes, kept only when the samples passed the detector.
+        # Rule 6: low-cardinality attributes, kept only when the samples passed the detector,
+        # now and at every earlier decision (ADR 0068).
         if not high_cardinality:
             if verdict.samples == 0:
                 return FieldDecision(
@@ -990,7 +1006,7 @@ class Classifier:
                     reason="low_card:no_samples",
                     samples_seen=non_null,
                 )
-            if verdict.hit_samples:
+            if verdict.hit_samples or stats.detector_hits_seen:
                 return FieldDecision(
                     FieldClass.LOW_CARD_ATTRIBUTE,
                     Policy.DROP,

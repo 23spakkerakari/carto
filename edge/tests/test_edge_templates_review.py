@@ -88,9 +88,10 @@ def test_a_lone_surrogate_never_breaks_template_persistence(tmp_path: Path) -> N
 
 def test_a_template_with_a_lone_surrogate_has_an_id() -> None:
     store = TemplateStore()
-    for _ in range(3):
-        text, _params = store.mine("sys_a", f"payment {LONE_SURROGATE} received")
-    assert text == f"payment {LONE_SURROGATE} received"
+    # Three distinct messages: identical repeats never earn constants (ADR 0068).
+    for word in ("alpha", "bravo", "charlie"):
+        text, _params = store.mine("sys_a", f"payment {LONE_SURROGATE} received {word}")
+    assert text == f"payment {LONE_SURROGATE} received {MASK}"
     assert compute_template_id("sys_a", text).startswith("tpl_")
 
 
@@ -103,16 +104,17 @@ JWT_NO_DIGITS = "eyJabcdefghijk.eyJabcdefghijk.abcdefghijklmn"
 def test_a_repeated_password_never_becomes_a_template_constant() -> None:
     pipeline = make(quarantine=200)
     for line in range(1, 5):
+        # The lines differ by a word (identical repeats never earn constants, ADR 0068).
         text = (
             f"2026-09-23T04:00:0{line}Z INFO connecting to ftp as user=svc_sync "
-            f"password={SECRET} attempt"
+            f"password={SECRET} attempt {('one', 'two', 'three', 'four')[line - 1]}"
         )
         result = pipeline.process(raw_line(text, line))
         assert result.event is not None
         assert SECRET not in result.event.model_dump_json()
     assert result.event is not None
     assert result.event.template_text == (
-        f"connecting to ftp as user={MASK} password={MASK} attempt"
+        f"connecting to ftp as user={MASK} password={MASK} attempt {MASK}"
     )
 
 

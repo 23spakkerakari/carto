@@ -52,7 +52,13 @@ from carto_simulator.ground_truth import (
     row_key,
     write_ground_truth,
 )
-from carto_simulator.names import MarkerFactory, draw_person
+from carto_simulator.names import (
+    SECRET_NOISE_SHARE,
+    MarkerFactory,
+    PlantedSecrets,
+    draw_person,
+    draw_secrets,
+)
 from carto_simulator.scenarios import people_ops_truth
 from carto_simulator.scenarios.people_ops_model import (
     BACKLOG_FIRST_DAY,
@@ -173,6 +179,7 @@ class _PeopleOpsRun:
         self.identifier_values: dict[str, set[str]] = {}
         self.pii_values: set[str] = set()
         self.marker_tokens: set[str] = set()
+        self.secrets: PlantedSecrets | None = None  # drawn at the first secret noise line
         self.actor_values: set[str] = set()
         self.emitted: list[Emitted] = []
         legacy = self.legacy_zone
@@ -654,27 +661,41 @@ class _PeopleOpsRun:
                         self.emit_noise_line(source_id, at)
                 hour_start += hour
 
+    def secret_message(self) -> str | None:
+        """One of the planted secret lines (ADR 0068) for a share of the noise, else None.
+        The secrets are drawn on first use, after every hire, so they change nothing before
+        phase D."""
+        rng = self.rng
+        if rng.random() >= SECRET_NOISE_SHARE:
+            return None
+        if self.secrets is None:
+            self.secrets = draw_secrets(rng, "db.people.internal")
+        return rng.choice(self.secrets.messages())
+
     def emit_noise_line(self, source_id: str, at: datetime) -> None:
         rng = self.rng
+        secret = self.secret_message()
         if source_id == SRC_ONBOARDING:
             fields: dict[str, object] = {"ts": self.onboarding.timestamp(at), "level": "info"}
-            if rng.random() < 0.5:
+            if secret is not None:
+                fields.update({"msg": secret})
+            elif rng.random() < 0.5:
                 fields.update({"msg": "health check ok", "path": "/healthz", "status": 200})
             else:
                 fields.update({"msg": "job queue drained", "queue": "notifications", "jobs": 0})
             self.onboarding.add(Truth(N_ONBOARDING_NOISE, at), ndjson_line(fields))
         elif source_id == SRC_LEGACY:
             at = clock.floor_seconds(at)
-            self.legacy.add(
-                Truth(N_LEGACY_NOISE, at),
-                logfmt_line(
-                    [
-                        ("time", self.legacy.timestamp(at)),
-                        ("lvl", "INFO"),
-                        ("msg", "scheduler heartbeat"),
-                        ("queue", "hires"),
-                    ]
-                ),
+            pairs: list[tuple[str, str | int]] = [("time", self.legacy.timestamp(at))]
+            if secret is not None:
+                pairs.extend([("lvl", "INFO"), ("msg", secret)])
+            else:
+                pairs.extend([("lvl", "INFO"), ("msg", "scheduler heartbeat"), ("queue", "hires")])
+            self.legacy.add(Truth(N_LEGACY_NOISE, at), logfmt_line(pairs))
+        elif secret is not None:
+            self.lms.add(
+                Truth(N_LMS_NOISE, at),
+                ndjson_line({"ts": self.lms.timestamp(at), "level": "info", "msg": secret}),
             )
         else:
             self.lms.add(
@@ -918,6 +939,7 @@ class _PeopleOpsRun:
                 self.identifier_values,
                 actor_values=self.actor_values,
                 amount_values={row.unit_price for row in self.sheet_rows},
+                secret_values=set(self.secrets.values) if self.secrets is not None else set(),
             ),
         )
         ground_truth_dir = write_ground_truth(self.out_dir, truth, self.events())

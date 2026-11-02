@@ -16,7 +16,9 @@ from hypothesis import strategies as st
 
 from carto_edge.pipeline.templates import (
     MASK,
+    MAX_DISTINCT_DIGESTS,
     MIN_CLUSTER_SIZE,
+    STATE_VERSION,
     TemplateStore,
     compute_template_id,
     generalize_name,
@@ -160,7 +162,7 @@ def test_templates_persistence_file_is_plain_json_without_pickle(tmp_path: Path)
         store.mine("sys_x", "cart created 1")
     raw = (tmp_path / "sys_x.json").read_bytes()
     state = json.loads(raw)
-    assert state["version"] == 1
+    assert state["version"] == STATE_VERSION
     assert "py/object" not in raw.decode("utf-8")
     assert state["clusters"][0]["tokens"] == ["cart", "created", MASK]
 
@@ -177,7 +179,10 @@ def test_templates_corrupt_state_file_is_ignored_not_fatal(tmp_path: Path) -> No
     assert store.mine("sys_y", "a 1")[0] == f"a {MASK}"
     assert store.mine("sys_z", "a 1")[0] == f"a {MASK}"
     store.flush()
-    assert json.loads((tmp_path / "sys_x.json").read_text(encoding="utf-8"))["version"] == 1
+    assert (
+        json.loads((tmp_path / "sys_x.json").read_text(encoding="utf-8"))["version"]
+        == STATE_VERSION
+    )
 
 
 def test_templates_oversized_state_file_is_ignored(tmp_path: Path) -> None:
@@ -274,19 +279,149 @@ def test_templates_property_mine_never_raises_and_params_align(text: str) -> Non
     assert template.count(MASK) >= len(params) or len(template) == MAX_TEMPLATE_TEXT_LEN
 
 
-def test_words_seen_in_fewer_than_three_messages_are_never_constants() -> None:
+def test_words_seen_in_fewer_than_three_distinct_messages_are_never_constants() -> None:
     """Drain3 keeps a one-member cluster verbatim; a word seen once (a name, a code word, free
-    text) must not become a template constant (spec 2.3 invariant 2)."""
+    text) must not become a template constant (spec 2.3 invariant 2). Identical repeats count
+    once (ADR 0068): a retry loop logging the same line does not make its words constants."""
     store = TemplateStore()
     assert MIN_CLUSTER_SIZE == 3
-    first, params = store.mine("sys_web", "delivery note leave behind the blue gate MKPINE")
+    message = "delivery note leave behind the blue gate MKPINE"
+    first, params = store.mine("sys_web", message)
     assert first == "<*> <*> <*> <*> <*> <*> <*> <*>"
     assert params == ["delivery", "note", "leave", "behind", "the", "blue", "gate", "MKPINE"]
-    second, _ = store.mine("sys_web", "delivery note leave behind the blue gate MKPINE")
-    assert second == first  # two members: still all parameters
-    third, third_params = store.mine("sys_web", "delivery note leave behind the blue gate MKPINE")
-    assert third == "delivery note leave behind the blue gate MKPINE"  # repeated three times
-    assert third_params == []
+    for _ in range(6):
+        repeated, repeated_params = store.mine("sys_web", message)
+        assert repeated == first  # one distinct message, however often: all parameters
+        assert repeated_params == params
+    # Whitespace variants are the same message.
+    assert store.mine("sys_web", "  delivery note   leave behind the blue gate MKPINE ")[0] == first
+
+
+def test_a_repeated_pii_line_stays_all_parameters() -> None:
+    """The review's case: ``Refund approved for Alice Smith by manager`` three times verbatim."""
+    store = TemplateStore()
+    message = "Refund approved for Alice Smith by manager"
+    for _ in range(3):
+        template, params = store.mine("sys_web", message)
+        assert template == "<*> <*> <*> <*> <*> <*> <*>"
+        assert params == ["Refund", "approved", "for", "Alice", "Smith", "by", "manager"]
+
+
+def test_three_distinct_messages_sharing_constants_mine_the_template() -> None:
+    store = TemplateStore()
+    lines = [
+        "Refund approved for MKALPHA by manager",
+        "Refund approved for MKBRAVO by manager",
+        "Refund approved for MKBRAVO by manager",  # a repeat: still two distinct
+    ]
+    for line in lines:
+        assert store.mine("sys_web", line)[0] == "<*> <*> <*> <*> <*> <*>"
+    template, params = store.mine("sys_web", "Refund approved for MKCHARLIE by manager")
+    assert template == "Refund approved for <*> by manager"
+    assert params == ["MKCHARLIE"]
+    # Earlier members of the cluster get the template too, once it has it.
+    assert store.mine("sys_web", lines[0]) == ("Refund approved for <*> by manager", ["MKALPHA"])
+
+
+def test_distinct_message_digests_are_persisted_and_bounded(tmp_path: Path) -> None:
+    with TemplateStore(tmp_path) as store:
+        store.mine("sys_web", "voucher MKALPHA redeemed by staff")
+        store.mine("sys_web", "voucher MKBRAVO redeemed by staff")
+        store.mine("sys_web", "voucher MKBRAVO redeemed by staff")
+    raw = (tmp_path / "sys_web.json").read_text(encoding="utf-8")
+    state = json.loads(raw)
+    assert state["version"] == STATE_VERSION == 2
+    (cluster,) = state["clusters"]
+    assert len(cluster["d"]) == 2  # two distinct messages, one repeat
+    assert all(len(digest) == 12 for digest in cluster["d"])
+    assert "MKALPHA" not in raw and "MKBRAVO" not in raw  # digests, never the messages
+    reloaded = TemplateStore(tmp_path)
+    # The third distinct message completes the count across the restart.
+    assert reloaded.mine("sys_web", "voucher MKCHARLIE redeemed by staff") == (
+        "voucher <*> redeemed by staff",
+        ["MKCHARLIE"],
+    )
+    for n in range(20):
+        reloaded.mine("sys_web", f"voucher MK{'X' * (n + 1)} redeemed by staff")
+    reloaded.flush()
+    state = json.loads((tmp_path / "sys_web.json").read_text(encoding="utf-8"))
+    assert len(state["clusters"][0]["d"]) == MAX_DISTINCT_DIGESTS
+
+
+def test_version_one_state_loads_with_constants_to_be_earned_again(tmp_path: Path) -> None:
+    """A version 1 file carries cluster sizes but no digests: its clusters start with no
+    distinct message, so a cluster of identical repeats cannot carry its words over."""
+    text = "voucher <*> redeemed by staff"
+    with TemplateStore(tmp_path) as store:
+        for name in ("MKALPHA", "MKBRAVO", "MKCHARLIE"):
+            store.mine("sys_web", f"voucher {name} redeemed by staff")
+        store.register("sys_web", store.template_id("sys_web", text), text, EventKind.LOG, T0)
+    path = tmp_path / "sys_web.json"
+    state = json.loads(path.read_text(encoding="utf-8"))
+    state["version"] = 1
+    for cluster in state["clusters"]:
+        del cluster["d"]
+    path.write_text(json.dumps(state), encoding="utf-8")
+    reloaded = TemplateStore(tmp_path)
+    assert reloaded.mine("sys_web", "voucher MKALPHA redeemed by staff")[0] == "<*> <*> <*> <*> <*>"
+    assert reloaded.registry()[0].count == 1  # the file was readable: the registry survived
+    for name in ("MKBRAVO", "MKDELTA"):
+        reloaded.mine("sys_web", f"voucher {name} redeemed by staff")
+    assert reloaded.mine("sys_web", "voucher MKECHO redeemed by staff")[0] == (
+        "voucher <*> redeemed by staff"
+    )
+    reloaded.flush()
+    assert json.loads(path.read_text(encoding="utf-8"))["version"] == STATE_VERSION
+
+
+def test_invalid_digests_make_the_state_file_unreadable(tmp_path: Path) -> None:
+    with TemplateStore(tmp_path) as store:
+        store.mine("sys_web", "voucher MKALPHA redeemed by staff")
+    path = tmp_path / "sys_web.json"
+    state = json.loads(path.read_text(encoding="utf-8"))
+    state["clusters"][0]["d"] = ["x" * 12] * (MAX_DISTINCT_DIGESTS + 1)
+    path.write_text(json.dumps(state), encoding="utf-8")
+    reloaded = TemplateStore(tmp_path)
+    assert reloaded.cluster_count("sys_web") == 0  # mining started fresh
+
+
+@pytest.mark.parametrize(
+    ("message", "secret_words"),
+    [
+        (
+            (
+                "key loaded -----BEGIN RSA PRIVATE KEY----- MIIEvQIBADANBgkqhkiG9w0BAQEFAASC "
+                "-----END RSA PRIVATE KEY----- ok"
+            ),
+            ["BEGIN", "PRIVATE", "KEY", "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC"],
+        ),
+        (
+            "key loaded -----BEGIN PRIVATE KEY----- MIIEvQIBADANBgkqhkiG9w0BAQEFAASC",
+            ["BEGIN", "PRIVATE", "KEY", "MIIEvQIBADANBgkqhkiG9w0BAQEFAASC"],
+        ),
+        (
+            "db reconnect postgres://svc_orders:Hunter2@db.internal/orders done",
+            ["Hunter2", "svc_orders"],
+        ),
+        (
+            "db reconnect dsn=postgres://svc_orders:Hunter2@db.internal/orders done",
+            ["Hunter2", "svc_orders"],
+        ),
+        ("fetch https://svc:Hunter2@splunk.internal/api failed", ["Hunter2"]),
+    ],
+)
+def test_pem_blocks_and_url_userinfo_are_secrets_never_constants_nor_params(
+    message: str, secret_words: list[str]
+) -> None:
+    """ADR 0068: PEM armour and a URL with userinfo are masked before mining and are never
+    parameters, so neither the key nor the password reaches a field, however often the line
+    repeats and however many variants arrive."""
+    store = TemplateStore()
+    for n in range(4):
+        template, params = store.mine("sys_web", f"{message} attempt{'x' * n}")
+        text = template + " " + " ".join(params)
+        for word in secret_words:
+            assert word not in text, (word, template, params)
 
 
 def test_a_varying_word_stays_a_parameter_once_constants_appear() -> None:

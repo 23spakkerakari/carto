@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Iterator
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pytest
@@ -37,12 +37,17 @@ from carto_simulator.api import GenerationRequest, generate, run_as_of
 
 ROOT = Path(__file__).resolve().parents[2]
 CONFIG = ROOT / "simulator" / "analyze.shop.yaml"
+SIM_START = date(2026, 10, 12)
+"""Three days before the pinned clock of ``edge/tests/conftest.py`` (2026-10-15)."""
 
 
 @pytest.fixture(scope="module")
 def sim_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
     out = tmp_path_factory.mktemp("sim") / "shop"
-    generate(GenerationRequest(days=1, daily_volume=5, seed=3), out)
+    # Three days before the edge tests' pinned clock (conftest ``PINNED_NOW``), not the
+    # simulator's fixed default start: the runs without ``--as-of`` check the plausible range
+    # against that clock (ADR 0036, events retention 30 days).
+    generate(GenerationRequest(days=1, daily_volume=5, seed=3, start_date=SIM_START), out)
     return out
 
 
