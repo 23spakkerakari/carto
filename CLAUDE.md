@@ -53,8 +53,9 @@ import, lint or test it.
   bridge recall 0.80, two legacy links under the distinct floor at that volume; founder call in
   the demo note). CI green on all eleven jobs on 2026-10-20 (pushed as `m2-map-discovery-built`
   at 2cb3bd0 because the rebased milestone branch needs the user's force push). Acceptance
-  waits on that founder call and the partner gate; `fix-c2` is not merged into it yet. Next:
-  M3 trace (write docs/plans/M3.md first).
+  waits on that founder call and the partner gate; `fix-c2` reaches the line through
+  `security-fixes-1` (merged there on 2026-11-02), never separately. Next: M3 trace (write
+  docs/plans/M3.md first).
 - M3 Trace: plan drafted 2026-10-20 on branch `m3-trace` (docs/plans/M3.md, cut from
   `m2-map-discovery` at 1e1b2d4); revised 2026-10-28 on branch `m3-trace-spec` (cut from
   `spec-data-layer` at c2e9a75) after five read-only reviews of the code against the plan:
@@ -62,7 +63,7 @@ import, lint or test it.
   7.3, 9.7, 9.8, 12, 13, 15, 18, 21, threat-model rows 3 and 8, an amendment on ADR 0052.
   The thirteen founder questions were answered on 2026-11-01 with the plan's recommendations
   (recorded under the questions; spec 8.4, 9.5, 9.7, 9.8, 12, 14.2, 14.9 edited). Code waits
-  on the M2 acceptance and the `fix-c2` rebase. ADRs from 0060 when code starts.
+  on the M2 acceptance. ADRs from 0060 when code starts.
 - M3 demo cut: branch `m3-demo` cut 2026-11-02 from `m3-trace-spec` at e12b626
   (docs/plans/M3-demo.md): the subset of M3 a demo video needs (assembler, graph rollup, map
   and trace screens, tokenize-for-search, a manual-hop preview badge); reveal, batches, skew,

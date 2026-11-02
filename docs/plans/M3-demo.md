@@ -1,8 +1,9 @@
 # M3 demo cut: trace, on camera
 
 Status: drafted 2026-11-02 on branch `m3-demo`, cut from `m3-trace-spec` at e12b626 (which
-stacks on `spec-data-layer` and the rebased `m2-map-discovery`; `fix-c2` is not merged and the
-M2 branch is not force-pushed yet, both deferred until after the recording).
+stacks on `spec-data-layer` and the rebased `m2-map-discovery`; `fix-c2` arrives through the
+security branch `security-fixes-1`, which merged it, and the M2 branch is not force-pushed
+yet, deferred until after the recording).
 
 This plan is a strict subset of `docs/plans/M3.md`. Every decision of that plan stands; this
 file names which of its packages are built now, which are cut for the video, and the handful
@@ -252,8 +253,9 @@ plan's decisions as built, each marked with what the demo leaves out.
 - Decision 20: journey 4.4 in the compose CI job.
 - `search_counters` (M4's self-alert input), `date_order` per source, scenario C's batch, the
   threat-model rows 3 and 8 test names, the leak scan over the reveal path.
-- The `fix-c2` merge, the M2 force push, the PR of `m1-review-fixes` to `main`, and the
-  2026-11-01 security findings (none on the demo path; the pip-audit red is expected in CI).
+- The M2 force push, the PR of `m1-review-fixes` to `main`, and the 2026-11-01 security
+  findings (none on the demo path), which the `security-fixes-1` branch carries together
+  with `fix-c2`; that PR lands on `m3-trace-spec` before this one.
 
 ## Order of work
 

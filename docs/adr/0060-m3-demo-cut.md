@@ -19,8 +19,10 @@ assembler's shape is settled and code may start.
   "Likely manual" preview badge (ADR 0063). Everything else in the M3 plan is listed there
   under "Left for M3 proper" and nothing is dropped.
 - The work runs on branch `m3-demo`, cut from `m3-trace-spec` at e12b626, whose PR targets
-  `m3-trace-spec`; M3 proper continues on top of it. The `fix-c2` merge, the force push of the
-  rebased M2 branch and the PR of `m1-review-fixes` to `main` wait until after the recording.
+  `m3-trace-spec`; M3 proper continues on top of it. `fix-c2` reaches `m3-trace-spec` through
+  the security branch `security-fixes-1`, which merged it (nobody merges it twice); the force
+  push of the rebased M2 branch and the PR of `m1-review-fixes` to `main` wait until after the
+  recording.
 - ADRs 0060 to 0066 record the decisions the demo cut builds; the M3 plan's other decisions
   get their ADRs when their packages are built.
 - `full` assembly in the demo cut is a replay of the read window over the existing index: the
