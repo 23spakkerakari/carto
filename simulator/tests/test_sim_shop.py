@@ -672,3 +672,32 @@ def test_shipping_lifecycle_timing(run: Run) -> None:
         local = clock.to_local(pickup.observed_at)
         assert time(22, 0) <= local.time() <= time(22, 30)
         assert pickup.batch_id is not None and pickup.batch_id.startswith("batch_MAN-")
+
+
+# ---------------------------------------------------------------------------------------------
+# Planted secrets (spec 18.3 ``secret_values``, ADR 0068)
+# ---------------------------------------------------------------------------------------------
+
+
+def test_secret_values_are_planted_in_noise_lines_and_recorded(run: Run) -> None:
+    secrets = run.truth.markers.secret_values
+    assert secrets == sorted(set(secrets))
+    assert len(secrets) == 7  # five shapes: the PEM and the DSN each record two strings
+    assert any(re.fullmatch(r"AKIA[A-Z0-9]{16}", value) for value in secrets)
+    assert "-----BEGIN RSA PRIVATE KEY-----" in secrets
+    dsn = [value for value in secrets if value.startswith("postgres://")]
+    assert len(dsn) == 1
+    assert re.fullmatch(r"postgres://svc_app:[A-Za-z0-9]{16}@[a-z.]+:5432/app", dsn[0])
+    native = run.native_text()
+    assert all(value in native for value in secrets)
+    for value in secrets:
+        assert not MARKER.search(value)  # the secrets never look like marker tokens
+    truth_text = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in sorted((run.out_dir / "ground_truth").glob("*"))
+        if path.name != "markers.json"
+    )
+    assert not any(value in truth_text for value in secrets if value.startswith(("AKIA", "post")))
+    # Every planted line is a noise event with no transaction behind it.
+    secret_lines = [line for line in native.splitlines() if any(v in line for v in secrets)]
+    assert len(secret_lines) >= 5

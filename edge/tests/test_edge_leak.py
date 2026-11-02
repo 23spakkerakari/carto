@@ -6,11 +6,14 @@ one: not the offline bundle (events, fields, templates, both manifests, signatur
 batches the edge would forward, not what ``ingest-api`` writes to ClickHouse, not its responses,
 and not the product logs (spec 2.3 invariants 2 and 7).
 
-``test_leak_scenario_a_small_run`` generates a small scenario-A run, captures every product log
-line from before the analyzer starts, analyzes in process with the configured PII detector and
-the locator map, scans the bundle, wraps the events into zstd ``IngestBatch`` payloads posted to
-``carto_core.ingest.app`` with in-memory stores, and scans the payloads, the rows the writer
-received (rendered through ``event_row``/``identifier_rows``), the responses and the logs.
+``test_leak_small_run`` generates a small two-day run of each scenario (``shop`` and
+``people_ops``), captures every product log line from before the analyzer starts, analyzes in
+process with the configured PII detector and the locator map, scans the bundle, wraps the
+events into zstd ``IngestBatch`` payloads posted to ``carto_core.ingest.app`` with in-memory
+stores, and scans the payloads, the rows the writer received (rendered through
+``event_row``/``identifier_rows``), the responses and the logs. The simulator's own markers
+include the ``secret_values`` it plants into noise lines (ADR 0068); the test plants probes of
+its own on top (:func:`_plant_probes`), among them a message repeated three times verbatim.
 ``test_leak_full_scenario_bundle`` scans ``<sim-out>/<scenario>.carto`` when ``make analyze``
 produced it (``make leak SCENARIO=...``; skipped otherwise).
 
@@ -46,7 +49,7 @@ import warnings
 from collections import Counter
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -84,9 +87,11 @@ from carto_schema.event import CanonicalEvent
 from carto_schema.ingest import MAX_EVENTS_PER_BATCH, IngestBatch
 from carto_simulator.api import GenerationRequest, generate
 
+PINNED_NOW = datetime(2026, 10, 15, 12, 0, tzinfo=UTC)
+"""The edge tests' wall clock (``conftest.PINNED_NOW``); the ingest app here runs on it too."""
+
 ROOT = Path(__file__).resolve().parents[2]
 NL = "\n"
-CONFIG = ROOT / "simulator" / "analyze.shop.yaml"
 MIN_MARKER_LEN = 4
 MAX_REPORTED = 40
 BATCH_SIZE = MAX_EVENTS_PER_BATCH
@@ -329,6 +334,40 @@ def batches_of(events: Sequence[CanonicalEvent], tenant_id: str) -> list[IngestB
     ]
 
 
+# --- scenarios ---------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Layout:
+    """Where the probes go in a scenario's output: the analyzer configuration, one ndjson log
+    source (glob and file-name prefix before the day) and one logfmt source with the prefix
+    its lines carry before ``msg=`` (timestamp and severity in that source's own names)."""
+
+    config: Path
+    ndjson_glob: str
+    ndjson_prefix: str
+    logfmt_glob: str
+    logfmt_prefix: str
+
+
+LAYOUTS: dict[str, Layout] = {
+    "shop": Layout(
+        config=ROOT / "simulator" / "analyze.shop.yaml",
+        ndjson_glob="webstore/app-*.ndjson",
+        ndjson_prefix="app-",
+        logfmt_glob="orders/order-svc-*.log",
+        logfmt_prefix="ts={day}T05:30:00.000Z level=info",
+    ),
+    "people_ops": Layout(
+        config=ROOT / "simulator" / "analyze.people_ops.yaml",
+        ndjson_glob="onboarding/onboarding-*.ndjson",
+        ndjson_prefix="onboarding-",
+        logfmt_glob="onboarding_legacy/legacy-hires-*.log",
+        logfmt_prefix='time="{day} 05:30:00" lvl=INFO',
+    ),
+}
+
+
 # --- fixtures ----------------------------------------------------------------------------------
 
 
@@ -376,21 +415,35 @@ def test_marker_rule() -> None:
     assert not _is_own_shape("4471")
 
 
-def test_leak_scenario_a_small_run(tmp_path: Path, restore_logging: None) -> None:
+@pytest.mark.parametrize("scenario", sorted(LAYOUTS))
+def test_leak_small_run(scenario: str, tmp_path: Path, restore_logging: None) -> None:
     logs = io.StringIO()
     configure_logging("edge", level="debug", stream=logs)  # before anything runs
 
-    sim = tmp_path / "shop"
+    layout = LAYOUTS[scenario]
+    sim = tmp_path / scenario
+    # Two recent days: ingest-api refuses events older than the events retention (ADR 0036),
+    # so the simulator's fixed default start date would be refused once it is 30 days past.
     generate(
-        GenerationRequest(days=2, daily_volume=20, seed=7, noise_rate=0.5, pii_density=0.5), sim
+        GenerationRequest(
+            scenario=scenario,
+            days=2,
+            daily_volume=20,
+            seed=7,
+            start_date=PINNED_NOW.date() - timedelta(days=4),
+            noise_rate=0.5,
+            pii_density=0.5,
+        ),
+        sim,
     )
-    probes = _plant_probes(sim)
+    probes = _plant_probes(sim, layout)
     markers_file = tmp_path / "markers.json"
     planted = json.loads((sim / "ground_truth" / "markers.json").read_text(encoding="utf-8"))
+    assert len(planted["secret_values"]) == 7, "the simulator planted no secrets (ADR 0068)"
     planted["probes"] = probes
     markers_file.write_text(json.dumps(planted), encoding="utf-8")
-    out = tmp_path / "shop.carto"
-    result = analyze(CONFIG, sim, out, locator_map=True)
+    out = tmp_path / f"{scenario}.carto"
+    result = analyze(layout.config, sim, out, locator_map=True)
     manifest = result.manifest
     assert manifest.counts.events > 0
     verified = verify_bundle(out)
@@ -402,6 +455,10 @@ def test_leak_scenario_a_small_run(tmp_path: Path, restore_logging: None) -> Non
         environment=_environment(tmp_path, ROOT),
     )
     assert report.markers.category, "markers.json holds no marker"
+    assert {report.markers.category[m] for m in report.markers.category} >= {
+        "secret_values",
+        "probes/thrice",
+    }
     assert scan_bundle(report, out) == manifest.counts.events
     for line in format_summary(result):
         report.text("analyze summary", line)
@@ -413,12 +470,18 @@ def test_leak_scenario_a_small_run(tmp_path: Path, restore_logging: None) -> Non
     assert {entry.name for entry in out.iterdir()} == BUNDLE_FILES
     lines = [json.loads(line) for line in locator.read_text(encoding="utf-8").splitlines()]
     assert len(lines) == manifest.counts.events
-    source_ids = tuple(f"{source.id}:" for source in load_sources_file(CONFIG).sources)
+    source_ids = tuple(f"{source.id}:" for source in load_sources_file(layout.config).sources)
     assert all(line["key"].startswith(source_ids) for line in lines)
 
     # What the edge would forward, and what ingest-api would write.
     writer = FakeWriter()
-    app = create_app(CoreSettings(), writer, InMemoryBatchLedger(), InMemorySourceHealthStore())
+    app = create_app(
+        CoreSettings(),
+        writer,
+        InMemoryBatchLedger(),
+        InMemorySourceHealthStore(),
+        clock=lambda: PINNED_NOW,  # the edge tests' clock (conftest): the run is four days old
+    )
     client = TestClient(ActAsRole(app, "edge-gateway"))  # the edge forwards (ADR 0031)
     for batch in batches_of(events, manifest.tenant_id):
         payload = compress_batch(batch)
@@ -466,16 +529,17 @@ def _letters(n: int) -> str:
     return "".join(chr(97 + (n // 26**place) % 26) for place in (2, 1, 0))
 
 
-def _plant_probes(sim: Path) -> dict[str, list[str]]:
+def _plant_probes(sim: Path, layout: Layout) -> dict[str, list[str]]:
     """Records that exercise the leak classes the simulator does not generate (review): a JSON
     map keyed by a value, maps keyed by names without digits (rare keys, and enough distinct keys
     to make the parent a map, ADR 0030), free text in a field, a one-off message, a message seen
-    twice (the analyzer reads its input twice), a logfmt line whose message runs on unquoted,
-    and rare free text in an otherwise low-cardinality field. Returns the
-    probe markers, which are scanned like the simulator's own."""
-    webstore = min((sim / "webstore").glob("app-*.ndjson"))
-    orders = min((sim / "orders").glob("order-svc-*.log"))
-    day = webstore.stem.removeprefix("app-")
+    twice (the analyzer reads its input twice), a message repeated three times verbatim (ADR
+    0068: identical repeats must not make its words template constants), a logfmt line whose
+    message runs on unquoted, and rare free text in an otherwise low-cardinality field. Returns
+    the probe markers, which are scanned like the simulator's own."""
+    ndjson = min(sim.glob(layout.ndjson_glob))
+    logfmt = min(sim.glob(layout.logfmt_glob))
+    day = ndjson.stem.removeprefix(layout.ndjson_prefix)
     probes = {
         "map_key": [f"mkprobe{n:03d}key" for n in range(3)],
         "rare_name_key": [f"mkprobekeyowner{_letters(n)}" for n in range(2)],
@@ -483,6 +547,7 @@ def _plant_probes(sim: Path) -> dict[str, list[str]]:
         "free_text": [f"please call mrs mkprobe{n:03d}note back tomorrow" for n in range(3)],
         "one_off": ["mkprobeoneoffword"],
         "twice": ["mkprobetwiceword"],
+        "thrice": ["mkprobethriceword"],
         "logfmt_words": ["mkprobebareword"],
         "rare_kept": [f"refund issued by mkprobe{n:03d}rare after review" for n in range(2)],
     }
@@ -507,16 +572,17 @@ def _plant_probes(sim: Path) -> dict[str, list[str]]:
     for twice_minute in ("21", "22"):
         message = "parcel left with neighbour mkprobetwiceword"
         lines.append(json.dumps({"ts": f"{day}T05:{twice_minute}:00.000Z", "msg": message}))
+    for thrice_minute in ("23", "24", "25"):
+        message = "refund approved for mkprobethriceword by manager"
+        lines.append(json.dumps({"ts": f"{day}T05:{thrice_minute}:00.000Z", "msg": message}))
     for n in range(60):
         detail = probes["rare_kept"][n // 30] if n % 30 == 7 else "ok"
         lines.append(
             json.dumps({"ts": f"{day}T06:{n:02d}:00.000Z", "msg": "callback", "callback": detail})
         )
-    with webstore.open("a", encoding="utf-8", newline=NL) as handle:
+    with ndjson.open("a", encoding="utf-8", newline=NL) as handle:
         handle.writelines(line + NL for line in lines)
-    with orders.open("a", encoding="utf-8", newline=NL) as handle:
-        handle.write(
-            f"ts={day}T05:30:00.000Z level=info msg=refund approved for mkprobebareword"
-            f" order_id=4471{NL}"
-        )
+    with logfmt.open("a", encoding="utf-8", newline=NL) as handle:
+        prefix = layout.logfmt_prefix.format(day=day)
+        handle.write(f"{prefix} msg=refund approved for mkprobebareword order_id=4471{NL}")
     return probes

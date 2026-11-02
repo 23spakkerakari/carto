@@ -47,7 +47,16 @@ from carto_simulator.ground_truth import (
     row_key,
     write_ground_truth,
 )
-from carto_simulator.names import CLERKS, SERVICE_ACCOUNT, MarkerFactory, Person, draw_person
+from carto_simulator.names import (
+    CLERKS,
+    SECRET_NOISE_SHARE,
+    SERVICE_ACCOUNT,
+    MarkerFactory,
+    Person,
+    PlantedSecrets,
+    draw_person,
+    draw_secrets,
+)
 from carto_simulator.scenarios import shop_truth
 from carto_simulator.scenarios.shop_model import (
     ALTER_RENAME,
@@ -157,6 +166,7 @@ class _ShopRun:
         self.identifier_values: dict[str, set[str]] = {}
         self.pii_values: set[str] = set()
         self.marker_tokens: set[str] = set()
+        self.secrets: PlantedSecrets | None = None  # drawn at the first secret noise line
         self.day_params: dict[date, DayParams] = {}
         self.emitted: list[Emitted] = []
         local = self.zone
@@ -724,11 +734,25 @@ class _ShopRun:
                         self.emit_noise_line(source_id, at)
                 hour_start += hour
 
+    def secret_message(self) -> str | None:
+        """One of the planted secret lines (ADR 0068) for a share of the noise, else None.
+        The secrets are drawn on first use, after every transaction, so they change nothing
+        before phase D."""
+        rng = self.rng
+        if rng.random() >= SECRET_NOISE_SHARE:
+            return None
+        if self.secrets is None:
+            self.secrets = draw_secrets(rng, "db.shop.internal")
+        return rng.choice(self.secrets.messages())
+
     def emit_noise_line(self, source_id: str, at: datetime) -> None:
         rng = self.rng
+        secret = self.secret_message() if source_id != SRC_PAYMENTS else None
         if source_id == SRC_WEBSTORE:
             fields: dict[str, object] = {"ts": self.webstore.timestamp(at), "level": "info"}
-            if rng.random() < 0.5:
+            if secret is not None:
+                fields.update({"msg": secret})
+            elif rng.random() < 0.5:
                 fields.update({"msg": "health check ok", "path": "/healthz", "status": 200})
             else:
                 fields.update({"msg": "cache refresh", "keys": 1200, "region": rng.choice(REGIONS)})
@@ -738,7 +762,9 @@ class _ShopRun:
                 ("ts", self.orders.timestamp(at)),
                 ("level", "info"),
             ]
-            if rng.random() < 0.5:
+            if secret is not None:
+                pairs.extend([("msg", secret)])
+            elif rng.random() < 0.5:
                 pairs.extend([("msg", "scheduler tick"), ("queue", "orders")])
             else:
                 pairs.extend([("msg", "db pool stats"), ("active", 3), ("idle", 7)])
@@ -754,7 +780,16 @@ class _ShopRun:
             at = clock.floor_seconds(at)
             self.export_log.add(
                 Truth(N_WAREHOUSE_NOISE, at),
-                self.export_text(at, "INFO", "export scheduler idle, next run 21:10"),
+                self.export_text(at, "INFO", secret)
+                if secret is not None
+                else self.export_text(at, "INFO", "export scheduler idle, next run 21:10"),
+            )
+        elif secret is not None:
+            self.shipping.add(
+                Truth(N_SHIPPING_NOISE, at),
+                logfmt_line(
+                    [("ts", self.shipping.timestamp(at)), ("level", "info"), ("msg", secret)]
+                ),
             )
         else:
             self.shipping.add(
@@ -944,6 +979,7 @@ class _ShopRun:
                     [txn.total for txn in self.transactions]
                     + [po.total for po in self.purchase_orders]
                 ),
+                secret_values=set(self.secrets.values) if self.secrets is not None else set(),
             ),
         )
         ground_truth_dir = write_ground_truth(self.out_dir, truth, self.events())

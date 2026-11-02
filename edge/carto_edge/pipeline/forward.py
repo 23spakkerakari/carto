@@ -60,7 +60,7 @@ import httpx
 from cryptography.x509.oid import NameOID
 
 from carto_common.ids import new_ulid
-from carto_common.logging import get_logger
+from carto_common.logging import get_logger, mask_string
 from carto_common.pki import PkiError, load_certificate
 from carto_edge.config import ConfigError, CoreLinkSettings, SourcesFile, load_sources_file
 from carto_edge.metrics import EdgeMetrics
@@ -553,7 +553,10 @@ class Heartbeater:
 
 def strip_config(config: Mapping[str, Any]) -> dict[str, Any]:
     """The connector configuration as core may see it (module docstring): secret-bearing keys
-    and every nested structure removed, scalars and lists of strings kept and bounded."""
+    and every nested structure removed, scalars and lists of strings kept and bounded. Every
+    string goes through the log redactor's :func:`~carto_common.logging.mask_string` (ADR
+    0068), so a URL with userinfo, an e-mail address or a token shape under a benign key
+    (``url``, ``dsn``, ``paths``) leaves masked, not in clear."""
     out: dict[str, Any] = {}
     for key, value in config.items():
         name = str(key)
@@ -562,9 +565,11 @@ def strip_config(config: Mapping[str, Any]) -> dict[str, Any]:
         if value is None or isinstance(value, bool | int | float):
             out[name] = value
         elif isinstance(value, str):
-            out[name] = value[:MAX_CONFIG_VALUE_LEN]
+            out[name] = mask_string(value[:MAX_CONFIG_VALUE_LEN])[:MAX_CONFIG_VALUE_LEN]
         elif isinstance(value, list) and all(isinstance(item, str) for item in value):
-            out[name] = [item[:MAX_CONFIG_VALUE_LEN] for item in value]
+            out[name] = [
+                mask_string(item[:MAX_CONFIG_VALUE_LEN])[:MAX_CONFIG_VALUE_LEN] for item in value
+            ]
         # dicts, lists of dicts and mixed lists are dropped: a secret could hide inside them
         if len(out) >= MAX_CONFIG_KEYS:
             break

@@ -229,7 +229,10 @@ turns all of them off except the clock skew, which is a property of the warehous
   or address, embedded unchanged so `token in value` holds for each one),
   `pii_values` (every emitted `customer_name`, `customer_email`, `cardholderName` and
   `ship_to_address`), `identifier_values` keyed by `str(FieldRef)` such as
-  `sys_orders/src_orders_log/order_id` (only fields that appear in the data have a key).
+  `sys_orders/src_orders_log/order_id` (only fields that appear in the data have a key),
+  `secret_values` (the five secret-shaped strings planted into noise lines of every log source,
+  ADR 0068: an AWS key id, a bearer token, a `password=` value, a PEM block and a DSN with a
+  password; the leak test scans for them like the other categories).
 - `manifest.json`: counts per source plus `transactions`, `events` (records with a transaction),
   `noise`, `files`; sha256 of every native file by relative path; the request parameters;
   `generator_version` from `carto_simulator.api.GENERATOR_VERSION`.

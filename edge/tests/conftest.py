@@ -3,6 +3,7 @@ and the pinned reference time of the plausible ``observed_at`` range (ADR 0036).
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from datetime import UTC, datetime
 
 import pytest
@@ -15,9 +16,13 @@ runs carry fixed dates from September and October 2026, which a real clock would
 old from November on. Tests of the range itself pass the pipeline an explicit clock."""
 
 
-@pytest.fixture(autouse=True)
-def _pinned_range_clock(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(pipeline_module, "wall_clock", lambda: PINNED_NOW)
+@pytest.fixture(autouse=True, scope="session")
+def _pinned_range_clock() -> Iterator[None]:
+    """Session-wide, so module-scoped fixtures (an analyzer run reused by several tests) see
+    the same clock as the tests that compare against them."""
+    with pytest.MonkeyPatch.context() as patcher:
+        patcher.setattr(pipeline_module, "wall_clock", lambda: PINNED_NOW)
+        yield
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:

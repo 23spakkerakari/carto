@@ -347,3 +347,25 @@ def test_run_survives_a_faulty_round(sources_file: Path, monkeypatch: pytest.Mon
     assert len(calls) >= 2
     assert any(entry.get("error") == "RuntimeError" for entry in logs)
     assert PLANTED not in repr(logs)
+
+
+def test_strip_config_masks_value_shapes_in_strings_and_lists() -> None:
+    """ADR 0068: a URL with userinfo, an e-mail address or a token under a benign key leaves
+    masked. The leak classes are the log redactor's; the inventory reuses them."""
+    stripped = strip_config(
+        {
+            "url": "https://svc:Hunter2@splunk.internal",
+            "dsn": "postgres://svc_orders:Hunter2@db.internal:5432/orders",
+            "owner": "ops@example.com",
+            "paths": ["sftp://u:p@host/in", "/plain/path"],
+            "host": "db",
+        }
+    )
+    text = json.dumps(stripped)
+    assert "Hunter2" not in text
+    assert "u:p@" not in text
+    assert "ops@example.com" not in text
+    assert stripped["url"].startswith("https://svc:")
+    assert "@splunk.internal" in stripped["url"]
+    assert stripped["paths"][1] == "/plain/path"
+    assert stripped["host"] == "db"

@@ -26,7 +26,11 @@ Two things are done differently from a stock Drain3 setup, both for spec 2.3:
   value. A token that :func:`~carto_edge.pipeline.pii.looks_like_secret` flags becomes
   :data:`MASK` too and stays a parameter, whose field the classifier then drops by its
   shape. Either way the secret is never a constant nor part of the persisted Drain3 state,
-  however often it repeats.
+  however often it repeats. Two more shapes are secrets by construction and never parameters
+  (ADR 0068): every token of a PEM armour block (from a token holding ``-----BEGIN`` to the
+  closing dashes after ``-----END``, or the end of the message) and a URL with userinfo
+  (``postgres://svc:hunter2@db``), whose password the classifier could not tell from the rest
+  of the connection string.
 - **Plain-JSON persistence.** Drain3's own snapshots use ``jsonpickle``, which instantiates
   arbitrary classes on load (invariant 8: no pickle). The store serialises the parse tree and
   the clusters itself, one validated JSON file per system under ``EdgeSettings.templates_dir``,
@@ -38,8 +42,12 @@ Two things are done differently from a stock Drain3 setup, both for spec 2.3:
 
 A third rule for the same invariant: Drain3 keeps a one-member cluster's message verbatim, so
 a word that appeared once (a name, a code word, free text) would become a "constant". Until a
-cluster has :data:`MIN_CLUSTER_SIZE` members every token of its messages is a parameter and the
-template is all ``<*>``; constants appear once the message shape has been seen that often.
+cluster holds :data:`MIN_CLUSTER_SIZE` **distinct** messages every token of its messages is a
+parameter and the template is all ``<*>``; constants appear once that many different messages
+share them. Identical repeats count once (ADR 0068): a retry loop logging ``Refund approved for
+Alice Smith by manager`` three times is one message, not three, and the name stays a
+parameter. The store keeps up to :data:`MAX_DISTINCT_DIGESTS` short digests of the distinct
+messages per cluster, persisted with the cluster; a message's words are never in the state.
 
 **Frozen replay.** The offline analyzer reads its input twice (ADR 0017). Mining the second
 pass would count every message again, so a message seen twice would reach
@@ -62,7 +70,7 @@ import json
 import re
 import time
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from types import TracebackType
@@ -83,6 +91,7 @@ from carto_schema.event import (
 
 __all__ = [
     "MASK",
+    "MAX_DISTINCT_DIGESTS",
     "MAX_MESSAGE_TOKENS",
     "MAX_STATE_BYTES",
     "MIN_CLUSTER_SIZE",
@@ -99,9 +108,18 @@ MASK: Final = "<*>"
 MAX_MESSAGE_TOKENS: Final = 512
 """Tokens of one message fed to Drain3; the rest is cut (bounded work per record)."""
 MAX_STATE_BYTES: Final = 64 * 1024 * 1024
-STATE_VERSION: Final = 1
+STATE_VERSION: Final = 2
+"""Version written. Version 1 files (no digests) load with every cluster's digests empty, so
+their templates earn their constants again from distinct messages (ADR 0068)."""
+_READABLE_VERSIONS: Final = frozenset({1, STATE_VERSION})
 MIN_CLUSTER_SIZE: Final = 3
-"""Messages a Drain3 cluster needs before its common words count as template constants."""
+"""Distinct messages a Drain3 cluster needs before its common words count as constants."""
+MAX_DISTINCT_DIGESTS: Final = 8
+"""Digests of distinct messages kept per cluster; counting stops there (bounded state)."""
+_DIGEST_BYTES: Final = 6
+_PEM_BEGIN: Final = "-----BEGIN"
+_PEM_END: Final = "-----END"
+_URL_USERINFO: Final = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://[^/\s@]+@")
 DEFAULT_MAX_CLUSTERS: Final = 10_000
 DEFAULT_FLUSH_INTERVAL: Final = 60.0
 DEFAULT_CACHE_SIZE: Final = 8192
@@ -182,7 +200,23 @@ def mask_tokens(tokens: Sequence[str]) -> tuple[list[str], list[int]]:
     masked: list[str] = []
     starts: list[int] = []
     secret_next = False
+    pem = 0  # 0 outside a PEM block, 1 inside, 2 after -----END until the closing dashes
     for token in tokens:
+        if pem or _PEM_BEGIN in token:
+            # PEM armour: the header words, the body and the footer are one secret (ADR 0068).
+            if _PEM_END in token:
+                pem = 2
+            elif pem == 0:
+                pem = 1
+            masked.append(MASK)
+            starts.append(_SECRET)
+            if pem == 2 and token.endswith("-----"):
+                pem = 0
+            continue
+        if _URL_USERINFO.search(token):
+            masked.append(MASK)  # a URL with userinfo: the password is never a parameter
+            starts.append(_SECRET)
+            continue
         if secret_next:
             if _bare(token).lower() in _AUTH_SCHEMES:
                 masked.append(token)  # Authorization: Basic <secret>: the scheme is no secret
@@ -266,7 +300,15 @@ class _SystemState:
     miner: TemplateMiner
     cache: dict[str, str]
     registry: dict[str, _Entry]
+    distinct: dict[int, list[str]] = field(default_factory=dict)
+    """Cluster id -> digests of up to ``MAX_DISTINCT_DIGESTS`` distinct messages (ADR 0068)."""
     dirty: bool = False
+
+
+def _message_digest(message: str) -> str:
+    """A short digest of a whitespace-normalised message; the state never holds the message."""
+    data = message.encode("utf-8", errors="surrogatepass")
+    return hashlib.blake2b(data, digest_size=_DIGEST_BYTES).hexdigest()
 
 
 def _miner_config(max_clusters: int) -> TemplateMinerConfig:
@@ -324,12 +366,13 @@ def _node_from_json(data: Any, depth: int) -> Node:
     return node
 
 
-def _drain_to_json(drain: Drain) -> dict[str, Any]:
+def _drain_to_json(drain: Drain, distinct: dict[int, list[str]]) -> dict[str, Any]:
     clusters = [
         {
             "id": cluster.cluster_id,
             "tokens": list(cluster.log_template_tokens),
             "size": cluster.size,
+            "d": distinct.get(cluster.cluster_id, []),
         }
         for cluster in drain.id_to_cluster.values()
     ]
@@ -340,7 +383,22 @@ def _drain_to_json(drain: Drain) -> dict[str, Any]:
     }
 
 
-def _drain_from_json(drain: Drain, data: dict[str, Any]) -> None:
+def _digests_from_json(data: Any) -> list[str]:
+    """The ``d`` list of a persisted cluster; absent in version 1 files (then empty)."""
+    if data is None:
+        return []
+    if (
+        not isinstance(data, list)
+        or len(data) > MAX_DISTINCT_DIGESTS
+        or not all(isinstance(digest, str) and len(digest) == 2 * _DIGEST_BYTES for digest in data)
+    ):
+        msg = "invalid cluster digests"
+        raise ValueError(msg)
+    return list(dict.fromkeys(data))
+
+
+def _drain_from_json(drain: Drain, data: dict[str, Any]) -> dict[int, list[str]]:
+    """Restore the tree and the clusters into ``drain``; returns the distinct digests."""
     clusters = data.get("clusters")
     counter = data.get("counter")
     if not isinstance(clusters, list) or not isinstance(counter, int) or counter < 0:
@@ -348,6 +406,7 @@ def _drain_from_json(drain: Drain, data: dict[str, Any]) -> None:
         raise ValueError(msg)
     root = _node_from_json(data.get("tree"), 0)
     restored: list[LogCluster] = []
+    distinct: dict[int, list[str]] = {}
     for item in clusters:
         if not isinstance(item, dict):
             msg = "invalid cluster"
@@ -370,10 +429,14 @@ def _drain_from_json(drain: Drain, data: dict[str, Any]) -> None:
         cluster = LogCluster(tokens, cluster_id)
         cluster.size = size
         restored.append(cluster)
+        digests = _digests_from_json(item.get("d"))
+        if digests:
+            distinct[cluster_id] = digests
     for cluster in restored:
         drain.id_to_cluster[cluster.cluster_id] = cluster
     drain.clusters_counter = counter
     drain.root_node = root
+    return distinct
 
 
 def _registry_to_json(registry: dict[str, _Entry]) -> list[dict[str, Any]]:
@@ -499,7 +562,9 @@ class TemplateStore:
             template = str(result["template_mined"])
             if result["change_type"] == _CHANGED or len(state.cache) >= self._cache_size:
                 state.cache.clear()
-            if int(result.get("cluster_size", 0)) >= self._min_cluster_size:
+            if self._note_distinct(state, int(result["cluster_id"]), tokens) >= (
+                self._min_cluster_size
+            ):
                 state.cache[masked] = template
             else:
                 template = " ".join(MASK for _ in tokens)  # not yet a constant: all parameters
@@ -521,11 +586,30 @@ class TemplateStore:
     def frozen(self) -> bool:
         return self._frozen
 
+    def _note_distinct(self, state: _SystemState, cluster_id: int, tokens: Sequence[str]) -> int:
+        """Count the message among the distinct messages of its cluster (bounded) and return
+        how many the cluster holds. Identical repeats count once (ADR 0068)."""
+        digests = state.distinct.get(cluster_id)
+        if digests is None:
+            if len(state.distinct) >= self._max_clusters:
+                live = state.miner.drain.id_to_cluster
+                for stale in [cid for cid in state.distinct if cid not in live]:
+                    del state.distinct[stale]
+            digests = state.distinct[cluster_id] = []
+        if len(digests) < MAX_DISTINCT_DIGESTS:
+            digest = _message_digest(" ".join(tokens))
+            if digest not in digests:
+                digests.append(digest)
+        return len(digests)
+
     def _match(self, state: _SystemState, masked: str, token_count: int) -> str:
         """The template of the cluster ``masked`` belongs to, or all parameters when it has
-        none or fewer than ``min_cluster_size`` members."""
+        none or fewer than ``min_cluster_size`` distinct messages."""
         cluster = state.miner.match(masked, full_search_strategy="fallback")
-        if cluster is None or cluster.size < self._min_cluster_size:
+        if (
+            cluster is None
+            or len(state.distinct.get(cluster.cluster_id, ())) < self._min_cluster_size
+        ):
             return " ".join(MASK for _ in range(token_count))
         return str(cluster.get_template())
 
@@ -628,7 +712,7 @@ class TemplateStore:
         payload = {
             "version": STATE_VERSION,
             "system_id": system_id,
-            **_drain_to_json(state.miner.drain),
+            **_drain_to_json(state.miner.drain, state.distinct),
             "registry": _registry_to_json(state.registry),
         }
         temporary = path.with_name(path.name + ".tmp")
@@ -655,11 +739,11 @@ class TemplateStore:
                 _log().warning("template_state_too_large", system_id=system_id, path=str(path))
                 return
             data = json.loads(path.read_bytes())
-            if not isinstance(data, dict) or data.get("version") != STATE_VERSION:
+            if not isinstance(data, dict) or data.get("version") not in _READABLE_VERSIONS:
                 msg = "unknown template state version"
                 raise ValueError(msg)
             registry = _registry_from_json(data.get("registry", []))
-            _drain_from_json(state.miner.drain, data)
+            state.distinct = _drain_from_json(state.miner.drain, data)
             state.registry = registry
         except (OSError, ValueError, TypeError, KeyError, RecursionError) as exc:
             _log().warning(
@@ -670,6 +754,7 @@ class TemplateStore:
             )
             state.miner = TemplateMiner(config=_miner_config(self._max_clusters))
             state.registry = {}
+            state.distinct = {}
 
     def _state(self, system_id: str) -> _SystemState:
         state = self._states.get(system_id)

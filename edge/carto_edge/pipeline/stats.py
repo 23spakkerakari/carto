@@ -16,6 +16,11 @@ estimate, null rate, shape histogram (...). Stats persist across restarts."
 - the number of secret-shaped values ever seen (rule 1,
   :func:`carto_edge.pipeline.pii.looks_like_secret`), counted at observation so the verdict
   survives reservoir eviction and restarts;
+- two sticky flags the classifier sets and nothing unsets (ADR 0068): ``high_cardinality_seen``
+  (rule 5's test was true at some decision) and ``detector_hits_seen`` (the detector hit a
+  sample at some decision). They persist in the snapshot, so a flood of one constant value
+  that drowns the distinct ratio and washes the reservoir cannot turn an identifier or a
+  field that carried PII into a kept attribute;
 - an exact count per distinct value, for the first :data:`MAX_COUNTED_VALUES` distinct values
   (values longer than :data:`COUNTED_VALUE_MAX_LEN` characters are counted under a BLAKE2b
   digest). The classifier lets a ``keep`` field's value travel in clear only once it was seen
@@ -34,7 +39,8 @@ registers travel zlib-compressed and base64-encoded. ``save`` writes a temporary
 the target and ``os.replace``s it, so a crash never leaves a half-written file; ``load`` treats a
 missing, unreadable, corrupt or foreign-version file as "start empty" and logs a warning,
 because stale statistics only delay classification (quarantine rule 8) while a crash loop would
-stop ingestion. The snapshot format is versioned (:data:`SNAPSHOT_VERSION`).
+stop ingestion. The snapshot format is versioned (:data:`SNAPSHOT_VERSION`): version 2 added
+the two flags; a version 1 snapshot loads with both false.
 """
 
 from __future__ import annotations
@@ -71,7 +77,8 @@ __all__ = [
     "StatsFormatError",
 ]
 
-SNAPSHOT_VERSION: Final = 1
+SNAPSHOT_VERSION: Final = 2
+_READABLE_VERSIONS: Final = frozenset({1, SNAPSHOT_VERSION})
 HLL_PRECISION: Final = 12
 MAX_SHAPES: Final = 256
 OVERFLOW_SHAPE: Final = "<other>"
@@ -126,6 +133,14 @@ def _require_int(data: Mapping[str, Any], key: str, *, minimum: int = 0) -> int:
     return value
 
 
+def _require_bool(data: Mapping[str, Any], key: str) -> bool:
+    value = data.get(key, False)
+    if not isinstance(value, bool):
+        msg = f"snapshot field {key!r} must be a boolean"
+        raise StatsFormatError(msg)
+    return value
+
+
 class FieldStats:
     """Streaming statistics of one field (spec 8.3). Not thread-safe on its own: the store
     serializes access."""
@@ -143,6 +158,8 @@ class FieldStats:
         "_whitespace_chars",
         "_whitespace_values",
         "count",
+        "detector_hits_seen",
+        "high_cardinality_seen",
         "null_count",
         "sample_size",
     )
@@ -154,6 +171,9 @@ class FieldStats:
         self.sample_size = sample_size
         self.count = 0
         self.null_count = 0
+        # Sticky (ADR 0068): set by the classifier through FieldStatsStore.note, never unset.
+        self.high_cardinality_seen = False
+        self.detector_hits_seen = False
         self._registers = bytearray(_HLL_M)
         self._shapes: Counter[str] = Counter()
         # None once the field went past MAX_COUNTED_VALUES distinct values (see the module).
@@ -308,6 +328,8 @@ class FieldStats:
             "whitespace_chars": self._whitespace_chars,
             "whitespace_values": self._whitespace_values,
             "secret_count": self._secret_count,
+            "high_cardinality_seen": self.high_cardinality_seen,
+            "detector_hits_seen": self.detector_hits_seen,
         }
 
     @classmethod
@@ -329,6 +351,9 @@ class FieldStats:
         stats._whitespace_chars = _require_int(data, "whitespace_chars")
         stats._whitespace_values = _require_int(data, "whitespace_values")
         stats._secret_count = _require_int(data, "secret_count")
+        # Absent in version 1 snapshots: both false.
+        stats.high_cardinality_seen = _require_bool(data, "high_cardinality_seen")
+        stats.detector_hits_seen = _require_bool(data, "detector_hits_seen")
         shapes = data.get("shapes", {})
         if not isinstance(shapes, Mapping):
             msg = "snapshot field 'shapes' must be a mapping"
@@ -417,6 +442,22 @@ class FieldStatsStore:
             self._dirty = True
             return stats
 
+    def note(
+        self, ref: str, *, high_cardinality: bool = False, detector_hits: bool = False
+    ) -> None:
+        """Set the sticky flags of ``ref`` (ADR 0068); nothing unsets them. A flag that changes
+        marks the store dirty so the next flush persists it. Unknown refs are ignored."""
+        with self._lock:
+            stats = self._fields.get(ref)
+            if stats is None:
+                return
+            if high_cardinality and not stats.high_cardinality_seen:
+                stats.high_cardinality_seen = True
+                self._dirty = True
+            if detector_hits and not stats.detector_hits_seen:
+                stats.detector_hits_seen = True
+                self._dirty = True
+
     def refs(self) -> list[str]:
         with self._lock:
             return list(self._fields)
@@ -445,7 +486,7 @@ class FieldStatsStore:
         if not isinstance(data, Mapping):
             msg = "snapshot must be a mapping"
             raise StatsFormatError(msg)
-        if data.get("version") != SNAPSHOT_VERSION:
+        if data.get("version") not in _READABLE_VERSIONS:
             msg = f"snapshot version is not {SNAPSHOT_VERSION}"
             raise StatsFormatError(msg)
         fields = data.get("fields", {})
