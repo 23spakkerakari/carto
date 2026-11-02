@@ -46,6 +46,10 @@ and trusted the `carto.source_id` an OTLP sender set.
    images carry their digest: `python:3.12-slim-bookworm`, `ghcr.io/astral-sh/uv:0.9.30` (the
    0.9 line the Dockerfile already used), `node:22.23.4-alpine3.24` (Node 20 is end of life;
    `package.json` `engines` allows 22) and `nginxinc/nginx-unprivileged:1.30.4-alpine`.
+   The gitleaks job names one scanner release in a job-level `GITLEAKS_VERSION` (8.24.3, the
+   action's own default at v2.3.9): the action downloads it without a checksum of its own, and
+   the annotate step, which re-runs the binary for a JSON report, fetches the same asset and
+   verifies its sha256 (recorded in the job) before running it (review 2026-11-02, finding 15).
    `renovate.json` keeps `helpers:pinGitHubActionDigests` and adds `docker:pinDigests`, so
    Renovate moves the SHAs and digests with the patch releases and pins the images
    `compose.yaml` still names by tag on its first run; a rule stops it from crossing a major
@@ -62,9 +66,13 @@ and trusted the `carto.source_id` an OTLP sender set.
 7. **Collector template.** `otel/collector.yaml` carries REPLACE-marked TLS blocks with a
    `client_ca_file` on the syslog, HEC and OTLP receivers, a `bearertokenauth` extension wired
    through `auth:` on the OTLP receivers, and a header stating that the collector runs inside
-   the edge trust zone. OTLP gets its own pipeline with a `resource/otlp` processor that upserts
-   `carto.source_id`, so the collector names the source and a sender's value is overwritten;
-   `filter/require_source` stays as the backstop.
+   the edge trust zone. The filelog and syslog receivers stamp `carto.source_id` through their
+   `resource` key. The Splunk HEC and OTLP receivers have no such key (the collector's config
+   loader is strict: a `resource:` under `splunk_hec` fails the whole file at start; review
+   2026-11-02, finding 8), so each gets a pipeline of its own (`logs/hec`, `logs/otlp`) with a
+   `resource/hec` or `resource/otlp` processor that upserts the attribute. Either way the
+   collector names the source and a sender's value is overwritten; `filter/require_source`
+   stays as the backstop.
 8. **Ride-alongs.** `web/.npmrc` sets `ignore-scripts=true` (the image build already installed
    that way; Playwright's browser is installed explicitly). `deploy/compose/secrets/.gitignore`
    and `proxy-tls/.gitignore` ignore everything but themselves and the README. `make dev`
@@ -106,7 +114,15 @@ and trusted the `carto.source_id` an OTLP sender set.
 - The third-party images in `compose.yaml` (PostgreSQL, ClickHouse, Dex, the collector, the
   nginx proxies) are still pinned by tag only until Renovate's first `docker:pinDigests` run.
 - The GitHub-hosted runner's `docker run` of the osv-scanner image pulls by digest; a scanner
-  release now arrives as a Renovate PR, not silently.
+  release now arrives as a Renovate PR, not silently. The gitleaks release is the exception:
+  Renovate does not move `GITLEAKS_VERSION` or its sha256, so a gitleaks upgrade is a manual
+  change of both values (the sha256 from the release's `gitleaks_<version>_checksums.txt`).
+- The console origin is `CARTO_PUBLIC_URL` (default `https://localhost:${CARTO_WEB_PORT:-8080}`),
+  from which the dev profile's Dex redirect URI is derived; the first cut hard-coded
+  `https://localhost:<port>` in both places, so a pilot reached from any other host name got a
+  redirect URI it could not register (review 2026-11-02, finding 13). The pilot guide's Login
+  table carries the variable and names the `.env` Compose actually reads
+  (`deploy/compose/.env`, or `--env-file`; finding 14).
 - `otel/collector.dev.yaml` (file receivers only, no network listener) is unchanged. The
   template's `bearertokenauth` extension is server-side and needs a token file on the collector
   host; a sender that only holds a client certificate deletes the `auth:` lines.

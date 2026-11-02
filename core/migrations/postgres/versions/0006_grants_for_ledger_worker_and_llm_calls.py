@@ -15,8 +15,10 @@ alone, still nothing on ``audit_log`` and no ``DELETE`` on the metadata tables.
 
 ``carto_worker`` had every metadata table of 0004, the identity tables among them. The worker
 (profiler, linker, namer) never reads ``users``, ``groups``, ``role_bindings`` or ``sessions``;
-only the console api does. They are revoked from it. It keeps ``settings`` whole: it reads the
-engine thresholds (ADR 0055) and the profiler upserts its watermark there. The plan also names
+only the console api does. They are revoked from it, with the ``USAGE`` 0004 granted on
+``role_bindings_id_seq``, the one sequence an identity table owns (``users``, ``groups`` and
+``sessions`` carry text ids). It keeps ``settings`` whole: it reads the engine thresholds (ADR
+0055) and the profiler upserts its watermark there. The plan also names
 ``login_attempts``; no such table exists (the api keeps login attempts in its session store),
 so a migration that creates one grants it to ``carto_app`` alone.
 
@@ -47,6 +49,9 @@ WORKER_ROLE: Final = "carto_worker"
 INGEST_ROLE: Final = "carto_ingest"
 IDENTITY_TABLES: Final = ("users", "groups", "role_bindings", "sessions")
 """The identity tables of 0004 (spec 14.1, 14.2); only the console api touches them."""
+IDENTITY_SEQUENCES: Final = ("role_bindings_id_seq",)
+"""The sequences of those tables that 0004's ``APP_SEQUENCES`` granted ``USAGE`` on; a revoke
+of the tables alone would leave the worker able to advance the id sequence."""
 
 LLM_TRIGGER_FUNCTION: Final = (
     "CREATE OR REPLACE FUNCTION llm_calls_append_only() RETURNS trigger "
@@ -80,6 +85,7 @@ def _guarded(role: str, statements: Sequence[str]) -> str:
 
 def _grant_statements() -> list[str]:
     identity = ", ".join(IDENTITY_TABLES)
+    sequences = ", ".join(IDENTITY_SEQUENCES)
     out: list[str] = []
     for role in APP_ROLES:
         statements = [
@@ -88,6 +94,7 @@ def _grant_statements() -> list[str]:
         ]
         if role == WORKER_ROLE:
             statements.append(f"REVOKE ALL ON {identity} FROM {role};")
+            statements.append(f"REVOKE ALL ON SEQUENCE {sequences} FROM {role};")
         out.append(_guarded(role, statements))
     out.append(_guarded(INGEST_ROLE, [f"GRANT DELETE ON ingest_batches TO {INGEST_ROLE};"]))
     return out
@@ -95,8 +102,9 @@ def _grant_statements() -> list[str]:
 
 def _revoke_statements() -> list[str]:
     """Back to 0004: full metadata grants on ``llm_calls`` and, for the worker, the identity
-    tables; no ``DELETE`` on the ledger for ``carto_ingest``."""
+    tables and their sequence; no ``DELETE`` on the ledger for ``carto_ingest``."""
     identity = ", ".join(IDENTITY_TABLES)
+    sequences = ", ".join(IDENTITY_SEQUENCES)
     out: list[str] = []
     for role in APP_ROLES:
         statements = [
@@ -105,6 +113,7 @@ def _revoke_statements() -> list[str]:
         ]
         if role == WORKER_ROLE:
             statements.append(f"GRANT SELECT, INSERT, UPDATE, DELETE ON {identity} TO {role};")
+            statements.append(f"GRANT USAGE ON SEQUENCE {sequences} TO {role};")
         out.append(_guarded(role, statements))
     out.append(_guarded(INGEST_ROLE, [f"REVOKE DELETE ON ingest_batches FROM {INGEST_ROLE};"]))
     return out

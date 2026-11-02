@@ -306,8 +306,10 @@ services:
       CARTO_POSTGRES__PASSWORD_FILE: /run/secrets/pg_app_password
       CARTO_API__HOST: 0.0.0.0
       CARTO_API__PORT: "8443"
-      # The console origin (what the browser uses); the web service publishes this port.
-      CARTO_API__PUBLIC_URL: https://localhost:${CARTO_WEB_PORT:-8080}
+      # The console origin (what the browser uses): CARTO_PUBLIC_URL from .env, by default the
+      # port the web service publishes on localhost. The dev profile's Dex redirect URI is
+      # derived from the same value.
+      CARTO_API__PUBLIC_URL: ${CARTO_PUBLIC_URL:-https://localhost:${CARTO_WEB_PORT:-8080}}
       # Its own listener CA signs its server certificate and the web proxy's client one.
       CARTO_API__TLS_CERT_FILE: /etc/carto/pki/listener.crt
       CARTO_API__TLS_KEY_FILE: /etc/carto/pki/listener.key
@@ -392,7 +394,7 @@ services:
     networks: [core]
     environment:
       CARTO_DEX_ISSUER: ${CARTO_OIDC_ISSUER:-https://localhost:8080/dex}
-      CARTO_DEX_REDIRECT_URI: https://localhost:${CARTO_WEB_PORT:-8080}/api/v1/auth/callback
+      CARTO_DEX_REDIRECT_URI: ${CARTO_PUBLIC_URL:-https://localhost:${CARTO_WEB_PORT:-8080}}/api/v1/auth/callback
       CARTO_DEX_CLIENT_SECRET_FILE: /run/secrets/oidc_client_secret
     secrets: [oidc_client_secret]
     volumes:

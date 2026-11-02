@@ -13,9 +13,10 @@
 # extension. Nothing here listens in clear.
 #
 # `carto.source_id` names the configured source a record belongs to (a source of type `otlp` in
-# sources.yaml). This pipeline sets it per receiver and never takes it from the sender: the log
-# receivers through their `resource` operator, the OTLP receiver through the `resource/otlp`
-# processor of its own pipeline, which overwrites whatever the sender put there. Anyone who can
+# sources.yaml). This configuration sets it per receiver and never takes it from the sender: the
+# filelog and syslog receivers through their `resource` key, the Splunk HEC and OTLP receivers
+# (which have no such key) through a `resource/<name>` processor in a pipeline of their own
+# (`logs/hec`, `logs/otlp`), which overwrites whatever the sender put there. Anyone who can
 # reach a receiver could otherwise write into any source. edge-gateway still rejects an id that
 # is not an enabled `otlp` source, and `filter/require_source` drops a record that reached the
 # exporter without an id (a misconfigured receiver), so the gateway never guesses (spec 2.3
@@ -81,7 +82,9 @@ receivers:
       carto.source_id: src_syslog # REPLACE
 
   # Splunk HEC push from systems that already speak HEC. The receiver does not check HEC tokens,
-  # so the client CA is what authenticates a sender.
+  # so the client CA is what authenticates a sender. It has no `resource` key: the `resource/hec`
+  # processor of the `logs/hec` pipeline names the source (one receiver, one processor and one
+  # pipeline per HEC source, as for OTLP).
   splunk_hec:
     endpoint: 0.0.0.0:8088
     tls:
@@ -89,8 +92,6 @@ receivers:
       key_file: /etc/otelcol/hec.key # REPLACE
       client_ca_file: /etc/otelcol/hec-senders-ca.crt # REPLACE: the CA that issued the senders' client certificates
       min_version: "1.2"
-    resource:
-      carto.source_id: src_hec # REPLACE
 
   # OTLP from applications already instrumented with OpenTelemetry (logs only, spec 2.2). One
   # receiver, one `resource/otlp` processor and one `logs/otlp` pipeline per source: copy the
@@ -126,7 +127,13 @@ processors:
     send_batch_size: 1000
     send_batch_max_size: 2000
     timeout: 2s
-  # The collector names the OTLP source; a `carto.source_id` the sender set is overwritten.
+  # The collector names the HEC and OTLP sources (their receivers have no `resource` key); a
+  # `carto.source_id` the sender set is overwritten.
+  resource/hec:
+    attributes:
+      - key: carto.source_id
+        value: src_hec # REPLACE: matches sources.yaml
+        action: upsert
   resource/otlp:
     attributes:
       - key: carto.source_id
@@ -173,12 +180,16 @@ service:
       level: basic
       address: 127.0.0.1:8888
   pipelines:
-    # Receivers that stamp the source id themselves (the `resource` operator).
+    # Receivers that stamp the source id themselves (their `resource` key).
     logs:
-      receivers: [filelog/orders, syslog, splunk_hec]
+      receivers: [filelog/orders, syslog]
       processors: [memory_limiter, filter/require_source, batch]
       exporters: [otlphttp/edge]
-    # OTLP gets its own pipeline so `resource/otlp` applies to it alone.
+    # HEC and OTLP get a pipeline each so their `resource/<name>` processor applies to them alone.
+    logs/hec:
+      receivers: [splunk_hec]
+      processors: [memory_limiter, resource/hec, filter/require_source, batch]
+      exporters: [otlphttp/edge]
     logs/otlp:
       receivers: [otlp]
       processors: [memory_limiter, resource/otlp, filter/require_source, batch]

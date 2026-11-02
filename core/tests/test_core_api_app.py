@@ -310,7 +310,17 @@ def test_forwarded_client_takes_the_last_hop_and_refuses_junk() -> None:
     assert forwarded_client("203.0.113.5, ") is None
     assert forwarded_client("") is None
     assert forwarded_client(None) is None
-    assert forwarded_client("1.1.1.1, " * 100 + "10.0.0.2") is None, "bounded length"
+    assert forwarded_client("1.1.1.1, " * 100 + "10.0.0.2") == "10.0.0.2", (
+        "the header length is irrelevant: only the last element is bounded and parsed"
+    )
+    assert forwarded_client("10.0.0.2, " + "1" * 46) is None, "an oversized last element"
+    assert forwarded_client("10.0.0.2, " + " " * 300 + "10.0.0.3") == "10.0.0.3", (
+        "padding around the last element is stripped before the bound"
+    )
+    assert (
+        forwarded_client("0000:0000:0000:0000:0000:ffff:255.255.255.255")
+        == "::ffff:255.255.255.255"
+    )
 
 
 def _settings_with_login_limit(per_minute: int) -> CoreSettings:
@@ -318,6 +328,21 @@ def _settings_with_login_limit(per_minute: int) -> CoreSettings:
         _env_file=None,
         api=ApiSettings(insecure_http=True, login_rate_per_minute_per_ip=per_minute),
     )
+
+
+def test_a_browser_padding_its_own_forwarded_header_keeps_its_own_bucket() -> None:
+    """A client that sends a long ``X-Forwarded-For`` of its own cannot make the api fall back
+    to the proxy address and so share one bucket with every other browser."""
+    app = create_app(_settings_with_login_limit(2), seeded_ports(), clock=lambda: NOW)
+    web = TestClient(ActAsRole(app, "web"), base_url="https://testserver")
+    login = f"{API_PREFIX}/auth/login"
+    padded = {"X-Forwarded-For": "203.0.113.5, " * 40 + "10.0.0.2"}
+    assert len(padded["X-Forwarded-For"]) > 500
+    assert [web.get(login, headers=padded).status_code for _ in range(3)] == [503, 503, 429]
+    assert web.get(login, headers={"X-Forwarded-For": "10.0.0.3"}).status_code == 503, (
+        "another browser behind the same proxy still has its own bucket"
+    )
+    assert web.get(login).status_code == 503, "the socket peer's bucket was not touched"
 
 
 def test_the_login_limiter_keys_on_the_forwarded_address_behind_the_web_role() -> None:

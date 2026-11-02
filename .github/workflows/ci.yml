@@ -495,6 +495,14 @@ jobs:
     name: gitleaks
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      # One scanner release for the gate and the annotation (threat-model row 9). The action
+      # downloads this version itself (its default at v2.3.9, made explicit here; it verifies
+      # no checksum). The annotate step fetches the same release asset and checks its sha256
+      # (from gitleaks_<version>_checksums.txt of the release) before running it, so a
+      # replaced asset fails the step instead of running on the runner.
+      GITLEAKS_VERSION: "8.24.3"
+      GITLEAKS_LINUX_X64_SHA256: 9991e0b2903da4c8f6122b5c3186448b927a5da4deef1fe45271c3793f4ee29c
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -506,7 +514,8 @@ jobs:
         if: failure()
         run: |
           curl -sSfL -o gitleaks.tgz \
-            https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_LINUX_X64_SHA256}  gitleaks.tgz" | sha256sum -c -
           tar -xzf gitleaks.tgz gitleaks
           ./gitleaks git . --redact --no-banner --config .gitleaks.toml \
             --report-format json --report-path gitleaks.json || true

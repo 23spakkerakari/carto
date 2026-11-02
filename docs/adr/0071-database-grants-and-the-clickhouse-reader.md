@@ -34,8 +34,10 @@ templates`.
 never reads them; only the console api does (`api/stores_postgres.py`). A compromised worker
 could have read every session id hash and rewritten role bindings.
 
-Decision: 0006 revokes the four identity tables from `carto_worker`. It keeps `settings`
-whole, not `SELECT` alone: it reads the engine thresholds there (ADR 0055) and the profiler
+Decision: 0006 revokes the four identity tables from `carto_worker`, and with them
+`role_bindings_id_seq`, the one sequence an identity table owns, which 0004's `APP_SEQUENCES`
+had granted `USAGE` on (`users`, `groups` and `sessions` carry text ids and own none; review
+2026-11-02, finding 12). It keeps `settings` whole, not `SELECT` alone: it reads the engine thresholds there (ADR 0055) and the profiler
 upserts its watermark there (`profiler/repository.py`). The plan also names `login_attempts`;
 no such table exists (the api keeps login attempts in its session store), so a migration that
 creates one grants it to `carto_app` alone.
@@ -109,8 +111,8 @@ away, and is left for M6 with the rest so the stack's user set changes once.
   deletes ledger rows past retention, as ADR 0034 item 4 intended. An existing installation
   gets the grant on its next `migrate`; the three roles must exist for the guarded blocks to
   apply, as for 0004.
-- The worker cannot read or write sessions, users, groups or role bindings. Nothing in the
-  worker changes.
+- The worker cannot read or write sessions, users, groups or role bindings, nor advance
+  `role_bindings_id_seq`. Nothing in the worker changes.
 - An `UPDATE` or `DELETE` on `llm_calls` fails for every role, the owner included. A retention
   policy for `llm_calls` (none exists) will need the same partition-drop approach as
   `audit_log`, not a `DELETE`.

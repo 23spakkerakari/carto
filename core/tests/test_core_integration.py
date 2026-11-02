@@ -741,8 +741,9 @@ def test_the_worker_role_has_no_identity_tables_and_llm_calls_is_append_only(
     migrated: tuple[Client, sqlalchemy.Engine], postgres: PostgresSettings
 ) -> None:
     """ADR 0071 (plan M11): ``carto_worker`` reads ``settings`` but none of the identity
-    tables; both console roles can only insert into and read ``llm_calls``, and the trigger
-    pair stops the owner too (spec 9.9, like audit_log under spec 14.9)."""
+    tables, nor the sequence behind ``role_bindings.id`` (0004 granted ``USAGE`` on it; review
+    2026-11-02, finding 12); both console roles can only insert into and read ``llm_calls``,
+    and the trigger pair stops the owner too (spec 9.9, like audit_log under spec 14.9)."""
     _client, owner = migrated
     worker = _as_role(postgres, "carto_worker")
     app = _as_role(postgres, "carto_app")
@@ -756,10 +757,16 @@ def test_the_worker_role_has_no_identity_tables_and_llm_calls_is_append_only(
             with pytest.raises(DBAPIError) as info, worker.begin() as connection:
                 connection.execute(sqlalchemy.text(f"SELECT count(*) FROM {table}"))  # noqa: S608 - fixed table names
             assert "permission denied" in str(info.value), table
+        next_id = sqlalchemy.text("SELECT nextval('role_bindings_id_seq')")
+        with pytest.raises(DBAPIError) as info, worker.begin() as connection:
+            connection.execute(next_id)
+        assert "permission denied" in str(info.value), "the identity table's sequence"
         with app.connect() as connection:
             assert (
                 connection.execute(sqlalchemy.text("SELECT count(*) FROM users")).scalar_one() >= 0
             )
+        with app.begin() as connection:
+            assert connection.execute(next_id).scalar_one() >= 1, "the api keeps the sequence"
         call_id = new_ulid()
         insert = sqlalchemy.text(
             "INSERT INTO llm_calls (id, tenant_id, at, task, payload_sha256, provider, model, "

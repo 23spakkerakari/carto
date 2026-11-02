@@ -55,8 +55,12 @@ __all__ = [
 ]
 
 MAX_USER_AGENT_LEN: Final = 512
-MAX_FORWARDED_FOR_LEN: Final = 256
-"""An ``X-Forwarded-For`` longer than this is ignored (a handful of hops at most)."""
+MAX_FORWARDED_FOR_LEN: Final = 45
+"""The longest IP literal (an IPv4-mapped IPv6 address spelled out); only the last element of
+``X-Forwarded-For`` is held to it. The header as a whole is not bounded here: a browser can
+pad its own hops to any length uvicorn accepts, and the trusted proxy's hop is still the last
+one, so bounding the whole header would let a client make every address fall back to the
+proxy's and share one login bucket."""
 PROXY_ROLE: Final = "web"
 """The certificate role whose ``X-Forwarded-For`` is trusted: the install's own nginx."""
 
@@ -127,13 +131,14 @@ def user_agent_of(request: Request) -> str | None:
 
 def forwarded_client(header: str | None) -> str | None:
     """The last hop of an ``X-Forwarded-For`` value as a normalised IP literal, or ``None``
-    when the header is missing, over :data:`MAX_FORWARDED_FOR_LEN` or its last element is not
-    an address. The last element is the one the trusted proxy appended (nginx's
-    ``$proxy_add_x_forwarded_for``); anything before it came from the client."""
-    if not header or len(header) > MAX_FORWARDED_FOR_LEN:
+    when the header is missing or its last element is empty, longer than
+    :data:`MAX_FORWARDED_FOR_LEN` or not an address. The last element is the one the trusted
+    proxy appended (nginx's ``$proxy_add_x_forwarded_for``); anything before it came from the
+    client and is never looked at, whatever its length."""
+    if not header:
         return None
     last = header.rsplit(",", 1)[-1].strip()
-    if not last:
+    if not last or len(last) > MAX_FORWARDED_FOR_LEN:
         return None
     try:
         return str(ipaddress.ip_address(last))

@@ -601,8 +601,9 @@ Copy the template [`otel/collector.yaml`](../../otel/collector.yaml) to
 `deploy/compose/collector.yaml` and edit it:
 
 - One receiver per source, each setting the `carto.source_id` resource attribute to the source
-  id above: the log receivers through their `resource` operator, the OTLP receiver through the
-  `resource/otlp` processor of its own `logs/otlp` pipeline, which overwrites whatever the
+  id above: the filelog and syslog receivers through their `resource` key, the Splunk HEC and
+  OTLP receivers (which have no such key) through the `resource/hec` and `resource/otlp`
+  processors of their own `logs/hec` and `logs/otlp` pipelines, which overwrite whatever the
   sender put there. The collector names the source, never the sender, so an application that
   can reach a receiver cannot write into another source (ADR 0072). Records that still lack the
   attribute are dropped by the `filter/require_source` processor, and the gateway rejects
@@ -611,7 +612,10 @@ Copy the template [`otel/collector.yaml`](../../otel/collector.yaml) to
   carry REPLACE-marked TLS blocks with a `client_ca_file` (mutual TLS) and the OTLP receivers
   also require the bearer token of the `bearertokenauth` extension, so nothing reaches a
   receiver in clear or without a certificate from the CA you name there.
-- Keep the receivers you use in `service.pipelines.logs.receivers` and delete the others.
+- Keep the receivers you use and delete the others: the file and syslog receivers are listed
+  in `service.pipelines.logs.receivers`; a HEC or OTLP receiver comes with its
+  `resource/<name>` processor and `logs/<name>` pipeline, which go with it. A second HEC or
+  OTLP source is a copy of the three with another port and id.
 - The `otlphttp/edge` exporter uses `ca_file`, `cert_file` and `key_file` from the
   `pki-otel-collector` volume (`/etc/carto/pki/to-edge-gateway-ca.crt`, `to-edge-gateway.crt`,
   `to-edge-gateway.key`: a client certificate from the edge-gateway CA with the
@@ -810,7 +814,8 @@ NDJSON log records because the dev stack has no source database (the header of
 
 The stack now runs the console: `api` (spec 12), `worker` (the profiler and linker jobs) and
 `web` (nginx serving the console and proxying `/api/` to `api` over mutual TLS). Users open
-one origin, `https://<host>:${CARTO_WEB_PORT:-8080}`, served with the certificate in
+one origin, `CARTO_PUBLIC_URL` (default `https://localhost:${CARTO_WEB_PORT:-8080}`; see
+"Login"), served with the certificate in
 `deploy/compose/proxy-tls/` (`make dev` generates a self-signed pair; install your own there).
 
 ### Secrets and database roles
@@ -834,11 +839,15 @@ then run `migrate` again so the grants apply.
 ### Login
 
 Login is single sign-on through your identity provider (OIDC authorization code flow with PKCE,
-spec 14.1). Set in the pilot `.env`:
+spec 14.1). Set in the pilot `.env`, which is `deploy/compose/.env`: Compose reads the `.env`
+next to the first `-f` file, not the one in the directory you run from. To keep it elsewhere,
+add `--env-file <path>` to `$COMPOSE` (step 8); the variables below and `CARTO_BIND` are read
+from nowhere else.
 
 | Variable | Meaning |
 | --- | --- |
-| `CARTO_OIDC_ISSUER` | The provider's issuer URL (`https://login.example.com/realms/carto`). The redirect URI to register at the provider is `https://<host>:<port>/api/v1/auth/callback`. |
+| `CARTO_PUBLIC_URL` | The console origin as browsers reach it (`https://carto.example.internal:8080`), scheme, host and port, no path. Default `https://localhost:${CARTO_WEB_PORT:-8080}`, which is right only from the VM itself. The api builds its redirect URI from it. |
+| `CARTO_OIDC_ISSUER` | The provider's issuer URL (`https://login.example.com/realms/carto`). The redirect URI to register at the provider is `<CARTO_PUBLIC_URL>/api/v1/auth/callback`. |
 | `CARTO_OIDC_CLIENT_ID` | The client id registered at the provider (default `carto-console`). |
 | `deploy/compose/secrets/oidc_client_secret` | The client secret, as a file (never an environment value). |
 | `CARTO_OIDC_GROUPS_CLAIM` | The ID token claim that carries group names (default `groups`; ask the provider to include it). |
@@ -1050,7 +1059,8 @@ other mismatch still stops the gateway.
   on `CARTO_WEBHOOK_PORT` (8443). With the default binding the console is reachable from the
   VM itself (an SSH tunnel, `ssh -L 8080:127.0.0.1:8080 <vm>`, gives a workstation the same
   view) and no push route accepts traffic from the network. To open them, set `CARTO_BIND` in
-  `.env` to the address of the interface you mean (`CARTO_BIND=10.0.5.20`; `0.0.0.0` is every
+  `deploy/compose/.env` (or the file you pass with `--env-file`, see "Login") to the address of
+  the interface you mean (`CARTO_BIND=10.0.5.20`; `0.0.0.0` is every
   interface) and filter it there: Docker programs its published ports into the `nat` and
   `FORWARD` chains, so rules in the host's `INPUT` chain (plain ufw or firewalld rules) do not
   apply to them; put the rules in the `DOCKER-USER` chain, in firewalld's `docker` zone, or in

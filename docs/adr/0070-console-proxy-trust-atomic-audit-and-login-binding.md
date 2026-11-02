@@ -21,9 +21,11 @@ user out, and the audit `ip` column recorded nginx.
 when the connection presented the `web` role certificate (`PeerRoleMiddleware`,
 `carto_common.mtls.peer_role`), else the socket peer. The last element is the one nginx itself
 appended with `$proxy_add_x_forwarded_for`; anything before it is client-supplied and ignored.
-The value must parse with `ipaddress` and the header is bounded at 256 bytes; a malformed
-header falls back to the peer. Nothing else trusts the header: uvicorn keeps
-`proxy_headers=False`.
+The header is split on commas first and only the last element is bounded (45 characters, the
+longest IP literal) and parsed with `ipaddress`; a malformed last element falls back to the
+peer. The header as a whole is not bounded: uvicorn bounds header size, and a bound on the
+whole value would be a lever for the client (Consequences). Nothing else trusts the header:
+uvicorn keeps `proxy_headers=False`.
 
 **Why the certificate role is the right signal.** Under `api.require_client_cert` the only
 caller that reaches the listener with the `web` role is the nginx the install's own PKI issued
@@ -117,6 +119,11 @@ navigation, which Lax sends; a cross-site fetch or an iframe does not get the co
   reason, never a value.
 - The audit `ip` column holds the browser address behind the web proxy; in `insecure_http`
   deployments it still holds the peer.
+- The first cut bounded the whole `X-Forwarded-For` at 256 bytes before parsing, so a browser
+  that padded its own header past that made `client_ip` fall back to the nginx address: every
+  such browser shared the proxy's login bucket and `audit.ip` recorded the proxy (review
+  2026-11-02, finding 6). The bound now applies to the last element alone, after the split, and
+  `test_core_api_app.py` pins that a padded header keeps the browser's own bucket.
 - `assemble_data_ports` and the in-memory port constructors take the audit log; the committed
   OpenAPI document changed only in the two auth operation descriptions.
 - The integration tests of the Postgres path (`test_core_api_postgres.py::

@@ -408,16 +408,23 @@ def test_migration_0006_grants_the_ledger_role_delete_on_the_ledger_only() -> No
 
 def test_migration_0006_takes_the_identity_tables_from_the_worker() -> None:
     """ADR 0071 (plan M11): the worker has no business with users, groups, role bindings or
-    sessions; it keeps ``settings`` (thresholds, ADR 0055; the profiler watermark)."""
+    sessions, nor with the sequence 0004 gave it for ``role_bindings.id`` (review 2026-11-02,
+    finding 12); it keeps ``settings`` (thresholds, ADR 0055; the profiler watermark)."""
     module = _load_migration(MIGRATION_0006)
     base = _load_migration("0004_map_discovery.py")
     assert set(module.IDENTITY_TABLES) == {"users", "groups", "role_bindings", "sessions"}
     assert set(module.IDENTITY_TABLES) <= set(base.APP_TABLES)
+    # Every sequence 0004 granted that belongs to an identity table is revoked, and no other.
+    owned = {s for s in base.APP_SEQUENCES if s.removesuffix("_id_seq") in module.IDENTITY_TABLES}
+    assert owned == set(module.IDENTITY_SEQUENCES) == {"role_bindings_id_seq"}
     grants = module._grant_statements()
     worker = [s for s in grants if "rolname = 'carto_worker'" in s]
     assert len(worker) == 1
     (statement,) = worker
     assert "REVOKE ALL ON users, groups, role_bindings, sessions FROM carto_worker;" in statement
+    assert "REVOKE ALL ON SEQUENCE role_bindings_id_seq FROM carto_worker;" in statement
+    for sequence in set(base.APP_SEQUENCES) - owned:
+        assert sequence not in statement, sequence
     assert "settings" not in statement and "jobs" not in statement
     app = [s for s in grants if "rolname = 'carto_app'" in s]
     assert len(app) == 1
@@ -428,6 +435,8 @@ def test_migration_0006_takes_the_identity_tables_from_the_worker() -> None:
         "GRANT SELECT, INSERT, UPDATE, DELETE ON users, groups, role_bindings, sessions "
         "TO carto_worker;"
     ) in down[0]
+    assert "GRANT USAGE ON SEQUENCE role_bindings_id_seq TO carto_worker;" in down[0]
+    assert "SEQUENCE" not in app[0], "the api keeps its sequence"
 
 
 def test_migration_0006_makes_llm_calls_append_only() -> None:
@@ -472,6 +481,7 @@ def test_migration_0006_statement_lists_are_symmetric() -> None:
         words = set(re.findall(r"[a-z_]+", statement))
         assert words & tables, statement
         assert not words & {"templates", "fields", "systems", "sources", "audit_log", "settings"}
+        assert {w for w in words if w.endswith("_seq")} <= {"role_bindings_id_seq"}, statement
 
 
 def test_clickhouse_migrations_dir_is_the_repository_layout_of_section_20() -> None:
