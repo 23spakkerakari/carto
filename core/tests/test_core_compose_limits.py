@@ -102,6 +102,14 @@ def test_every_service_runs_as_a_non_root_user(name: str) -> None:
     assert uid.isdigit() and int(uid) >= 10000, f"{name}: user {user!r} is not a dedicated uid"
 
 
+def test_ingest_api_is_probed_for_readiness_over_mutual_tls() -> None:
+    """ADR 0073: the readiness 503 (every in-flight slot held past the body deadline, or a
+    store down) is only ever seen if the healthcheck asks /readyz, not /healthz."""
+    probe = _services()["ingest-api"]["healthcheck"]["test"]
+    assert probe[:3] == ["CMD", "carto-core", "healthcheck"]
+    assert probe[probe.index("--url") + 1] == "https://localhost:8443/readyz"
+
+
 def test_the_carto_images_switch_to_uid_10001() -> None:
     for dockerfile in (BASE_DOCKERFILE, WEB_DOCKERFILE):
         lines = [line.strip() for line in dockerfile.read_text(encoding="utf-8").splitlines()]

@@ -89,10 +89,14 @@ port binds `127.0.0.1` (`CARTO_BIND`). The dev profile's values live in `dev.env
 `make dev`, `make dev-down` and CI's compose job pass with `--env-file`; a pilot sets its own
 variables in `.env` and never uses `dev.env`.
 
-`ingest-api`'s healthcheck is `carto-core healthcheck`, which presents the service's own
-certificate because the listener requires mutual TLS. Its `/readyz` also reports 503 once every
-in-flight slot has been held longer than `CARTO_INGEST__BODY_TIMEOUT_SECONDS` (default 30; ADR
-0073), so a wedged listener is restarted rather than left green.
+`ingest-api`'s healthcheck is `carto-core healthcheck --url https://localhost:8443/readyz`,
+which presents the service's own certificate because the listener requires mutual TLS. It
+probes readiness, not liveness: `/readyz` is 503 when PostgreSQL or ClickHouse is unreachable
+and once every in-flight slot has been held longer than `CARTO_INGEST__BODY_TIMEOUT_SECONDS`
+(default 30; ADR 0073), so a wedged listener shows as `unhealthy` in `docker compose ps` and
+`edge-gateway`, which waits on `service_healthy`, is not started against it. Compose does not
+restart a container for failing its healthcheck; `/healthz` stays 200 as long as the process
+serves and is not probed by the stack.
 
 `sources.dev.yaml` points the edge at the simulator's output volume; copy it to `sources.yaml`
 and edit for a real pilot (see `docs/install/compose-pilot.md`).

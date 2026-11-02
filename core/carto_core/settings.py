@@ -257,7 +257,10 @@ class IngestListenerSettings(_Frozen):
         le=1_000_000,
         description=(
             "Ceiling on templates rows per (tenant, system) (ADR 0073). A batch that would push "
-            "a system past it is refused with 422 before anything is written; the edge parks it."
+            "a system past it is refused with 422 before anything is written; the edge parks it. "
+            "The check runs before the ledger claim without a lock, so batches of one system in "
+            "flight at once can each pass it: a system can exceed the ceiling by at most "
+            "max_inflight_batches times the distinct templates of one batch."
         ),
     )
     max_edges_per_tenant: int = Field(

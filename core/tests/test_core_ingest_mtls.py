@@ -1,10 +1,13 @@
 """ingest-api over mutual TLS (spec 12 "Internal", 14.4): a throwaway CA from carto_common.pki,
 uvicorn in a thread on a free port; a valid client certificate succeeds, no certificate or a
 certificate from another CA is refused at the handshake, plain HTTP and TLS below 1.2 never
-connect."""
+connect; a body that trickles past the deadline is answered 408 and the connection is closed
+by the server (ADR 0073), which only a real uvicorn and a raw socket can show."""
 
 from __future__ import annotations
 
+import contextlib
+import json
 import socket
 import ssl
 import threading
@@ -120,10 +123,11 @@ def _listener(pki: Pki, port: int, **overrides: object) -> IngestListenerSetting
     return IngestListenerSettings.model_validate(values | overrides)
 
 
-@pytest.fixture(scope="module")
-def served(pki: Pki) -> Iterator[Served]:
+@contextlib.contextmanager
+def _serve(pki: Pki, **overrides: object) -> Iterator[Served]:
+    """The app under a real uvicorn on a free port, with the listener settings overridden."""
     port = _free_port()
-    settings = CoreSettings(ingest=_listener(pki, port))
+    settings = CoreSettings(ingest=_listener(pki, port, **overrides))
     writer = FakeWriter()
     app = create_app(settings, writer, InMemoryBatchLedger(), InMemorySourceHealthStore())
     server = uvicorn.Server(build_uvicorn_config(app, settings.ingest))
@@ -134,9 +138,24 @@ def served(pki: Pki) -> Iterator[Served]:
         if time.monotonic() > deadline or not thread.is_alive():
             pytest.fail("uvicorn did not start")
         time.sleep(0.05)
-    yield Served(f"https://127.0.0.1:{port}", "127.0.0.1", port, writer)
-    server.should_exit = True
-    thread.join(timeout=10)
+    try:
+        yield Served(f"https://127.0.0.1:{port}", "127.0.0.1", port, writer)
+    finally:
+        server.should_exit = True
+        thread.join(timeout=10)
+
+
+@pytest.fixture(scope="module")
+def served(pki: Pki) -> Iterator[Served]:
+    with _serve(pki) as running:
+        yield running
+
+
+@pytest.fixture(scope="module")
+def served_short_deadline(pki: Pki) -> Iterator[Served]:
+    """A listener whose body deadline is one second (ADR 0073), for the trickling client."""
+    with _serve(pki, body_timeout_seconds=1) as running:
+        yield running
 
 
 def _context(pki: Pki, certificate: tuple[Path, Path] | None) -> ssl.SSLContext:
@@ -230,6 +249,76 @@ def test_tls_below_1_2_is_never_negotiated(served: Served, pki: Pki) -> None:
         context.wrap_socket(sock, server_hostname="127.0.0.1") as tls,
     ):
         tls.do_handshake()
+
+
+def _read_response(tls: ssl.SSLSocket) -> tuple[str, dict[str, str], bytes]:
+    """One HTTP/1.1 response off the socket: the status line, the headers (lower-cased names)
+    and the body, read to its Content-Length."""
+    raw = b""
+    while b"\r\n\r\n" not in raw:
+        chunk = tls.recv(4096)
+        assert chunk, "the server closed the connection before answering"
+        raw += chunk
+    head, _, body = raw.partition(b"\r\n\r\n")
+    status_line, *header_lines = head.decode("latin-1").split("\r\n")
+    headers = {
+        name.strip().lower(): value.strip()
+        for name, value in (line.split(":", 1) for line in header_lines)
+    }
+    length = int(headers["content-length"])
+    while len(body) < length:
+        chunk = tls.recv(4096)
+        assert chunk, "the server closed the connection mid-body"
+        body += chunk
+    return status_line, headers, body[:length]
+
+
+def test_a_trickling_body_is_408_with_connection_close_and_the_server_closes_the_socket(
+    served_short_deadline: Served, pki: Pki
+) -> None:
+    """The 408 of ADR 0073 frees the in-flight slot, but on its own it left the HTTP/1.1
+    connection open: h11 keeps keep-alive and uvicorn restarts its idle timer on every byte,
+    so a client trickling one byte at a time held one of the 256 connections for ever. The 408
+    carries ``Connection: close`` and uvicorn ends the connection after it."""
+    context = _context(pki, (pki.client_cert, pki.client_key))
+    with (
+        socket.create_connection(
+            (served_short_deadline.host, served_short_deadline.port), 15
+        ) as sock,
+        context.wrap_socket(sock, server_hostname="127.0.0.1") as tls,
+    ):
+        tls.sendall(
+            b"POST /internal/ingest HTTP/1.1\r\n"
+            b"Host: ingest-api\r\n"
+            b"Content-Type: application/json\r\n"
+            b"Content-Length: 100000\r\n"
+            b"\r\n"
+            b"{"
+        )
+        started = time.monotonic()
+        status_line, headers, body = _read_response(tls)
+        assert status_line.startswith("HTTP/1.1 408")
+        assert time.monotonic() - started < 10, "answered at the deadline, not at the cap"
+        assert headers["connection"] == "close"
+        assert headers["content-type"].startswith("application/problem+json")
+        problem = json.loads(body)
+        assert problem["status"] == 408
+        assert problem["request_id"] == headers["x-request-id"]
+        # The server closed the connection: the next read is end of stream, not a wait.
+        try:
+            trailing = tls.recv(1)
+        except TimeoutError:
+            pytest.fail("the connection stayed open after the 408")
+        except (ssl.SSLError, ConnectionError):
+            trailing = b""
+        assert trailing == b""
+    # The slot and the connection are both back: an honest batch is served at once.
+    with httpx.Client(verify=context) as client:
+        accepted = client.post(
+            f"{served_short_deadline.url}/internal/ingest", content=_batch_body(), headers=JSON
+        )
+        assert accepted.status_code == 200, accepted.text
+    assert len(served_short_deadline.writer.batches) == 1
 
 
 def test_server_context_has_tls_1_2_as_the_floor_and_requires_client_certs(pki: Pki) -> None:

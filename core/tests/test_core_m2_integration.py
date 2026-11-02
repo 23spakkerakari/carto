@@ -31,6 +31,7 @@ from carto_core.metadata import (
     FieldRecord,
     InventoryResult,
     MetadataError,
+    MetadataLimitError,
     PostgresMetadataStore,
     TemplateRecord,
 )
@@ -516,6 +517,119 @@ def test_postgres_metadata_inventory_sources_and_pins(engine: sqlalchemy.Engine)
         ).scalar_one()
     assert payload == "a" * 64
     assert store.list_sources("nobody") == []
+
+
+# --- the row ceilings (ADR 0073) ------------------------------------------------------------------
+
+
+def _template(system_id: str, template_id: str) -> TemplateRecord:
+    return TemplateRecord(system_id, template_id, "INSERT rows", "row_change", NOW, NOW, 1)
+
+
+def test_postgres_template_ceiling_refuses_a_new_id_at_the_ceiling_and_writes_nothing(
+    engine: sqlalchemy.Engine,
+) -> None:
+    """The in-memory case of ``test_core_metadata.py`` on PostgreSQL: the ceiling is on the
+    rows a system would hold after the batch, known ids add nothing, ids are known per system
+    (the batch's pairs are joined on both columns), and the check never writes."""
+    store = PostgresMetadataStore(engine)
+    tenant = "meta_ceiling"
+    seeded = [_template("sys_orders", f"tpl_{index}") for index in range(3)]
+    assert store.upsert_templates(tenant, seeded) == 3
+    known = _template("sys_orders", "tpl_1")
+    new = _template("sys_orders", "tpl_new")
+    other = _template("sys_pay", "tpl_x")
+    assert store.templates_over_ceiling(tenant, [known, new], ceiling=4) is None
+    assert store.templates_over_ceiling(tenant, [known, new], ceiling=3) == "sys_orders"
+    assert store.templates_over_ceiling(tenant, [known, known], ceiling=3) is None
+    assert store.templates_over_ceiling(tenant, [other, other], ceiling=1) is None
+    assert store.templates_over_ceiling(tenant, [other, new], ceiling=3) == "sys_orders"
+    assert store.templates_over_ceiling("meta_ceiling_other", [new, other], ceiling=1) is None
+    assert store.templates_over_ceiling(tenant, [], ceiling=1) is None
+    # tpl_1 is known to sys_orders and new to sys_pay; sys_pay's rows never count for sys_orders.
+    same_id_elsewhere = _template("sys_pay", "tpl_1")
+    assert store.templates_over_ceiling(tenant, [same_id_elsewhere], ceiling=1) is None
+    assert store.upsert_templates(tenant, [same_id_elsewhere]) == 1
+    assert store.templates_over_ceiling(tenant, [same_id_elsewhere], ceiling=1) is None
+    assert store.templates_over_ceiling(tenant, [known], ceiling=3) is None
+    assert store.templates_over_ceiling(tenant, [new], ceiling=3) == "sys_orders"
+    assert store.templates_over_ceiling(tenant, [_template("sys_pay", "tpl_9")], ceiling=1) == (
+        "sys_pay"
+    )
+    # Nothing was written by any check: the counts are what the upserts made them.
+    orders = store.list_templates(tenant, "sys_orders")
+    assert [(t.template_id, t.count) for t in orders] == [
+        ("tpl_0", 1),
+        ("tpl_1", 1),
+        ("tpl_2", 1),
+    ]
+    assert [(t.template_id, t.count) for t in store.list_templates(tenant, "sys_pay")] == [
+        ("tpl_1", 1)
+    ]
+
+
+def test_postgres_edge_ceiling_refuses_a_new_edge_and_rolls_the_inventory_back(
+    engine: sqlalchemy.Engine,
+) -> None:
+    """The in-memory case on PostgreSQL: at the ceiling a new edge_id raises
+    ``MetadataLimitError`` and the transaction rolls back, so none of that inventory's systems
+    or sources is persisted, while the known edge still replaces its copy. The count runs under
+    the tenant's transaction-level advisory lock (ADR 0073). System and source ids are unique
+    to this test: both tables key on the bare id."""
+    store = PostgresMetadataStore(engine)
+    tenant = "meta_edges"
+    first = _inventory(
+        tenant,
+        systems=[InventorySystem(id="sys_edge_one", name="One")],
+        sources=[InventorySource(id="src_edge_one", system_id="sys_edge_one", type="otlp")],
+        field_policies=[],
+    )
+    assert store.replace_inventory(first, NOW, max_edges=1).systems == 1
+    second = _inventory(
+        tenant,
+        edge_id="edge-two",
+        systems=[InventorySystem(id="sys_edge_two", name="Two")],
+        sources=[InventorySource(id="src_edge_two", system_id="sys_edge_two", type="otlp")],
+        field_policies=[],
+    )
+    with pytest.raises(MetadataLimitError, match="edge"):
+        store.replace_inventory(second, NOW, max_edges=1)
+    assert [system.id for system in store.list_systems(tenant)] == ["sys_edge_one"]
+    assert store.get_source(tenant, "src_edge_two") is None
+    with engine.connect() as connection:
+        edges = (
+            connection.execute(
+                sqlalchemy.text(
+                    "SELECT edge_id FROM edge_inventories WHERE tenant_id = :tenant_id "
+                    "ORDER BY edge_id"
+                ),
+                {"tenant_id": tenant},
+            )
+            .scalars()
+            .all()
+        )
+        locks = connection.execute(
+            sqlalchemy.text("SELECT COUNT(*) FROM pg_locks WHERE locktype = 'advisory'")
+        ).scalar_one()
+    assert edges == ["edge-gateway"]
+    assert locks == 0, "the advisory lock is transaction-scoped: released with the rollback"
+    # The known edge still replaces its copy at the ceiling.
+    later = first.model_copy(update={"sources_file_sha256": "b" * 64})
+    assert store.replace_inventory(later, NOW + timedelta(hours=1), max_edges=1).systems == 1
+    with engine.connect() as connection:
+        sha = connection.execute(
+            sqlalchemy.text(
+                "SELECT sources_file_sha256 FROM edge_inventories WHERE tenant_id = :tenant_id "
+                "AND edge_id = 'edge-gateway'"
+            ),
+            {"tenant_id": tenant},
+        ).scalar_one()
+    assert sha == "b" * 64
+    # One more edge fits under a higher ceiling, and the refused inventory then lands whole.
+    assert store.replace_inventory(second, NOW, max_edges=2).systems == 1
+    assert [system.id for system in store.list_systems(tenant)] == ["sys_edge_one", "sys_edge_two"]
+    source = store.get_source(tenant, "src_edge_two")
+    assert source is not None and source.edge_id == "edge-two"
 
 
 def test_postgres_metadata_errors_name_the_driver_class_only(postgres: PostgresSettings) -> None:

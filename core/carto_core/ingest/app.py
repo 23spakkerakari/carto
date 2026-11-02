@@ -10,7 +10,9 @@ Endpoints, all internal (mutual TLS, never behind the ingress; see :mod:`.server
   never on the event loop. At most ``ingest.max_inflight_batches`` requests are decoded or
   written at once; the next is answered 429 with ``Retry-After``. A body that has not fully
   arrived within ``ingest.body_timeout_seconds`` is answered 408 and its slot released (ADR
-  0073). Only the contract models are accepted, so a raw value cannot arrive in a slot the
+  0073); the 408 carries ``Connection: close``, so uvicorn ends the connection with the
+  response and a client trickling bytes cannot keep one of the listener's connections open for
+  ever either. Only the contract models are accepted, so a raw value cannot arrive in a slot the
   schema does not have (spec 2.3 invariant 2). An event whose ``observed_at`` or ``ingested_at``
   lies outside the plausible range (ADR 0036, 0073) refuses the batch with 422, so the edge
   parks it; so does a batch that would push a system past ``ingest.max_templates_per_system``
@@ -554,10 +556,16 @@ def create_app(
                 path=request.url.path,
                 timeout_seconds=listener.body_timeout_seconds,
             )
+            # The slot is released by admitted(); the connection must go too. Without this
+            # header h11 keeps the connection alive after the response and uvicorn resets its
+            # idle timer on every byte the client still trickles, so one slow client holds one
+            # of limit_concurrency's connections for ever. With it, h11 moves to MUST_CLOSE
+            # after the response and uvicorn closes the transport.
             raise Problem(
                 408,
                 "request timeout",
                 "the body did not arrive within the body timeout; send the request again",
+                headers={"Connection": "close"},
             ) from None
         return await run_in_threadpool(
             _decode,
@@ -603,7 +611,11 @@ def create_app(
 
     def check_template_ceiling(records: list[TemplateRecord], context: dict[str, Any]) -> None:
         """ADR 0073: refuse the batch before the claim when a system would hold more than
-        ``max_templates_per_system`` templates. A failed count is a 503, never an open door."""
+        ``max_templates_per_system`` templates. A failed count is a 503, never an open door.
+        The check is not serialised against other batches (no lock; the claim comes after
+        it), so batches of one system in flight at once can each pass it: the overshoot is at
+        most ``max_inflight_batches`` times the distinct templates of a batch, which the
+        ceiling's size makes immaterial."""
         ceiling = listener.max_templates_per_system
         try:
             over = templates.templates_over_ceiling(context["tenant_id"], records, ceiling=ceiling)

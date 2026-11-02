@@ -37,14 +37,27 @@ problem that never echoes the partial body), the slot is released by the same co
 that took it, and `carto_ingest_body_timeout_total` counts it. The edge treats 408 like any
 other non-parking status: it backs off and sends the batch again.
 
+The 408 carries `Connection: close`. Without it the slot was free but the connection was not:
+h11 keeps an HTTP/1.1 connection alive after an early response, and uvicorn cancels its
+keep-alive timer on every byte received, so a client trickling one byte at a time held one of
+the listener's `limit_concurrency=256` connections for ever while the slot went back into
+circulation. With the header h11 moves to `MUST_CLOSE` once the response is sent and uvicorn
+closes the transport (verified against a real uvicorn and a raw TLS socket in
+`test_core_ingest_mtls.py`: the 408 arrives at the deadline with the header, and the next read
+on the socket is end of stream).
+
 The in-flight bound of ADR 0043 section 2 is now an `InflightSlots` object instead of a bare
 `BoundedSemaphore`: it is still only ever tried, never waited on, but it remembers when each
 slot was taken. `/readyz` answers 503 (`{"status": "unavailable"}`, no detail, spec 12) when
 every slot is held and none has been held for less than the body timeout. The bound is
 exclusive: a slot held exactly the timeout is not yet stalled. A slot legitimately held that
 long by every request at once means the listener cannot admit anything honest, which is what
-the orchestrator's probe should see. uvicorn's configuration is unchanged; a comment in
-`server.py` says the app owns the deadline.
+the orchestrator's probe should see. The Compose healthcheck of `ingest-api` therefore probes
+`/readyz` (it probed `/healthz`, which never reports this), with `carto-core healthcheck`
+presenting the service certificate; a wedged or store-less listener shows as unhealthy and
+`edge-gateway`'s `service_healthy` dependency waits on it. Compose does not restart on an
+unhealthy probe by itself; `deploy/compose/README.md` says so. uvicorn's configuration is
+unchanged; a comment in `server.py` says the app owns the deadline.
 
 ## 2. A ratio cap on decompression, and one buffer per body
 
@@ -76,22 +89,34 @@ spec 8.5, not by this ADR.
 
 - `ingest.max_templates_per_system` (default 50,000, 1,000 to 1,000,000). Before the ledger
   claim, `MetadataStore.templates_over_ceiling` tells `ingest-api` in one grouped query (per
-  system of the batch: rows held, and how many of the batch's `system/template` pairs are
+  system of the batch: rows held, and how many of the batch's `(system, template)` pairs are
   among them) whether any system would hold more than the ceiling once the batch's templates
-  were upserted. A batch over it is a 422 `too_many_templates` whose detail names the system id
-  only; the edge parks it, which is the fail-closed outcome; nothing is claimed or written;
-  `carto_ingest_templates_refused_total` counts it. Ids a system already holds add nothing,
-  so a full system keeps accepting its known templates. A failed count is a 503, never an open
-  door. The check runs before the claim rather than inside the ledger's `done` transaction so
-  that a refused batch leaves no events in ClickHouse; the price is a race between concurrent
-  batches of one system, bounded by `max_inflight_batches` times the distinct templates of a
-  batch, which the ceiling's size makes immaterial.
-- `ingest.max_edges_per_tenant` (default 64, 1 to 10,000). `replace_inventory` counts the
-  tenant's `edge_inventories` rows first in its transaction and refuses an `edge_id` the tenant
-  has not recorded yet once it holds that many, with `MetadataLimitError`, which `ingest-api`
-  answers as 422 `too_many_edges` and counts in `carto_ingest_edges_refused_total`. The raise
-  rolls the transaction back, so none of that inventory's systems or sources is written. A
-  known edge always replaces its copy.
+  were upserted. The batch's pairs are bound as two parallel `text[]` arrays and joined to the
+  system's rows through `unnest`, on both columns, so the planner hashes the batch side once;
+  the first cut concatenated `system_id || '/' || id` on every row of the system and tested it
+  against a list, which scanned the whole system per batch. A batch over the ceiling is a 422
+  `too_many_templates` whose detail names the system id only; the edge parks it, which is the
+  fail-closed outcome; nothing is claimed or written; `carto_ingest_templates_refused_total`
+  counts it. Ids a system already holds add nothing, so a full system keeps accepting its known
+  templates. A failed count is a 503, never an open door. The check runs before the claim rather
+  than inside the ledger's `done` transaction so that a refused batch leaves no events in
+  ClickHouse, and it takes no lock: batches of one system in flight at once can each pass it,
+  so the system can exceed the ceiling by at most `max_inflight_batches` times the distinct
+  templates of one batch (8 x 5,000 at the defaults, against a ceiling of 50,000), a bound the
+  setting's description and the handler's docstring state. Serialising the check is not worth a
+  lock on the hot path for an overshoot of that size.
+- `ingest.max_edges_per_tenant` (default 64, 1 to 10,000). `replace_inventory` takes the
+  transaction-level advisory lock `pg_advisory_xact_lock(EDGE_CEILING_LOCK_KEY,
+  hashtext(tenant_id))` first in its transaction (`EDGE_CEILING_LOCK_KEY` is the ASCII bytes of
+  `edge` as an `int4`, distinct from the migration lock's `bigint` key), then counts the tenant's
+  `edge_inventories` rows and refuses an `edge_id` the tenant has not recorded yet once it holds
+  that many, with `MetadataLimitError`, which `ingest-api` answers as 422 `too_many_edges` and
+  counts in `carto_ingest_edges_refused_total`. The raise rolls the transaction back, so none of
+  that inventory's systems or sources is written, and the lock goes with it. The advisory lock
+  was chosen over `SELECT ... FOR UPDATE` on the tenant's rows: a row lock does not serialise two
+  inserts of distinct new edge ids, and a tenant with no rows yet has nothing to lock, so two
+  first edges under a ceiling of one would both get in. A known edge always replaces its copy;
+  it takes the lock too, briefly, so the count a new edge sees is never mid-write.
 - `carto_schema.inventory.MAX_CONFIG_LIST_ITEMS` (64): a config list value is at most 64
   strings (`ConfigList`), and the committed JSON Schema gains the `maxItems`. The edge's
   `strip_config` does not cut lists to that length; a longer list is refused by core with 422,
@@ -120,12 +145,33 @@ it so the bound above is understood as the backstop it is.
 already runs periodic work (`refresh_gauges` every pass); it now also runs
 `Forwarder.purge_parked`, which throttles itself to once per `PARKED_PURGE_SECONDS` (hourly,
 like the runtime's housekeeping of ADR 0033) and runs at once on the first pass.
-`DiskBuffer.purge_parked(older_than)` deletes the parked rows created before the cutoff in one
-committed transaction, returns the count and the batch id of the oldest one, and releases
-their bytes only once the delete is committed, as `ack` does; pending rows are never touched.
-The pass counts `carto_edge_parked_purged_total` and logs one warning with the count, the
-oldest batch id (a ULID) and the age, never a payload (spec 2.3 invariant 7). `runtime.py` is
-not edited: the forwarder owns the buffer and already has a loop, so the hook lives there.
+`DiskBuffer.purge_parked(older_than, now=...)` deletes the rows parked before the cutoff in one
+committed transaction, returns the count and the batch id of the one parked longest ago, and
+releases their bytes only once the delete is committed, as `ack` does; pending rows are never
+touched. The pass counts `carto_edge_parked_purged_total` and logs one warning with the count,
+the oldest batch id (a ULID) and the age, never a payload (spec 2.3 invariant 7). `runtime.py`
+is not edited: the forwarder owns the buffer and already has a loop, so the hook lives there.
+
+Parked rows are aged from when they were parked, not from when they were appended: a batch
+that waited in the queue through a long core outage and was then refused gets its full
+`parked_max_age_days` from the refusal, where aging it from its append time could purge it in
+the same pass that parked it. `DiskBuffer.park(row_id, at=, reason=)` stamps `parked_at_ms`
+with the forwarder's clock and `parked_reason` with the status (`http_422`; a label of at most
+`MAX_PARKED_REASON_LEN` characters, never content). The buffer's schema is now versioned
+(`PRAGMA user_version`, `SCHEMA_VERSION` 2; it was `CREATE TABLE IF NOT EXISTS` alone): a file
+at version 0 that already holds `batches` is a version-1 file and gains the two columns and the
+ledger table on open, in one transaction per version; its rows parked before the migration have
+no `parked_at_ms` and are aged from `created_at_ms`, which is all that is known about them; a
+file a newer edge wrote is refused with `BufferSchemaError` rather than read with the wrong
+columns.
+
+A purge is a data-loss event, and a log line and a counter are not a record of one. Each
+purged batch leaves a row in the buffer's `purged` table, written in the purge's transaction:
+`batch_id`, `events`, `parked_reason` and `purged_at_ms`, no payload. The table is cut to the
+last `PURGED_LEDGER_ROWS` (10,000) rows by the same transaction, so it cannot grow with the
+refusals it records; `DiskBuffer.purged_ledger(limit)` reads it newest first for an operator or
+a later console view. At the defaults that is 10,000 batches of up to 5,000 events, the loss of
+weeks of persistent refusal, on file across restarts.
 
 ## Alternatives
 
@@ -136,14 +182,24 @@ not edited: the forwarder owns the buffer and already has a loop, so the hook li
   against a number known before the first byte comes out.
 - Checking the template ceiling inside the ledger's `done` transaction: exact, but after the
   ClickHouse write, so a refused batch would leave orphaned events behind.
+- A lock around the template ceiling check: serialises every batch of a tenant on the hot
+  path to remove an overshoot of at most `max_inflight_batches` batches' templates.
+- `SELECT ... FOR UPDATE` on the tenant's `edge_inventories` rows for the edge ceiling: does
+  not serialise two inserts of distinct new edges, and locks nothing for a tenant without rows.
+- Keeping purged batch ids in the log only: the log rotates, the counter resets with the
+  process, and neither says which batches went.
 - Deleting old templates instead of refusing new ones: templates are referenced by fields,
   nodes and the console's names; a deletion policy is a product decision for M6.
 - Expiring parked rows from `EdgeRuntime.housekeeping`: the runtime does not hold the buffer.
 
 ## Consequences
 
-- A trickling client gets 408 after the deadline and the slot back in circulation; eight of
-  them no longer starve honest batches, and a wedged listener fails its readiness probe.
+- A trickling client gets 408 after the deadline, the slot goes back into circulation and its
+  connection is closed; eight of them no longer starve honest batches, 256 of them no longer
+  hold every connection, and a wedged listener fails the readiness probe the stack now runs.
+- An edge upgraded to this version migrates its buffer file on first open; an edge downgraded
+  past it refuses the file (`BufferSchemaError`) instead of ignoring the columns it does not
+  know. The operator restores the matching edge version or starts a new buffer.
 - An operator whose edge sends batches that compress past 200x sees a ratio 413 and raises
   `max_decompression_ratio`; the measurements above say no real source needs that.
 - A system at its template ceiling stops accepting new templates until an operator raises the
@@ -158,11 +214,19 @@ not edited: the forwarder owns the buffer and already has a loop, so the hook li
 
 ## Tests
 
-`core/tests/test_core_ingest_app.py` (a stalled ASGI receive on each internal route is 408 and
-frees the slot; `/readyz` 503 once every slot outlives the deadline; ratio cap against the
-whole wire length and the realistic batch; `ingested_at` bounds; the template and edge
-ceilings), `test_core_settings.py` (defaults and ranges), `test_core_metadata.py` (the
-in-memory ceilings, the statement shapes), `packages/carto-schema/tests/test_schema_inventory.py`
-(the list cap), `edge/tests/test_edge_buffer.py` (purge and byte accounting),
-`edge/tests/test_edge_forward.py` (the pass, its period, the loop, the log line),
-`edge/tests/test_edge_leak.py` (end to end through the real app).
+`core/tests/test_core_ingest_app.py` (a stalled ASGI receive on each internal route is 408
+with `Connection: close` and frees the slot; a chunked body inside the deadline is accepted;
+`/readyz` 503 once every slot outlives the deadline; ratio cap against the whole wire length
+and the realistic batch; `ingested_at` bounds; the template and edge ceilings),
+`test_core_ingest_mtls.py` (a raw TLS socket trickling a body to a real uvicorn gets the 408
+and then end of stream), `test_core_settings.py` (defaults and ranges), `test_core_metadata.py`
+(the in-memory ceilings, ids known per system, the statement shapes: `unnest` join, no
+concatenation, the advisory lock), `test_core_m2_integration.py` (Docker: both ceilings on
+PostgreSQL, the rollback of a refused inventory, the lock released with it),
+`test_core_compose_limits.py` (the healthcheck probes `/readyz`),
+`packages/carto-schema/tests/test_schema_inventory.py` (the list cap),
+`edge/tests/test_edge_buffer.py` (purge and byte accounting, aging from the park time, the
+version-1 file migrated on open, a newer file refused, the purged ledger and its bound),
+`edge/tests/test_edge_forward.py` (the pass, its period, the loop, the log line, 408 retried
+not parked, the status as the parked reason and the ledger row), `edge/tests/test_edge_leak.py`
+(end to end through the real app).

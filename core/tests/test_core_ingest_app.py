@@ -908,6 +908,7 @@ def test_a_body_that_never_arrives_is_408_and_the_slot_is_freed(path: str) -> No
     assert status == 408
     assert time.monotonic() - started < 30
     assert headers["content-type"].startswith(PROBLEM_CONTENT_TYPE)
+    assert headers["connection"] == "close", "the trickling connection is ended with the slot"
     problem = json.loads(body)
     assert problem["status"] == 408
     assert problem["request_id"] == headers["x-request-id"]
@@ -922,6 +923,52 @@ def test_a_body_that_never_arrives_is_408_and_the_slot_is_freed(path: str) -> No
     )
     assert response.status_code == 200, response.text
     assert len(writer.batches) == 1
+
+
+async def _chunked_post(
+    app: Any, path: str, body: bytes, *, pieces: int, pause: float
+) -> tuple[int, bytes]:
+    """POST ``body`` in ``pieces`` chunks with ``pause`` seconds between them, as a client on a
+    slow link does; returns the status and the response body."""
+    sent: list[dict[str, Any]] = []
+    size = max(1, -(-len(body) // pieces))
+    chunks = [body[offset : offset + size] for offset in range(0, len(body), size)]
+
+    async def receive() -> dict[str, Any]:
+        if not chunks:
+            return {"type": "http.disconnect"}
+        await asyncio.sleep(pause)
+        chunk = chunks.pop(0)
+        return {"type": "http.request", "body": chunk, "more_body": bool(chunks)}
+
+    async def send(message: dict[str, Any]) -> None:
+        sent.append(message)
+
+    await app(_asgi_scope(path), receive, send)
+    start = next(message for message in sent if message["type"] == "http.response.start")
+    body_out = b"".join(m.get("body", b"") for m in sent if m["type"] == "http.response.body")
+    return int(start["status"]), body_out
+
+
+def test_a_chunked_body_that_completes_within_the_deadline_is_accepted() -> None:
+    """The deadline covers the whole read, not the gap between chunks: a body that arrives in
+    pieces, with pauses, but inside ``body_timeout_seconds`` is an ordinary accepted batch."""
+    settings = _settings(body_timeout_seconds=5, max_inflight_batches=1)
+    writer = FakeWriter()
+    app = create_app(
+        settings, writer, InMemoryBatchLedger(), InMemorySourceHealthStore(), clock=lambda: NOW
+    )
+    payload = json.dumps(_payload([_event(0), _event(1)])).encode()
+    status, body = asyncio.run(
+        _chunked_post(
+            ActAsRole(app, "edge-gateway"), "/internal/ingest", payload, pieces=5, pause=0.05
+        )
+    )
+    assert status == 200, body
+    assert json.loads(body) == {"accepted": 2, "duplicate": False}
+    assert len(writer.batches) == 1
+    assert app.state.metrics.get("carto_ingest_body_timeout_total") == 0
+    assert app.state.metrics.get("carto_ingest_errors_total") == 0
 
 
 def test_readyz_is_503_once_every_slot_has_been_held_past_the_body_timeout() -> None:

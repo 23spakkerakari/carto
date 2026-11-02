@@ -308,13 +308,19 @@ def test_transport_error_report_and_log_carry_no_payload(buffer: DiskBuffer) -> 
     assert MARKER not in repr(logs)
 
 
-def test_unexpected_4xx_is_retried_not_parked(buffer: DiskBuffer) -> None:
+@pytest.mark.parametrize("status", [404, 408])
+def test_unexpected_4xx_is_retried_not_parked(buffer: DiskBuffer, status: int) -> None:
+    """408 is core's body deadline (ADR 0073): the batch is fine, the connection was not, so
+    it is sent again after a backoff like any status outside PARK_STATUSES."""
     buffer.append(batch())
-    report = forwarder(buffer, lambda _request: httpx.Response(404)).send_once()
+    report = forwarder(buffer, lambda _request: httpx.Response(status)).send_once()
     assert report.failed
-    assert report.status == 404
+    assert not report.parked
+    assert report.status == status
+    assert report.retry_after_seconds is not None and report.retry_after_seconds > 0
     assert buffer.depth() == 1
     assert buffer.parked() == 0
+    assert status not in PARK_STATUSES
 
 
 def test_run_drains_the_buffer_and_stops_promptly(buffer: DiskBuffer) -> None:
@@ -379,16 +385,18 @@ def test_drain_gives_up_after_consecutive_failures(buffer: DiskBuffer) -> None:
 # --- parked batches expire (ADR 0073) ----------------------------------------------------------
 
 
-def _park_at(buf: DiskBuffer, created_at: datetime) -> IngestBatch:
+def _park_at(buf: DiskBuffer, parked_at: datetime) -> IngestBatch:
+    """A batch appended and parked at ``parked_at`` (the purge ages parked rows from when
+    they were parked, ADR 0073)."""
     stored = batch()
     row_id = buf.append_bytes(
         compress_batch(stored),
         source_id=stored.source_id,
         batch_id=stored.batch_id,
         events=len(stored.events),
-        created_at=created_at,
+        created_at=parked_at,
     )
-    assert buf.park(row_id)
+    assert buf.park(row_id, at=parked_at, reason="http_422")
     return stored
 
 
@@ -471,6 +479,37 @@ def test_run_purges_parked_batches_past_the_age(buffer: DiskBuffer) -> None:
     thread.join(timeout=2.0)
     assert buffer.parked() == 0
     assert metrics.get("carto_edge_parked_purged_total") == 1
+
+
+def test_a_parked_batch_is_stamped_with_the_status_and_the_purge_records_it(
+    buffer: DiskBuffer,
+) -> None:
+    """ADR 0073: the forwarder parks with its own clock and the status as the reason; the purge
+    is aged from that time and leaves the batch in the buffer's purged ledger (id, events,
+    reason, when; no payload), so the data loss is on file, not only in a log line."""
+    sent = batch(events=3)
+    buffer.append(sent)
+    clock = {"now": NOW}
+    metrics = default_metrics()
+    fwd = Forwarder(
+        buffer,
+        client_for(lambda _request: httpx.Response(422, json={"title": "refused"})),
+        metrics=metrics,
+        clock=lambda: clock["now"],
+        parked_max_age_days=7,
+    )
+    assert fwd.send_once().parked
+    assert fwd.purge_parked(force=True) == 0, "parked just now"
+    clock["now"] = NOW + timedelta(days=7)
+    assert fwd.purge_parked(force=True) == 0, "exactly the age: not yet"
+    clock["now"] = NOW + timedelta(days=7, seconds=1)
+    with structlog.testing.capture_logs() as logs:
+        assert fwd.purge_parked(force=True) == 1
+    (entry,) = buffer.purged_ledger()
+    assert (entry.batch_id, entry.events, entry.parked_reason) == (sent.batch_id, 3, "http_422")
+    assert entry.purged_at == clock["now"]
+    assert metrics.get("carto_edge_parked_purged_total") == 1
+    assert MARKER not in repr(logs)
 
 
 def test_the_parked_age_is_validated(buffer: DiskBuffer) -> None:

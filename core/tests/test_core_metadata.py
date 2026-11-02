@@ -160,6 +160,22 @@ def test_templates_over_ceiling_counts_new_ids_per_system_in_one_pass(
     assert store.templates_over_ceiling("default", [other, new], ceiling=3) == "sys_orders"
     assert store.templates_over_ceiling("other", [new, other], ceiling=1) is None
     assert store.templates_over_ceiling("default", [], ceiling=1) is None
+    # A template id is known per system: sys_orders holds tpl_1, which is new to sys_pay, and
+    # sys_pay's rows never count toward sys_orders (the batch side is matched on both columns).
+    same_id_elsewhere = template(template_id="tpl_1", system_id="sys_pay")
+    assert store.templates_over_ceiling("default", [same_id_elsewhere], ceiling=1) is None
+    store.upsert_templates("default", [same_id_elsewhere])
+    assert store.templates_over_ceiling("default", [same_id_elsewhere], ceiling=1) is None
+    assert store.templates_over_ceiling("default", [known], ceiling=3) is None
+    assert store.templates_over_ceiling("default", [new], ceiling=3) == "sys_orders"
+    assert (
+        store.templates_over_ceiling(
+            "default", [template(template_id="tpl_9", system_id="sys_pay")], ceiling=1
+        )
+        == "sys_pay"
+    )
+    # The check never writes: the counts are what the upserts made them.
+    assert [t.count for t in store.list_templates("default", "sys_orders")] == [3, 3, 3]
     with pytest.raises(ValueError, match="ceiling"):
         store.templates_over_ceiling("default", [new], ceiling=0)
 
@@ -421,12 +437,18 @@ def test_postgres_statements_are_fixed_text_with_bound_parameters() -> None:
     assert "class = EXCLUDED" not in profile_upsert and "policy = EXCLUDED" not in profile_upsert
     assert "LEFT JOIN source_health" in str(metadata_module._SOURCES)
     assert "FOR UPDATE" not in str(metadata_module._PIN_FIELDS)
-    # ADR 0073: one grouped count per batch for the template ceiling, one count per inventory
-    # for the edge ceiling; both are plain SELECTs with bound lists.
+    # ADR 0073: one grouped count per batch for the template ceiling, the batch's pairs joined
+    # from two bound arrays (no per-row concatenation, no FILTER over the system's rows); one
+    # count per inventory for the edge ceiling, taken under the tenant's advisory lock.
     counts = str(metadata_module._TEMPLATE_COUNTS)
-    assert "GROUP BY system_id" in counts and "= ANY(:systems)" in counts
-    assert "FILTER (WHERE" in counts and "= ANY(:pairs)" in counts
+    assert counts.startswith("SELECT") and "GROUP BY t.system_id" in counts
+    assert "= ANY(:systems)" in counts
+    assert "unnest(CAST(:batch_systems AS text[]), CAST(:batch_ids AS text[]))" in counts
+    assert "||" not in counts and "FILTER" not in counts
     edges = str(metadata_module._EDGE_COUNTS)
     assert (
         edges.startswith("SELECT") and "FROM edge_inventories WHERE tenant_id = :tenant_id" in edges
     )
+    lock = str(metadata_module._EDGE_LOCK)
+    assert "pg_advisory_xact_lock(" in lock and "hashtext(:tenant_id)" in lock
+    assert 0 < metadata_module.EDGE_CEILING_LOCK_KEY < 2**31

@@ -281,7 +281,9 @@ services:
     command: ["ingest-api"]
     healthcheck:
       # Mutual TLS: the probe presents the service's own certificate (carto-core healthcheck).
-      test: ["CMD", "carto-core", "healthcheck", "--url", "https://localhost:8443/healthz"]
+      # Readiness, not liveness: /readyz is 503 when a store is unreachable or every in-flight
+      # slot has been held past the body deadline (ADR 0073); /healthz would stay green.
+      test: ["CMD", "carto-core", "healthcheck", "--url", "https://localhost:8443/readyz"]
       interval: 15s
       timeout: 10s
       retries: 8

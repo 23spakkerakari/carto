@@ -15,10 +15,19 @@ default 20 GB) and the backpressure threshold (``buffer.backpressure_ratio``, de
 exact (ADR 0014). :meth:`DiskBuffer.is_above_backpressure` is what pull connectors poll to slow
 down and push receivers map to 429; :meth:`DiskBuffer.is_full` is the hard stop (503, and
 :class:`BufferFullError` on ``append``). A batch that core refuses for good (a 4xx) is parked
-by :meth:`DiskBuffer.park` so the queue keeps moving; parked rows still count toward the cap
-and appear in the metrics until an operator clears them or the forwarder's housekeeping
-deletes those older than ``core.parked_max_age_days`` with :meth:`DiskBuffer.purge_parked`
-(ADR 0073), so a persistent refusal cannot fill the buffer with rows nobody will send.
+by :meth:`DiskBuffer.park`, which stamps when and (as a short label, the status) why, so the
+queue keeps moving; parked rows still count toward the cap and appear in the metrics until an
+operator clears them or the forwarder's housekeeping deletes those parked longer ago than
+``core.parked_max_age_days`` with :meth:`DiskBuffer.purge_parked` (ADR 0073), so a persistent
+refusal cannot fill the buffer with rows nobody will send. A purge is a data-loss event, so each
+purged batch leaves a row in the ``purged`` ledger (batch id, event count, parked reason, when;
+never a payload), kept to the last :data:`PURGED_LEDGER_ROWS` rows and read back with
+:meth:`DiskBuffer.purged_ledger`.
+
+The schema is versioned with ``PRAGMA user_version`` (:data:`SCHEMA_VERSION`): a file at an
+older version is migrated on open, one version per transaction; a file from before versioning
+is version 1; a file a newer edge wrote is refused with :class:`BufferSchemaError` rather than
+read with the wrong columns.
 
 Nothing here logs; payloads are opaque bytes to this module.
 """
@@ -38,7 +47,18 @@ import zstandard
 
 from carto_schema.ingest import IngestBatch
 
-__all__ = ["BufferFullError", "BufferedBatch", "DiskBuffer", "compress_batch", "decompress_batch"]
+__all__ = [
+    "MAX_PARKED_REASON_LEN",
+    "PURGED_LEDGER_ROWS",
+    "SCHEMA_VERSION",
+    "BufferFullError",
+    "BufferSchemaError",
+    "BufferedBatch",
+    "DiskBuffer",
+    "PurgedBatch",
+    "compress_batch",
+    "decompress_batch",
+]
 
 ZSTD_LEVEL: Final = 3
 STATE_PENDING: Final = 0
@@ -46,25 +66,52 @@ STATE_PARKED: Final = 1
 MAX_DECOMPRESSED_BYTES: Final = 64 * 1024 * 1024
 """A stored batch is at most 5 MB of JSON before compression (spec 8.5); 64 MB is a safe ceiling
 for :func:`decompress_batch` so a corrupt row cannot expand without bound (spec 2.3 invariant 8)."""
+SCHEMA_VERSION: Final = 2
+"""``PRAGMA user_version`` of a buffer file this code writes (module docstring)."""
+PURGED_LEDGER_ROWS: Final = 10_000
+"""Rows kept in the ``purged`` ledger: the most recent purges (ADR 0073)."""
+MAX_PARKED_REASON_LEN: Final = 32
+"""A parked reason is a label such as ``http_422``, cut to this length; never content."""
 
-_SCHEMA: Final = (
-    (
-        "CREATE TABLE IF NOT EXISTS batches ("
-        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
-        "source_id TEXT NOT NULL, "
-        "batch_id TEXT NOT NULL UNIQUE, "
-        "events INTEGER NOT NULL, "
-        "size INTEGER NOT NULL, "
-        "created_at_ms INTEGER NOT NULL, "
-        "state INTEGER NOT NULL DEFAULT 0, "
-        "payload BLOB NOT NULL)"
+_MIGRATIONS: Final[dict[int, tuple[str, ...]]] = {
+    1: (
+        (
+            "CREATE TABLE IF NOT EXISTS batches ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "source_id TEXT NOT NULL, "
+            "batch_id TEXT NOT NULL UNIQUE, "
+            "events INTEGER NOT NULL, "
+            "size INTEGER NOT NULL, "
+            "created_at_ms INTEGER NOT NULL, "
+            "state INTEGER NOT NULL DEFAULT 0, "
+            "payload BLOB NOT NULL)"
+        ),
+        "CREATE INDEX IF NOT EXISTS batches_state_id ON batches (state, id)",
     ),
-    "CREATE INDEX IF NOT EXISTS batches_state_id ON batches (state, id)",
-)
+    2: (
+        # ADR 0073: parked rows are aged from when they were parked (NULL for rows parked
+        # before this version: those fall back to created_at_ms), and the purged ledger.
+        "ALTER TABLE batches ADD COLUMN parked_at_ms INTEGER",
+        "ALTER TABLE batches ADD COLUMN parked_reason TEXT",
+        (
+            "CREATE TABLE IF NOT EXISTS purged ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "batch_id TEXT NOT NULL, "
+            "events INTEGER NOT NULL, "
+            "parked_reason TEXT, "
+            "purged_at_ms INTEGER NOT NULL)"
+        ),
+    ),
+}
+"""The statements that take a file from version ``n - 1`` to ``n``, applied in order."""
 
 
 class BufferFullError(Exception):
     """The buffer holds ``max_bytes``; the caller must slow down or refuse (spec 8.5)."""
+
+
+class BufferSchemaError(Exception):
+    """The buffer file was written by a newer edge than this one (module docstring)."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,6 +125,52 @@ class BufferedBatch:
     size_bytes: int
     created_at: datetime
     payload: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class PurgedBatch:
+    """One row of the ``purged`` ledger (ADR 0073): what was lost, when and why; no payload."""
+
+    batch_id: str
+    events: int
+    parked_reason: str | None
+    purged_at: datetime
+
+
+def _ms(at: datetime) -> int:
+    return int(at.astimezone(UTC).timestamp() * 1000)
+
+
+def _from_ms(value: int) -> datetime:
+    return datetime.fromtimestamp(int(value) / 1000, tz=UTC)
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Bring the file to :data:`SCHEMA_VERSION` (module docstring)."""
+    row = conn.execute("PRAGMA user_version").fetchone()
+    version = int(row[0]) if row is not None else 0
+    if version == 0:
+        present = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'batches'"
+        ).fetchone()
+        if present is not None:
+            version = 1  # a file from before the schema was versioned
+    if version > SCHEMA_VERSION:
+        msg = (
+            f"buffer schema version {version} is newer than this edge supports "
+            f"({SCHEMA_VERSION}); the file was written by a newer edge"
+        )
+        raise BufferSchemaError(msg)
+    for target in range(version + 1, SCHEMA_VERSION + 1):
+        conn.execute("BEGIN")
+        try:
+            for statement in _MIGRATIONS[target]:
+                conn.execute(statement)
+            conn.execute(f"PRAGMA user_version = {target:d}")
+            conn.execute("COMMIT")
+        except sqlite3.Error:
+            conn.execute("ROLLBACK")
+            raise
 
 
 def compress_batch(batch: IngestBatch) -> bytes:
@@ -113,8 +206,11 @@ class DiskBuffer:
         self._conn = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=FULL")
-        for statement in _SCHEMA:
-            self._conn.execute(statement)
+        try:
+            _migrate(self._conn)
+        except BaseException:
+            self._conn.close()
+            raise
         row = self._conn.execute("SELECT COALESCE(SUM(size), 0) FROM batches").fetchone()
         self._bytes = int(row[0]) if row is not None else 0
 
@@ -140,6 +236,12 @@ class DiskBuffer:
     def max_bytes(self) -> int:
         return self._max_bytes
 
+    def schema_version(self) -> int:
+        """The file's ``PRAGMA user_version`` (:data:`SCHEMA_VERSION` once opened)."""
+        with self._lock:
+            row = self._conn.execute("PRAGMA user_version").fetchone()
+        return int(row[0]) if row is not None else 0
+
     # -- writes --------------------------------------------------------------------------------
 
     def append(self, batch: IngestBatch, source_id: str | None = None) -> int:
@@ -158,7 +260,7 @@ class DiskBuffer:
         self, payload: bytes, *, source_id: str, batch_id: str, events: int, created_at: datetime
     ) -> int:
         size = len(payload)
-        created_ms = int(created_at.astimezone(UTC).timestamp() * 1000)
+        created_ms = _ms(created_at)
         with self._lock:
             if self._bytes >= self._max_bytes:
                 msg = f"disk buffer holds {self._bytes} bytes; the cap is {self._max_bytes}"
@@ -202,39 +304,60 @@ class DiskBuffer:
             self._bytes -= freed  # only once the delete is committed: the cap stays exact
         return removed
 
-    def park(self, row_id: int) -> bool:
-        """Take a row out of the pending queue (core refused it for good); it keeps its bytes."""
+    def park(self, row_id: int, *, at: datetime | None = None, reason: str | None = None) -> bool:
+        """Take a row out of the pending queue (core refused it for good); it keeps its bytes.
+        ``at`` (default: now) is when it was parked, which :meth:`purge_parked` ages it by;
+        ``reason`` is a short label (the status, never content) kept for the purged ledger."""
+        parked_ms = _ms(at if at is not None else datetime.now(UTC))
+        label = reason[:MAX_PARKED_REASON_LEN] if reason is not None else None
         with self._lock:
             cursor = self._conn.execute(
-                "UPDATE batches SET state = ? WHERE id = ? AND state = ?",
-                (STATE_PARKED, row_id, STATE_PENDING),
+                "UPDATE batches SET state = ?, parked_at_ms = ?, parked_reason = ? "
+                "WHERE id = ? AND state = ?",
+                (STATE_PARKED, parked_ms, label, row_id, STATE_PENDING),
             )
             return cursor.rowcount > 0
 
-    def purge_parked(self, older_than: datetime) -> tuple[int, str | None]:
-        """Delete the parked rows created before ``older_than`` (ADR 0073); returns how many
-        and the batch id (a ULID, never content) of the oldest one removed. Pending rows are
-        never touched. The bytes are released once the delete is committed, as in :meth:`ack`."""
-        cutoff_ms = int(older_than.astimezone(UTC).timestamp() * 1000)
+    def purge_parked(
+        self, older_than: datetime, *, now: datetime | None = None
+    ) -> tuple[int, str | None]:
+        """Delete the rows parked before ``older_than`` (ADR 0073); returns how many and the
+        batch id (a ULID, never content) of the one parked longest ago. A row parked before
+        the schema recorded the time is aged from its append time. Pending rows are never
+        touched. Each deleted row is written to the ``purged`` ledger, stamped ``now``, in the
+        same transaction, and the ledger is cut to :data:`PURGED_LEDGER_ROWS`. The bytes are
+        released once the delete is committed, as in :meth:`ack`."""
+        cutoff_ms = _ms(older_than)
+        purged_ms = _ms(now if now is not None else datetime.now(UTC))
         with self._lock:
             self._conn.execute("BEGIN")
             try:
                 rows = self._conn.execute(
-                    "SELECT batch_id, size FROM batches WHERE state = ? AND created_at_ms < ? "
-                    "ORDER BY created_at_ms, id",
+                    "SELECT id, batch_id, events, size, parked_reason FROM batches "
+                    "WHERE state = ? AND COALESCE(parked_at_ms, created_at_ms) < ? "
+                    "ORDER BY COALESCE(parked_at_ms, created_at_ms), id",
                     (STATE_PARKED, cutoff_ms),
                 ).fetchall()
                 if rows:
+                    self._conn.executemany(
+                        "DELETE FROM batches WHERE id = ?", [(int(row[0]),) for row in rows]
+                    )
+                    self._conn.executemany(
+                        "INSERT INTO purged (batch_id, events, parked_reason, purged_at_ms) "
+                        "VALUES (?, ?, ?, ?)",
+                        [(row[1], int(row[2]), row[4], purged_ms) for row in rows],
+                    )
                     self._conn.execute(
-                        "DELETE FROM batches WHERE state = ? AND created_at_ms < ?",
-                        (STATE_PARKED, cutoff_ms),
+                        "DELETE FROM purged WHERE id NOT IN "
+                        "(SELECT id FROM purged ORDER BY id DESC LIMIT ?)",
+                        (PURGED_LEDGER_ROWS,),
                     )
                 self._conn.execute("COMMIT")
             except sqlite3.Error:
                 self._conn.execute("ROLLBACK")
                 raise
-            self._bytes -= sum(int(row[1]) for row in rows)
-        return len(rows), (str(rows[0][0]) if rows else None)
+            self._bytes -= sum(int(row[3]) for row in rows)
+        return len(rows), (str(rows[0][1]) if rows else None)
 
     # -- reads ---------------------------------------------------------------------------------
 
@@ -252,8 +375,26 @@ class DiskBuffer:
                 batch_id=str(row[2]),
                 events=int(row[3]),
                 size_bytes=int(row[4]),
-                created_at=datetime.fromtimestamp(int(row[5]) / 1000, tz=UTC),
+                created_at=_from_ms(row[5]),
                 payload=bytes(row[6]),
+            )
+            for row in rows
+        ]
+
+    def purged_ledger(self, limit: int = 100) -> list[PurgedBatch]:
+        """The most recent purges, newest first (ADR 0073); at most ``limit`` rows."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT batch_id, events, parked_reason, purged_at_ms FROM purged "
+                "ORDER BY id DESC LIMIT ?",
+                (max(1, min(int(limit), PURGED_LEDGER_ROWS)),),
+            ).fetchall()
+        return [
+            PurgedBatch(
+                batch_id=str(row[0]),
+                events=int(row[1]),
+                parked_reason=str(row[2]) if row[2] is not None else None,
+                purged_at=_from_ms(row[3]),
             )
             for row in rows
         ]
@@ -301,7 +442,7 @@ class DiskBuffer:
             ).fetchone()
         if row is None or row[0] is None:
             return None
-        return datetime.fromtimestamp(int(row[0]) / 1000, tz=UTC)
+        return _from_ms(row[0])
 
     def is_above_backpressure(self) -> bool:
         with self._lock:

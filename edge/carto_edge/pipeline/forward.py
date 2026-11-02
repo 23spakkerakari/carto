@@ -16,12 +16,16 @@
   them would park the whole buffer within seconds, and fixing the configuration would recover
   nothing. 429 honours ``Retry-After`` (seconds, capped); 5xx, any other status and transport
   errors back off exponentially with jitter (:func:`carto_edge.net.retry.backoff_delay`) up to
-  ``retry_max_seconds``, and the row stays. Parked rows expire: once per
+  ``retry_max_seconds``, and the row stays (408, core's body deadline, is one of them: the
+  batch is fine, the connection was not). A row is parked with the forwarder's clock and the
+  status as its reason (``http_422``). Parked rows expire: once per
   :data:`PARKED_PURGE_SECONDS` the loop's housekeeping (:meth:`Forwarder.purge_parked`)
-  deletes those older than ``parked_max_age_days`` (``core.parked_max_age_days``, ADR 0073),
-  counts them in ``carto_edge_parked_purged_total`` and logs one warning per pass with the
-  count and the oldest batch id only; a persistent refusal cannot fill the buffer with rows
-  nobody will ever send.
+  deletes those parked longer ago than ``parked_max_age_days`` (``core.parked_max_age_days``,
+  ADR 0073), counts them in ``carto_edge_parked_purged_total`` and logs one warning per pass
+  with the count and the oldest batch id only; the buffer keeps each purged batch's id, event
+  count, reason and time in its bounded ``purged`` ledger, so the loss is on file and not
+  only in a log line. A persistent refusal cannot fill the buffer with rows nobody will ever
+  send.
 - :class:`SourceHealth` keeps, per source, ``last_success_at``, ``lag_seconds``, the
   consecutive error count and the records read (spec 8.1 "Health"); the status is ``ok`` after a
   successful read, ``degraded`` after one or two consecutive errors and ``failing`` from three.
@@ -273,17 +277,19 @@ class Forwarder:
         return self._parked_max_age_days
 
     def purge_parked(self, *, force: bool = False) -> int:
-        """Housekeeping (module docstring): delete the parked batches older than
+        """Housekeeping (module docstring): delete the batches parked longer ago than
         ``parked_max_age_days``. Runs at most once per :data:`PARKED_PURGE_SECONDS` unless
         ``force``, and at once on the first call; returns the rows deleted. The one warning per
-        pass carries the count and the oldest batch id, never a payload (spec 2.3 invariant 7)."""
+        pass carries the count and the oldest batch id, never a payload (spec 2.3 invariant 7);
+        the buffer's purged ledger keeps the ids."""
         tick = self._monotonic()
         last = self._last_purge
         if not force and last is not None and tick - last < PARKED_PURGE_SECONDS:
             return 0
         self._last_purge = tick
-        cutoff = self._clock() - timedelta(days=self._parked_max_age_days)
-        purged, oldest = self._buffer.purge_parked(cutoff)
+        now = self._clock()
+        cutoff = now - timedelta(days=self._parked_max_age_days)
+        purged, oldest = self._buffer.purge_parked(cutoff, now=now)
         if purged:
             self._metrics.inc("carto_edge_parked_purged_total", purged)
             log.warning(
@@ -343,7 +349,9 @@ class Forwarder:
             log.debug("forward.sent", **context)
             return SendReport(sent=True, status=status, batch_id=row.batch_id)
         if status in PARK_STATUSES:
-            self._buffer.park(row.id)
+            # Stamped with this clock and the status: the purge ages the row from now, and the
+            # purged ledger records why it was parked (ADR 0073).
+            self._buffer.park(row.id, at=self._clock(), reason=f"http_{status}")
             self._metrics.inc("carto_edge_batches_parked_total")
             self._attempt = 0
             log.warning("forward.parked", **context)

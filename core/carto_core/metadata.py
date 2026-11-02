@@ -23,10 +23,16 @@ Who writes what (ADR 0056):
 
 Two ceilings bound what the edge can grow (ADR 0073, spec 2.3 invariant 8): templates are named
 by the edge, so :meth:`MetadataStore.templates_over_ceiling` tells ``ingest-api`` in one grouped
-query whether a batch would push a system past ``ingest.max_templates_per_system``, before the
-batch is claimed or written; ``edge_inventories`` is keyed by the body's ``edge_id``, so
-:meth:`MetadataStore.replace_inventory` refuses a new edge past ``max_edges`` with
-:class:`MetadataLimitError` inside its transaction, and nothing of that inventory is written.
+query (the batch's ``(system, template)`` pairs bound as two arrays and joined to the system's
+rows, so no row is concatenated or filtered against a list) whether a batch would push a system
+past ``ingest.max_templates_per_system``, before the batch is claimed or written; the check
+takes no lock, and ``ingest-api`` documents the overshoot that concurrent batches allow.
+``edge_inventories`` is keyed by the body's ``edge_id``, so :meth:`MetadataStore.replace_inventory`
+refuses a new edge past ``max_edges`` with :class:`MetadataLimitError` inside its transaction,
+and nothing of that inventory is written; the count runs under a transaction-level advisory
+lock keyed by the tenant (:data:`EDGE_CEILING_LOCK_KEY`, ``hashtext(tenant_id)``), so two new
+edges arriving at once cannot both count the same rows and both get in: a row lock on the
+existing rows would not serialise two inserts, and a tenant with no rows yet has nothing to lock.
 
 A pin names a field as ``system/template/path`` or ``system/*/path`` (any template, spec 8.3).
 :class:`InMemoryMetadataStore` is the reference and the test double; :class:`PostgresMetadataStore`
@@ -59,6 +65,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "DEFAULT_PAGE",
+    "EDGE_CEILING_LOCK_KEY",
     "MAX_PAGE",
     "FieldProfileUpdate",
     "FieldRecord",
@@ -80,6 +87,10 @@ __all__ = [
 DEFAULT_PAGE: Final = 100
 MAX_PAGE: Final = 1000
 PIN_SEGMENTS: Final = 3
+EDGE_CEILING_LOCK_KEY: Final = 0x65646765
+"""The first key of the two-``int4`` transaction advisory lock the edge ceiling takes (ADR
+0073): the ASCII bytes of ``edge``; the second key is ``hashtext(tenant_id)``. Distinct from
+the migration lock, which is a single ``bigint`` key (ADR 0043 section 4)."""
 Shapes = tuple[tuple[str, float], ...]
 """``(shape, share)`` pairs, most frequent first."""
 
@@ -794,13 +805,23 @@ _TEMPLATES = sqlalchemy.text(
     "AND (:any_system OR system_id = :system_id) ORDER BY system_id, id"
 )
 _TEMPLATE_COUNTS = sqlalchemy.text(
-    "SELECT system_id, COUNT(*) AS total, "
-    "COUNT(*) FILTER (WHERE system_id || '/' || id = ANY(:pairs)) AS known "
-    "FROM templates WHERE tenant_id = :tenant_id AND system_id = ANY(:systems) "
-    "GROUP BY system_id"
+    "SELECT t.system_id, COUNT(*) AS total, COUNT(b.id) AS known "
+    "FROM templates AS t "
+    "LEFT JOIN unnest(CAST(:batch_systems AS text[]), CAST(:batch_ids AS text[])) "
+    "AS b(system_id, id) ON b.system_id = t.system_id AND b.id = t.id "
+    "WHERE t.tenant_id = :tenant_id AND t.system_id = ANY(:systems) "
+    "GROUP BY t.system_id"
 )
 """ADR 0073: per system of a batch, the rows it holds and how many of the batch's
-``system/template`` pairs are among them, in one query."""
+``(system, template)`` pairs are among them, in one query. The pairs travel as two parallel
+arrays and are joined on both columns, so the planner hashes the batch side once instead of
+concatenating every row of the system and testing it against a list; ``COUNT(b.id)`` counts
+the joined (batch-side) matches, which the primary key makes at most one per pair."""
+_EDGE_LOCK = sqlalchemy.text(
+    "SELECT pg_advisory_xact_lock(CAST(:key AS integer), hashtext(:tenant_id))"
+)
+"""ADR 0073: serialises the edge-ceiling count and the inventory write per tenant for the rest
+of the transaction (released at commit or rollback, nothing to unlock)."""
 _EDGE_COUNTS = sqlalchemy.text(
     "SELECT COUNT(*) AS total, COUNT(*) FILTER (WHERE edge_id = :edge_id) AS known "
     "FROM edge_inventories WHERE tenant_id = :tenant_id"
@@ -995,14 +1016,20 @@ class PostgresMetadataStore:
         wanted = _templates_by_system(records)
         if not wanted:
             return None
-        pairs = [
-            f"{system_id}/{template_id}"
-            for system_id, ids in wanted.items()
-            for template_id in sorted(ids)
-        ]
+        batch_systems: list[str] = []
+        batch_ids: list[str] = []
+        for system_id, ids in wanted.items():
+            for template_id in sorted(ids):
+                batch_systems.append(system_id)
+                batch_ids.append(template_id)
         rows = self._rows(
             _TEMPLATE_COUNTS,
-            {"tenant_id": tenant_id, "systems": list(wanted), "pairs": pairs},
+            {
+                "tenant_id": tenant_id,
+                "systems": list(wanted),
+                "batch_systems": batch_systems,
+                "batch_ids": batch_ids,
+            },
             "template count",
         )
         counts = {str(row.system_id): (int(row.total), int(row.known)) for row in rows}
@@ -1115,6 +1142,11 @@ class PostgresMetadataStore:
                 if max_edges is not None:
                     # First in the transaction: a refused inventory writes nothing (the raise
                     # is not a driver error, so it leaves the except below alone and rolls back).
+                    # The tenant's advisory lock serialises count and insert against another
+                    # new edge of the same tenant; it goes with the transaction either way.
+                    connection.execute(
+                        _EDGE_LOCK, {"key": EDGE_CEILING_LOCK_KEY, "tenant_id": tenant}
+                    )
                     edges = connection.execute(
                         _EDGE_COUNTS, {"tenant_id": tenant, "edge_id": inventory.edge_id}
                     ).one()

@@ -1,5 +1,6 @@
 """carto_edge.pipeline.buffer: durable appends, exact size accounting, backpressure, acks,
-parking and the round trip of the compressed wire form (spec 8.5, ADR 0014)."""
+parking and the round trip of the compressed wire form (spec 8.5, ADR 0014); the versioned
+schema, parked rows aged from when they were parked, and the bounded purged ledger (ADR 0073)."""
 
 from __future__ import annotations
 
@@ -13,7 +14,10 @@ import zstandard
 
 from carto_common.ids import new_ulid
 from carto_edge.pipeline.buffer import (
+    PURGED_LEDGER_ROWS,
+    SCHEMA_VERSION,
     BufferFullError,
+    BufferSchemaError,
     DiskBuffer,
     compress_batch,
     decompress_batch,
@@ -150,7 +154,7 @@ def test_purge_parked_removes_old_parked_rows_and_their_bytes(tmp_path: Path) ->
             events=2,
             created_at=old_at,
         )
-        assert buf.park(old_id) and buf.park(young_id)
+        assert buf.park(old_id, at=old_at) and buf.park(young_id, at=NOW)
         before = buf.bytes()
         old_size = len(compress_batch(old_batch))
         assert buf.purge_parked(NOW - timedelta(days=7)) == (1, old_batch.batch_id)
@@ -163,6 +167,146 @@ def test_purge_parked_removes_old_parked_rows_and_their_bytes(tmp_path: Path) ->
         assert buf.bytes() == len(compress_batch(pending_batch))
     with DiskBuffer(tmp_path / "b.sqlite", max_bytes=10_000_000, backpressure_ratio=0.8) as again:
         assert again.bytes() == len(compress_batch(pending_batch)), "the delete was committed"
+
+
+def test_parked_rows_age_from_when_they_were_parked_not_from_append(tmp_path: Path) -> None:
+    """ADR 0073: a batch that waited a month in the queue and was parked today gets its full
+    parked_max_age_days from today; aging it from its append time would purge it at once."""
+    appended_at = NOW - timedelta(days=30)
+    with DiskBuffer(tmp_path / "b.sqlite", max_bytes=10_000_000, backpressure_ratio=0.8) as buf:
+        stored = _batch()
+        row_id = buf.append_bytes(
+            compress_batch(stored),
+            source_id="src_wms_db",
+            batch_id=stored.batch_id,
+            events=2,
+            created_at=appended_at,
+        )
+        assert buf.park(row_id, at=NOW, reason="http_422")
+        assert buf.purge_parked(NOW - timedelta(days=7)) == (0, None), "parked today: kept"
+        assert buf.parked() == 1
+        assert buf.purge_parked(NOW + timedelta(days=7, seconds=1)) == (1, stored.batch_id)
+        assert buf.parked() == 0
+        # park() without a time stamps the wall clock, never the append time.
+        later = _batch()
+        later_id = buf.append_bytes(
+            compress_batch(later),
+            source_id="src_wms_db",
+            batch_id=later.batch_id,
+            events=2,
+            created_at=appended_at,
+        )
+        assert buf.park(later_id)
+        assert buf.purge_parked(datetime.now(UTC) - timedelta(seconds=60)) == (0, None)
+
+
+def _v1_schema(path: Path, *, batch: IngestBatch, created_at: datetime, state: int) -> None:
+    """A buffer file as the code before ADR 0073's ledger wrote it: no user_version, no
+    parked_at_ms, no purged table."""
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS batches ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, source_id TEXT NOT NULL, "
+            "batch_id TEXT NOT NULL UNIQUE, events INTEGER NOT NULL, size INTEGER NOT NULL, "
+            "created_at_ms INTEGER NOT NULL, state INTEGER NOT NULL DEFAULT 0, "
+            "payload BLOB NOT NULL)"
+        )
+        conn.execute("CREATE INDEX IF NOT EXISTS batches_state_id ON batches (state, id)")
+        payload = compress_batch(batch)
+        conn.execute(
+            "INSERT INTO batches (source_id, batch_id, events, size, created_at_ms, state, "
+            "payload) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                "src_wms_db",
+                batch.batch_id,
+                2,
+                len(payload),
+                int(created_at.timestamp() * 1000),
+                state,
+                payload,
+            ),
+        )
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 0
+
+
+def test_a_buffer_from_before_schema_versioning_is_migrated_on_open(tmp_path: Path) -> None:
+    """The schema is versioned with ``PRAGMA user_version`` (ADR 0073). A file at version 0
+    that already holds ``batches`` is a version-1 file: it gains the parked columns and the
+    purged table, keeps its rows, and a row parked before the migration (no parked_at_ms) is
+    aged from its append time, which is all that is known about it."""
+    path = tmp_path / "b.sqlite"
+    parked_before, pending_before = _batch(), _batch()
+    _v1_schema(path, batch=parked_before, created_at=NOW - timedelta(days=30), state=1)
+    with sqlite3.connect(path) as conn:
+        payload = compress_batch(pending_before)
+        conn.execute(
+            "INSERT INTO batches (source_id, batch_id, events, size, created_at_ms, state, "
+            "payload) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("src_wms_db", pending_before.batch_id, 2, len(payload), 1, 0, payload),
+        )
+    with DiskBuffer(path, max_bytes=10_000_000, backpressure_ratio=0.8) as buf:
+        assert buf.schema_version() == SCHEMA_VERSION
+        assert buf.parked() == 1 and buf.depth() == 1
+        assert buf.bytes() == len(compress_batch(parked_before)) + len(payload)
+        columns = {row[1] for row in buf._conn.execute("PRAGMA table_info(batches)").fetchall()}
+        assert {"parked_at_ms", "parked_reason"} <= columns
+        assert buf.purge_parked(NOW - timedelta(days=7)) == (1, parked_before.batch_id)
+        assert buf.parked() == 0
+        assert buf.depth() == 1, "the pending row is untouched"
+        (entry,) = buf.purged_ledger()
+        assert entry.batch_id == parked_before.batch_id
+        assert entry.parked_reason is None, "nothing was recorded before the migration"
+    with DiskBuffer(path, max_bytes=10_000_000, backpressure_ratio=0.8) as again:
+        assert again.schema_version() == SCHEMA_VERSION, "opening again migrates nothing"
+        assert again.depth() == 1
+
+
+def test_a_buffer_written_by_a_newer_edge_is_refused(tmp_path: Path) -> None:
+    path = tmp_path / "b.sqlite"
+    with DiskBuffer(path, max_bytes=10_000_000, backpressure_ratio=0.8) as buf:
+        buf.append(_batch())
+    with sqlite3.connect(path) as conn:
+        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION + 1}")
+    with pytest.raises(BufferSchemaError, match="newer"):
+        DiskBuffer(path, max_bytes=10_000_000, backpressure_ratio=0.8)
+
+
+def test_purged_batches_are_recorded_in_a_bounded_ledger(tmp_path: Path) -> None:
+    """ADR 0073: a purge is a data-loss event. Each purged batch leaves a row in ``purged``
+    (batch id, event count, parked reason, when; never a payload), kept to the last
+    ``PURGED_LEDGER_ROWS`` rows."""
+    path = tmp_path / "b.sqlite"
+    with DiskBuffer(path, max_bytes=10_000_000, backpressure_ratio=0.8) as buf:
+        assert buf.purged_ledger() == []
+        first, second = _batch(events=3), _batch(events=1)
+        first_id, second_id = buf.append(first), buf.append(second)
+        assert buf.park(first_id, at=NOW - timedelta(days=9), reason="http_422")
+        assert buf.park(second_id, at=NOW - timedelta(days=8), reason="http_400")
+        assert buf.purge_parked(NOW - timedelta(days=7), now=NOW) == (2, first.batch_id)
+        ledger = buf.purged_ledger()
+        assert [(e.batch_id, e.events, e.parked_reason, e.purged_at) for e in ledger] == [
+            (second.batch_id, 1, "http_400", NOW),
+            (first.batch_id, 3, "http_422", NOW),
+        ], "newest first"
+        assert buf.purged_ledger(limit=1) == ledger[:1]
+        # The ledger is bounded: with 10,000 earlier purges on file, one more drops the oldest.
+        buf._conn.executemany(
+            "INSERT INTO purged (batch_id, events, parked_reason, purged_at_ms) "
+            "VALUES (?, ?, ?, ?)",
+            [(f"FILLER{index:020d}", 1, "http_422", 0) for index in range(PURGED_LEDGER_ROWS)],
+        )
+        third = _batch()
+        assert buf.park(buf.append(third), at=NOW - timedelta(days=8), reason="http_413")
+        assert buf.purge_parked(NOW - timedelta(days=7), now=NOW) == (1, third.batch_id)
+        count = buf._conn.execute("SELECT COUNT(*) FROM purged").fetchone()
+        assert count is not None and count[0] == PURGED_LEDGER_ROWS
+        assert buf.purged_ledger(limit=1)[0].batch_id == third.batch_id
+        kept = {row[0] for row in buf._conn.execute("SELECT batch_id FROM purged").fetchall()}
+        assert first.batch_id not in kept and second.batch_id not in kept
+        assert f"FILLER{0:020d}" not in kept, "the three oldest rows went"
+        assert f"FILLER{1:020d}" in kept and f"FILLER{PURGED_LEDGER_ROWS - 1:020d}" in kept
+    with DiskBuffer(path, max_bytes=10_000_000, backpressure_ratio=0.8) as again:
+        assert again.purged_ledger(limit=1)[0].batch_id == third.batch_id, "durable"
 
 
 def test_rejects_bad_limits(tmp_path: Path) -> None:
