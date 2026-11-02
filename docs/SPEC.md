@@ -656,7 +656,7 @@ Forms that collapse to fewer than 3 characters are skipped. Forms identical to a
 - `K_tenant` is a 256-bit key generated at install. It is stored only wrapped by the customer's KMS or Vault Transit (envelope encryption) and unwrapped into edge-gateway memory at startup.
 - No key material in environment variables, config files, images or logs.
 - Rotation: create `K_v2`, dual-tokenize new events with both versions for a configurable overlap window (default 30 days, at least the event retention period), then switch. Linker and assembler treat links per key version. Document the procedure in a runbook.
-- Brute-force note: short numeric IDs (4 to 6 digits) are guessable if the key leaks. The key never leaves the edge, the tokenize API is rate-limited and audited, and core never exposes a tokenize oracle to users beyond the search box (also rate-limited and audited).
+- Brute-force note: short numeric IDs (4 to 6 digits) are guessable if the key leaks. The key never leaves the edge, the tokenize API is rate-limited and audited, and core never exposes a tokenize oracle to users beyond the search box. The edge is the audit of record for search: it writes a row per tokenize query (subject, purpose, request id, form and value counts, never values or tokens) and limits queries separately from reveals (default 600 per user per hour). Core adds a burst cap (default 10 per user per minute), passes the edge's 429 through, and keeps per-user counts for the self-alert of Section 10 (M4); a per-address limit waits for the proxy allowlist (M6).
 
 **Reveal vault:** for `raw` forms only, the edge stores `token -> AES-256-GCM(raw_value)` with a data key wrapped by the KMS, plus `expires_at` aligned with event retention. Reveal requests come from core's API with a signed short-lived internal assertion carrying the user, permission and purpose; the edge verifies, rate-limits (default 100 values per user per hour), audits, and returns values. No bulk export.
 
@@ -721,7 +721,7 @@ When an event carries two identifier fields (the order system logs `order_id=447
 
 ### 9.5 Composite links (no shared identifier, typical of manual hops)
 
-When two systems show consistent temporal adjacency (B events follow A events in volume and time pattern) but no exact link scores above 0.5, the linker tries composite matching:
+When two systems show consistent temporal adjacency (B events follow A events in volume and time pattern), the linker tries composite matching. It runs even where an exact link above 0.5 exists between the pair (`linker.composite_beside_exact`, default on), with the events the exact link matched excluded from the blocks, so a second, manual path between the same two systems is still found; the composite precision gate of Section 18.4 is watched in the eval:
 
 1. **Components:** `date`, `amount`, `phonetic` forms, low-cardinality attributes (warehouse code, plan type), and identifier forms with partial overlap.
 2. **Blocking:** candidate pairs share an exact `date` or `amount` token within the time window (default: A event to B event within 3 business days).
@@ -742,7 +742,7 @@ Every decision is audited and versioned. Rejected pairs are remembered and not r
 
 Runs every 30 s on new events by store watermark (`stored_at`, ADR 0046).
 
-1. **Keys per event:** tokens of `(field, form)` pairs that participate in accepted transaction links or bridges.
+1. **Keys per event:** tokens of `(field, form)` pairs that participate in accepted transaction links or bridges, plus the matched event pairs of accepted composite links (Section 9.5). A composite pair joins exactly the two events it names, its merges are counted per link, and because composite links are never auto-accepted, no composite pair ever joins events without a reviewer's decision.
 2. **Hub detection:** track distinct transactions per token per day. A token exceeding the fanout threshold (default 50) becomes a **batch key**: it is removed from the merge index, a `batches` record is created, and transactions carrying it are linked to the batch. The nightly claims file with 5,000 claims becomes one batch with 5,000 linked transactions, not one giant transaction. Ends of batch-role links (Section 9.3) are batch keys from the start; the fanout threshold applies to transaction-role tokens.
 3. **Union-find:** for each event, look up its keys in `txn_token_index`. No hit: create a transaction (ULID). One hit: join it. Several hits: merge into the oldest transaction, record in `txn_merges`, repoint index entries, and append new `txn_events` versions for moved events.
 4. **Guardrails:** refuse a merge that would exceed 10,000 events or a time span beyond the entity's max span (default 14 days). Refused merges increment an `ambiguous_merges` counter on the responsible link and surface it in review.
@@ -760,7 +760,7 @@ Performance target: assembly keeps up with 2,000 events/s on the reference node,
 - **Hop probability** `p_next(X to Y)`: share of settled transactions (below) visiting X whose next node is Y.
 - **Terminal nodes:** per entity, nodes after which at least 95% of the entity's settled transactions have no further events. A transaction is settled when no event has arrived for the entity's quiet span: three times its observed p99 inter-event gap, capped at the entity's max span, which is also the default before any gap is observed. (Defining `completed` by terminal nodes and terminal nodes by completed transactions, as earlier wording did, bootstraps nothing.)
 - **Flow variants:** the top 10 node sequences per entity with counts, shown in the UI.
-- **Clock skew:** for directed links with tight lags (IQR under 10 s), a consistently negative lag between two systems means their clocks disagree. Estimate a per-system offset by the median of negative lags, use it only for ordering, never rewrite stored timestamps, and show a warning when the offset exceeds 30 s.
+- **Clock skew:** for tight links (IQR under 10 s) whose direction is known independently of the lag sign, a consistently negative lag between two systems means their clocks disagree. The linker directs a link from the sign of its lag, so the anchors are a direction the reviewer sets on accept (an audited field on the link) and links between two templates of one system, whose clock agrees with itself. Estimate a per-system offset by the median of negative lags, use it only for ordering, never rewrite stored timestamps, and show a warning when the offset exceeds 30 s.
 
 ### 9.9 LLM assist (optional)
 
@@ -933,7 +933,7 @@ Internal (edge to core and core to edge, mTLS only, not exposed through ingress)
 
 - `POST /internal/ingest` (core): batch of canonical events.
 - `POST /internal/heartbeat` (core): source health.
-- `POST /internal/tokenize` (edge): query string to tokens for all forms. Rate-limited, audited.
+- `POST /internal/tokenize` (edge): query string to tokens for all forms. Rate-limited (default 600 queries per user per hour, separate from the reveal quota) and audited at the edge (Section 8.4); core applies a burst cap of 10 per user per minute.
 - `POST /internal/reveal` (edge): tokens to values with signed user assertion. Rate-limited, audited.
 
 Conventions: cursor pagination (`?cursor=&limit=`, max 500), RFC 7807 problem details for errors, request IDs, `ETag`/`If-Match` on mutable resources to prevent lost updates.
@@ -996,7 +996,7 @@ Deny by default. Enforced in one FastAPI dependency layer; handlers never check 
 | View audit log                              | yes             | no                   | no                       | yes     |
 | **Reveal values**                           | only if granted | only if granted      | only if granted          | never   |
 
-- `reveal` is a separate grant, never implied by a role.
+- `reveal` is a separate grant, never implied by a role. It is held per user (`users.reveal_granted`), set by an audited admin command until the Admin screen exists (M6), and no user holds it at install; the install guide shows how to grant it.
 - Role bindings can be scoped to entities or systems.
 - An authorization matrix test is generated from the OpenAPI spec: every endpoint is called as every role and the result compared to this table.
 
@@ -1047,6 +1047,7 @@ Non-root UID, read-only root filesystem (writable volumes only where needed), al
 - The application's DB role has INSERT and SELECT only on `audit_log`; a trigger rejects UPDATE and DELETE.
 - Daily anchor (latest hash) exported to the customer's syslog or SIEM, so tampering is detectable externally.
 - Records: actor, action, target, before/after (never secrets or raw values), request ID, IP, user agent, timestamp, reason (for reveal).
+- Search queries are audited at the edge, not here (Section 8.4): the edge row carries subject, purpose and request id; core keeps per-user counts only.
 - Verification command: `carto-ctl audit verify`.
 
 ### 14.10 Retention and deletion

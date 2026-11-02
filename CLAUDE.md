@@ -60,8 +60,9 @@ import, lint or test it.
   `spec-data-layer` at c2e9a75) after five read-only reviews of the code against the plan:
   corrections in the plan's "What the code read changed", editorial spec fixes in 3, 5.2, 7.2,
   7.3, 9.7, 9.8, 12, 13, 15, 18, 21, threat-model rows 3 and 8, an amendment on ADR 0052.
-  Thirteen founder questions open (five of them spec changes); code waits on the M2
-  acceptance, the answers and the `fix-c2` rebase. ADRs from 0060 when code starts.
+  The thirteen founder questions were answered on 2026-11-01 with the plan's recommendations
+  (recorded under the questions; spec 8.4, 9.5, 9.7, 9.8, 12, 14.2, 14.9 edited). Code waits
+  on the M2 acceptance and the `fix-c2` rebase. ADRs from 0060 when code starts.
 - Spec direction 2026-10-21 on branch `spec-data-layer` (ADR 0059, proposed): hosted data layer,
   business rules and hosted deployment as v2 (spec 22.2 to 22.4); partial failures, stale data
   and missed events into M4 (spec 10.1, 10.2); partner questions 9 to 25 in spec 23 open.
