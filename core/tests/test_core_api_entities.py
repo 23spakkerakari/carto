@@ -15,6 +15,7 @@ from carto_core.api.app import API_PREFIX, create_app
 from carto_core.api.context import ApiContext
 from carto_core.api.memory_ports import InMemoryAuditLog, seeded_ports
 from carto_core.api.ports import ApiPorts
+from carto_core.audit import AuditEntry
 from carto_core.settings import SESSION_COOKIE_NAME, ApiSettings, CoreSettings
 from carto_schema.api import Role
 
@@ -109,6 +110,32 @@ def test_patch_confirms_the_name_and_is_audited() -> None:
         f"{ENTITIES}/ent_01", json={"name": "Again"}, headers={**headers, "If-Match": 'W/"1"'}
     )
     assert stale.status_code == 412
+
+
+def test_a_failing_audit_append_rolls_the_patch_back() -> None:
+    settings = CoreSettings(_env_file=None, api=ApiSettings(insecure_http=True))
+
+    class FailingAuditLog(InMemoryAuditLog):
+        def record(self, entry: AuditEntry) -> str:
+            del entry
+            raise RuntimeError("audit append failed")
+
+    ports = seeded_ports(audit=FailingAuditLog())
+    app = create_app(settings, ports, clock=lambda: NOW)
+    context = app.state.context
+    assert isinstance(context, ApiContext)
+    client = TestClient(app, base_url="https://testserver", raise_server_exceptions=False)
+    headers = _login(client, context, Role.INTEGRATION_ENGINEER)
+    response = client.patch(
+        f"{ENTITIES}/ent_01",
+        json={"name": "Customer order"},
+        headers={**headers, "If-Match": 'W/"1"'},
+    )
+    assert response.status_code == 500
+    stored = ports.entities.get("default", "ent_01")
+    assert stored is not None
+    assert (stored.name, stored.name_confirmed, stored.version) == ("Order", False, 1)
+    assert _audit(ports).entries() == []
 
 
 def test_description_only_patch_leaves_the_name_unconfirmed() -> None:

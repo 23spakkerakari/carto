@@ -4,9 +4,12 @@
 so two API workers cannot both chain from the same head and fork the log; the row's content is
 hashed exactly as :func:`carto_core.audit.chain_hash` defines it, with ``at`` normalised to UTC
 first so the hash survives the round trip through ``timestamptz`` whatever the session time
-zone. The application role has INSERT and SELECT only and a trigger rejects UPDATE and DELETE
-(migration 0004), so the chain is the tamper evidence and :func:`verify_audit_log` walks it in
-id order and reports the first break (``carto-core audit-verify``).
+zone. :meth:`PostgresAuditLog.append_on` runs the lock, the head read and the insert on a
+connection the caller's transaction owns, so a console decision and its row commit together
+(ADR 0070); :meth:`PostgresAuditLog.record` does the same in a transaction of its own. The
+application role has INSERT and SELECT only and a trigger rejects UPDATE and DELETE (migration
+0004), so the chain is the tamper evidence and :func:`verify_audit_log` walks it in id order
+and reports the first break (``carto-core audit-verify``).
 
 ``before`` and ``after`` are scrubbed on write (:func:`carto_core.audit.scrub`) as the backstop
 behind the metadata-only views the handlers pass.
@@ -28,7 +31,7 @@ from carto_core.audit import GENESIS_HASH, AuditEntry, ChainBreak, chain_hash, s
 from carto_core.db.postgres import ping_engine
 
 if TYPE_CHECKING:
-    from sqlalchemy import Engine
+    from sqlalchemy import Connection, Engine
 
 __all__ = ["AuditStoreError", "PostgresAuditLog", "verify_audit_log"]
 
@@ -84,8 +87,35 @@ def normalize(entry: AuditEntry) -> AuditEntry:
     )
 
 
+def _append(connection: Connection, clean: AuditEntry) -> str:
+    """Lock the tenant's chain, chain from its head and insert, on ``connection``."""
+    connection.execute(_LOCK, {"tenant_id": clean.tenant_id})
+    prev = connection.execute(_HEAD, {"tenant_id": clean.tenant_id}).scalar()
+    prev_hash = str(prev) if prev else GENESIS_HASH
+    row_hash = chain_hash(prev_hash, clean.content())
+    connection.execute(
+        _INSERT,
+        {
+            "tenant_id": clean.tenant_id,
+            "at": clean.at,
+            "actor": clean.actor,
+            "action": clean.action,
+            "target": clean.target,
+            "before": _json_text(clean.before),
+            "after": _json_text(clean.after),
+            "reason": clean.reason,
+            "request_id": clean.request_id,
+            "ip": clean.ip,
+            "user_agent": clean.user_agent,
+            "prev_hash": prev_hash,
+            "row_hash": row_hash,
+        },
+    )
+    return row_hash
+
+
 class PostgresAuditLog:
-    """``AuditRecorder`` and ``AuditPort`` over ``audit_log``."""
+    """``TransactionalAuditRecorder`` and ``AuditPort`` over ``audit_log``."""
 
     __slots__ = ("_engine",)
 
@@ -96,32 +126,22 @@ class PostgresAuditLog:
         clean = normalize(entry)
         try:
             with self._engine.begin() as connection:
-                connection.execute(_LOCK, {"tenant_id": clean.tenant_id})
-                prev = connection.execute(_HEAD, {"tenant_id": clean.tenant_id}).scalar()
-                prev_hash = str(prev) if prev else GENESIS_HASH
-                row_hash = chain_hash(prev_hash, clean.content())
-                connection.execute(
-                    _INSERT,
-                    {
-                        "tenant_id": clean.tenant_id,
-                        "at": clean.at,
-                        "actor": clean.actor,
-                        "action": clean.action,
-                        "target": clean.target,
-                        "before": _json_text(clean.before),
-                        "after": _json_text(clean.after),
-                        "reason": clean.reason,
-                        "request_id": clean.request_id,
-                        "ip": clean.ip,
-                        "user_agent": clean.user_agent,
-                        "prev_hash": prev_hash,
-                        "row_hash": row_hash,
-                    },
-                )
+                return _append(connection, clean)
         except SQLAlchemyError as exc:
             msg = f"audit append failed: {type(exc).__name__}"
             raise AuditStoreError(msg) from exc
-        return row_hash
+
+    def append_on(self, connection: Connection | None, entry: AuditEntry) -> str:
+        """Append on the caller's open transaction (ADR 0070); ``None`` falls back to
+        :meth:`record`. The caller commits or rolls back; a failure here propagates as
+        :class:`AuditStoreError` so the caller's ``with engine.begin()`` rolls back."""
+        if connection is None:
+            return self.record(entry)
+        try:
+            return _append(connection, normalize(entry))
+        except SQLAlchemyError as exc:
+            msg = f"audit append failed: {type(exc).__name__}"
+            raise AuditStoreError(msg) from exc
 
     def latest_hash(self, tenant_id: str) -> str:
         try:

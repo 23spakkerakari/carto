@@ -2,24 +2,35 @@
 
 Login starts the OIDC flow (:mod:`carto_core.api.oidc`): the state, nonce and PKCE verifier
 are kept server-side in a :class:`~carto_core.api.ports.LoginAttemptStore` keyed by the
-SHA-256 of ``state`` for ten minutes and consumed once by the callback. The callback exchanges
-the code, verifies the ID token, maps the groups claim to roles through ``role_bindings``
-(exact group names; a group with no binding grants nothing, so such a user signs in and sees
-``403`` everywhere, which ``GET /me`` makes visible), upserts the user, issues a new session
-(never adopting an id from the request) and redirects to ``/``. Both login routes are
-rate-limited per socket address (spec 14.7 "stricter on login"). Logout deletes the session
-and is CSRF-checked like every mutation. Login and logout are audited (spec 14.9).
+SHA-256 of ``state`` for ten minutes and consumed once by the callback. The same response sets
+the ``__Host-carto_login`` cookie (:data:`LOGIN_COOKIE_NAME`: 32 random bytes, ``Secure``,
+``HttpOnly``, ``SameSite=Lax``, path ``/``, the attempt's lifetime) and the attempt stores its
+SHA-256, so the callback completes only in the browser that started the login: a callback URL
+an attacker started and handed to a victim is refused as a ``state`` failure (login CSRF,
+session swapping; ADR 0070). The callback requires that cookie, compares its hash in constant
+time, exchanges the code, verifies the ID token, maps the groups claim to roles through
+``role_bindings`` (exact group names; a group with no binding grants nothing, so such a user
+signs in and sees ``403`` everywhere, which ``GET /me`` makes visible), upserts the user,
+issues a new session (never adopting an id from the request), clears the login cookie and
+redirects to ``/``. Both login routes are rate-limited per client address (the browser's,
+behind the web proxy; :func:`carto_core.api.context.client_ip`; spec 14.7 "stricter on
+login"). Logout deletes the session and is CSRF-checked like every mutation. Login, logout and
+every refused login are audited (spec 14.9); the refused one as ``auth.login_failed`` by the
+anonymous actor with the step as target and the detail as reason.
 
 Failures answer a problem that names the step (``state``, ``exchange``, ``token``), never the
-code, the state or a claim; the log line carries the same.
+code, the state, the cookie or a claim; the log line and the audit row carry the same, and
+every failure clears the login cookie.
 """
 
 from __future__ import annotations
 
 import hashlib
+import hmac
+import secrets
 from collections.abc import Iterable, Sequence
 from datetime import timedelta
-from typing import Annotated, Final
+from typing import TYPE_CHECKING, Annotated, Final
 
 from fastapi import APIRouter, Query, Request
 from starlette.concurrency import run_in_threadpool
@@ -35,12 +46,19 @@ from carto_core.api.sessions import Guard, principal_of, public_route
 from carto_core.settings import SESSION_COOKIE_NAME
 from carto_schema.api import MeView, Role
 
-__all__ = ["LOGIN_ATTEMPT_TTL", "roles_for_groups", "router"]
+if TYPE_CHECKING:
+    from carto_core.settings import ApiSettings
+
+__all__ = ["LOGIN_ATTEMPT_TTL", "LOGIN_COOKIE_NAME", "roles_for_groups", "router"]
 
 log = get_logger(component="api")
 router = APIRouter(tags=["auth"])
 
 LOGIN_ATTEMPT_TTL: Final = timedelta(minutes=10)
+LOGIN_COOKIE_NAME: Final = "__Host-carto_login"
+"""Binds a pending login to the browser that started it (module docstring, ADR 0070)."""
+_LOGIN_COOKIE_BYTES: Final = 32
+_MAX_LOGIN_COOKIE_LEN: Final = 128
 _NO_STORE: Final = {"Cache-Control": "no-store"}
 _AUTHENTICATED = Guard(None)
 
@@ -50,8 +68,52 @@ def roles_for_groups(bindings: Sequence[RoleBinding], groups: Iterable[str]) -> 
     return frozenset(binding.role for binding in bindings if binding.group_name in wanted)
 
 
+def _sha256(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
 def _state_hash(state: str) -> str:
-    return hashlib.sha256(state.encode("utf-8")).hexdigest()
+    return _sha256(state)
+
+
+def _binding_matches(cookie_value: str | None, binding_hash: str) -> bool:
+    """Whether the login cookie the browser sent is the one the attempt was bound to; a missing
+    or oversized cookie, or an attempt without a binding, never matches."""
+    if not cookie_value or len(cookie_value) > _MAX_LOGIN_COOKIE_LEN or not binding_hash:
+        return False
+    return hmac.compare_digest(_sha256(cookie_value), binding_hash)
+
+
+def _set_login_cookie(response: Response, settings: ApiSettings, value: str) -> None:
+    response.set_cookie(
+        LOGIN_COOKIE_NAME,
+        value,
+        max_age=int(LOGIN_ATTEMPT_TTL.total_seconds()),
+        path="/",
+        secure=settings.cookie_secure,
+        httponly=True,
+        samesite="lax",
+    )
+
+
+def _clear_login_cookie(response: Response, settings: ApiSettings) -> None:
+    response.set_cookie(
+        LOGIN_COOKIE_NAME,
+        "",
+        max_age=0,
+        expires=0,
+        path="/",
+        secure=settings.cookie_secure,
+        httponly=True,
+        samesite="lax",
+    )
+
+
+def _clearing_header(settings: ApiSettings) -> dict[str, str]:
+    """The ``Set-Cookie`` that clears the login cookie, for a problem response."""
+    scratch = Response()
+    _clear_login_cookie(scratch, settings)
+    return {"Set-Cookie": scratch.headers["set-cookie"]}
 
 
 def _login_limited(request: Request) -> None:
@@ -64,16 +126,33 @@ def _login_limited(request: Request) -> None:
         )
 
 
-def _login_failed(request: Request, step: str, detail: str) -> Problem:
+async def _login_failed(request: Request, step: str, detail: str) -> Problem:
+    """Count, log and audit a refused login (``auth.login_failed`` by the anonymous actor,
+    spec 14.9); the problem names the step only and clears the login cookie."""
     context = context_of(request)
     context.metrics.inc("carto_api_login_failures_total")
     log.warning("login refused", step=step, detail=detail)
-    return Problem(400, "login failed", f"the login could not be completed ({step})")
+    await record_audit(
+        context,
+        request,
+        None,
+        action="auth.login_failed",
+        target=step,
+        before=None,
+        after=None,
+        reason=detail,
+    )
+    return Problem(
+        400,
+        "login failed",
+        f"the login could not be completed ({step})",
+        headers=_clearing_header(context.settings.api),
+    )
 
 
 @router.get("/auth/login", status_code=302, response_class=RedirectResponse, **public_route())
 async def login(request: Request) -> Response:
-    """Send the browser to the identity provider."""
+    """Send the browser to the identity provider, bound to it by the login cookie."""
     context = context_of(request)
     _login_limited(request)
     if not context.oidc.configured:
@@ -84,6 +163,7 @@ async def login(request: Request) -> Response:
         log.warning("login cannot start", step=exc.kind, detail=exc.detail)
         raise Problem(503, "login unavailable", "the identity provider is unreachable") from exc
     now = context.clock()
+    binding = secrets.token_urlsafe(_LOGIN_COOKIE_BYTES)
     attempt = LoginAttempt(
         state_hash=_state_hash(start.state),
         tenant_id=context.tenant_id,
@@ -91,9 +171,12 @@ async def login(request: Request) -> Response:
         nonce=start.nonce,
         created_at=now,
         expires_at=now + LOGIN_ATTEMPT_TTL,
+        binding_hash=_sha256(binding),
     )
     await run_in_threadpool(context.ports.login_attempts.put, attempt)
-    return RedirectResponse(start.authorization_url, status_code=302, headers=_NO_STORE)
+    response = RedirectResponse(start.authorization_url, status_code=302, headers=_NO_STORE)
+    _set_login_cookie(response, context.settings.api, binding)
+    return response
 
 
 @router.get("/auth/callback", status_code=302, response_class=RedirectResponse, **public_route())
@@ -103,15 +186,19 @@ async def callback(
     state: Annotated[str | None, Query(max_length=512)] = None,
     error: Annotated[str | None, Query(max_length=256)] = None,
 ) -> Response:
-    """Finish the flow: code to ID token to session."""
+    """Finish the flow: cookie to attempt, code to ID token to session."""
     context = context_of(request)
     _login_limited(request)
     if error is not None or not code or not state:
-        raise _login_failed(request, "state", "provider returned an error or no code")
+        raise await _login_failed(request, "state", "provider returned an error or no code")
     attempt = await run_in_threadpool(context.ports.login_attempts.pop, _state_hash(state))
     now = context.clock()
     if attempt is None or attempt.expires_at <= now or attempt.tenant_id != context.tenant_id:
-        raise _login_failed(request, "state", "unknown or expired state")
+        raise await _login_failed(request, "state", "unknown or expired state")
+    if not _binding_matches(request.cookies.get(LOGIN_COOKIE_NAME), attempt.binding_hash):
+        raise await _login_failed(
+            request, "state", "login cookie missing or from another login attempt"
+        )
     try:
         identity = await run_in_threadpool(
             context.oidc.finish, code, attempt.code_verifier, attempt.nonce
@@ -121,7 +208,7 @@ async def callback(
             raise Problem(
                 503, "login unavailable", "the identity provider is not configured"
             ) from exc
-        raise _login_failed(request, exc.kind, exc.detail) from exc
+        raise await _login_failed(request, exc.kind, exc.detail) from exc
     bindings = await run_in_threadpool(context.ports.role_bindings.list, context.tenant_id)
     roles = roles_for_groups(bindings, identity.groups)
     user = await run_in_threadpool(
@@ -160,6 +247,7 @@ async def callback(
     log.info("login", subject=identity.subject, roles=len(roles))
     response = RedirectResponse("/", status_code=302, headers=_NO_STORE)
     context.sessions.set_cookie(response, issued.cookie_value)
+    _clear_login_cookie(response, context.settings.api)
     return response
 
 

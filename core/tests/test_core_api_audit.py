@@ -17,7 +17,7 @@ from carto_core.api.app import API_PREFIX, create_app
 from carto_core.api.context import ApiContext
 from carto_core.api.memory_ports import InMemoryAuditLog, seeded_ports
 from carto_core.api.ports import ApiPorts
-from carto_core.audit import GENESIS_HASH, AuditEntry, chain_hash, verify_chain
+from carto_core.audit import ANONYMOUS_ACTOR, GENESIS_HASH, AuditEntry, chain_hash, verify_chain
 from carto_core.settings import SESSION_COOKIE_NAME, ApiSettings, CoreSettings
 from carto_schema.api import Role
 
@@ -157,3 +157,25 @@ def test_in_memory_log_chains_like_the_table_and_verifies() -> None:
     ]
     broken = verify_chain(tampered)
     assert broken is not None and broken.row_id == 1
+
+
+def test_in_memory_log_appends_on_any_transaction_like_the_table() -> None:
+    """The in-memory log has no connection; ``append_on`` is ``record`` so the ports' hook
+    (ADR 0070) runs against it in the unit tests."""
+    log = InMemoryAuditLog()
+    entry = AuditEntry(
+        at=NOW,
+        actor=ANONYMOUS_ACTOR,
+        action="auth.login_failed",
+        target="state",
+        before=None,
+        after=None,
+        reason="unknown or expired state",
+        request_id="r1",
+        ip="10.0.0.2",
+        user_agent="t",
+    )
+    row_hash = log.append_on(None, entry)
+    assert row_hash == chain_hash(GENESIS_HASH, log.entries()[0].content())
+    assert log.entries()[0].actor == "anonymous"
+    assert verify_chain(log.chain()) is None

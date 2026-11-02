@@ -11,15 +11,17 @@ identity stores of :mod:`carto_core.api.stores_postgres`:
   :class:`~carto_core.linker.review.ReviewService`, the one place a status changes, so the state
   machine, the ``key_link_decisions`` row and the ``If-Match`` check under the repository's own
   guard are the linker's, not a second copy. The review service's own audit recorder is a no-op
-  here on purpose: the route that called the port writes the audit row for every human decision
-  (:func:`carto_core.api.context.record_audit`, with the request id, the socket address and the
-  user agent the port never sees), and one decision must produce one row, not two. The
-  linker-side transitions (re-proposal, staleness, auto-accept) run in the worker with the real
-  recorder (:meth:`carto_core.linker.run.LinkPass.from_context`).
+  here on purpose: the route that called the port builds the audit row for every human decision
+  (:func:`carto_core.api.context.audit_entry`, with the request id, the client address and the
+  user agent the port never sees) and the adapter appends it on the decision's own connection
+  through :meth:`~carto_core.audit.TransactionalAuditRecorder.append_on`, inside the repository
+  transaction (ADR 0070), so one decision produces one row and never a decision without one.
+  The linker-side transitions (re-proposal, staleness, auto-accept) run in the worker with the
+  real recorder (:meth:`carto_core.linker.run.LinkPass.from_context`).
 - :class:`EntityPortAdapter`: families as the repository stores them; ``link_ids`` come from the
-  links assigned to the entity.
+  links assigned to the entity. Its patch appends the audit row the same way.
 - :class:`SystemPortAdapter`, :class:`SourcePortAdapter`, :class:`FieldPortAdapter`: the inventory
-  (ADR 0050) from the metadata store.
+  (ADR 0050) from the metadata store; the system rename appends the audit row the same way.
 
 ``systems`` and ``entities`` have no version column, so their ETag version is
 :func:`carto_core.metadata.updated_at_version` of ``updated_at`` (whole milliseconds since the
@@ -43,6 +45,7 @@ from typing import TYPE_CHECKING, Any, Final
 from carto_common.logging import get_logger
 from carto_core.api.ports import (
     MAX_CURSOR_LEN,
+    AuditEntryFor,
     DecisionError,
     DecisionErrorKind,
     EntityFieldRecord,
@@ -59,6 +62,7 @@ from carto_core.api.ports import (
     SystemPort,
     SystemRecord,
 )
+from carto_core.audit_postgres import PostgresAuditLog
 from carto_core.linker.repository import (
     EntityRepository,
     LinkRepository,
@@ -80,12 +84,13 @@ from carto_core.metadata import (
 from carto_schema.api import MAX_SENTENCE_LEN, LinkStatus, RejectReason
 
 if TYPE_CHECKING:
-    from sqlalchemy import Engine
+    from sqlalchemy import Connection, Engine
 
-    from carto_core.audit import AuditEntry
+    from carto_core.audit import AuditEntry, TransactionalAuditRecorder, TransactionHook
     from carto_core.linker.model import KeyLink
     from carto_core.linker.repository import Entity
     from carto_core.metadata import FieldRecord as MetadataField
+    from carto_core.metadata import SystemRecord as MetadataSystem
     from carto_core.settings import CoreSettings, LinkerSettings
     from carto_core.store.model import FieldForm
 
@@ -220,18 +225,20 @@ class _Lookup:
 class LinkPortAdapter:
     """``LinkPort`` over ``LinkRepository`` and ``ReviewService`` (module docstring)."""
 
-    __slots__ = ("_at", "_clock", "_links", "_metadata", "_review")
+    __slots__ = ("_at", "_audit", "_clock", "_links", "_metadata", "_review")
 
     def __init__(
         self,
         links: LinkRepository,
         metadata: MetadataStore,
         settings: LinkerSettings,
+        audit: TransactionalAuditRecorder,
         *,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._links = links
         self._metadata = metadata
+        self._audit = audit
         self._clock = clock if clock is not None else _utc_now
         self._at = _AtClock(self._clock)
         self._review = ReviewService(links, _RouteAudits(), settings, clock=self._at)
@@ -265,19 +272,22 @@ class LinkPortAdapter:
         reason: RejectReason | None,
         note: str,
         at: datetime,
+        audit: AuditEntryFor[LinkRecord] | None = None,
     ) -> LinkRecord:
         del reason
         return self._decide(
             tenant_id,
             at,
-            lambda: self._review.accept(
+            lambda on_write: self._review.accept(
                 tenant_id,
                 link_id,
                 actor=actor,
                 expected_version=expected_version,
                 note=note or None,
                 context=RequestContext(),
+                on_write=on_write,
             ),
+            audit,
         )
 
     def reject(
@@ -290,11 +300,12 @@ class LinkPortAdapter:
         reason: RejectReason | None,
         note: str,
         at: datetime,
+        audit: AuditEntryFor[LinkRecord] | None = None,
     ) -> LinkRecord:
         return self._decide(
             tenant_id,
             at,
-            lambda: self._review.reject(
+            lambda on_write: self._review.reject(
                 tenant_id,
                 link_id,
                 actor=actor,
@@ -302,7 +313,9 @@ class LinkPortAdapter:
                 reason=reason,
                 note=note or None,
                 context=RequestContext(),
+                on_write=on_write,
             ),
+            audit,
         )
 
     def mark_association(
@@ -315,19 +328,22 @@ class LinkPortAdapter:
         reason: RejectReason | None,
         note: str,
         at: datetime,
+        audit: AuditEntryFor[LinkRecord] | None = None,
     ) -> LinkRecord:
         del reason
         return self._decide(
             tenant_id,
             at,
-            lambda: self._review.mark_association(
+            lambda on_write: self._review.mark_association(
                 tenant_id,
                 link_id,
                 actor=actor,
                 expected_version=expected_version,
                 note=note or None,
                 context=RequestContext(),
+                on_write=on_write,
             ),
+            audit,
         )
 
     def ping(self) -> bool:
@@ -335,15 +351,29 @@ class LinkPortAdapter:
 
     # -----------------------------------------------------------------------------------------
 
-    def _decide(self, tenant_id: str, at: datetime, action: Callable[[], KeyLink]) -> LinkRecord:
+    def _decide(
+        self,
+        tenant_id: str,
+        at: datetime,
+        action: Callable[[TransactionHook[KeyLink] | None], KeyLink],
+        audit: AuditEntryFor[LinkRecord] | None,
+    ) -> LinkRecord:
+        lookup = _Lookup(self._metadata, tenant_id)
+        on_write: TransactionHook[KeyLink] | None = None
+        if audit is not None:
+            entry_for = audit
+
+            def on_write(connection: Connection | None, stored: KeyLink) -> None:
+                self._audit.append_on(connection, entry_for(self._record(stored, lookup)))
+
         self._at.set(at)
         try:
-            stored = action()
+            stored = action(on_write)
         except ReviewDecisionError as exc:
             raise DecisionError(_DECISION_KINDS[exc.kind]) from None
         finally:
             self._at.set(None)
-        return self._record(stored, _Lookup(self._metadata, tenant_id))
+        return self._record(stored, lookup)
 
     def _record(self, link: KeyLink, lookup: _Lookup) -> LinkRecord:
         extra = link.extra
@@ -413,11 +443,14 @@ class EntityPortAdapter:
     write itself is not guarded by the version (``set_name`` takes none).
     """
 
-    __slots__ = ("_entities", "_links")
+    __slots__ = ("_audit", "_entities", "_links")
 
-    def __init__(self, entities: EntityRepository, links: LinkRepository) -> None:
+    def __init__(
+        self, entities: EntityRepository, links: LinkRepository, audit: TransactionalAuditRecorder
+    ) -> None:
         self._entities = entities
         self._links = links
+        self._audit = audit
 
     def list(self, tenant_id: str, cursor: str | None, limit: int) -> PortPage[EntityRecord]:
         entities = self._entities.list_entities(tenant_id)
@@ -445,6 +478,7 @@ class EntityPortAdapter:
         expected_version: int,
         actor: str,
         at: datetime,
+        audit: AuditEntryFor[EntityRecord] | None = None,
     ) -> EntityRecord:
         del actor  # the route audits the actor; the row keeps no reviewer column (spec 9.6)
         current = self._entities.get(tenant_id, entity_id)
@@ -452,6 +486,14 @@ class EntityPortAdapter:
             raise DecisionError("not_found")
         if updated_at_version(current.updated_at) != expected_version:
             raise DecisionError("stale_version")
+        link_ids = self._assigned(tenant_id).get(entity_id, ())
+        on_write: TransactionHook[Entity] | None = None
+        if audit is not None:
+            entry_for = audit
+
+            def on_write(connection: Connection | None, stored: Entity) -> None:
+                self._audit.append_on(connection, entry_for(_entity_record(stored, link_ids)))
+
         try:
             stored = self._entities.set_name(
                 tenant_id,
@@ -459,10 +501,11 @@ class EntityPortAdapter:
                 name=name if name is not None else (current.display_name or ""),
                 description=description if description is not None else current.description,
                 now=at,
+                on_write=on_write,
             )
         except NotFoundError:
             raise DecisionError("not_found") from None
-        return _entity_record(stored, self._assigned(tenant_id).get(entity_id, ()))
+        return _entity_record(stored, link_ids)
 
     def ping(self) -> bool:
         return self._entities.ping()
@@ -504,10 +547,11 @@ class SystemPortAdapter:
     """``SystemPort`` over ``MetadataStore.list_systems`` and ``rename_system``; the version is
     :func:`updated_at_version` of the row, checked by the store inside the update."""
 
-    __slots__ = ("_metadata",)
+    __slots__ = ("_audit", "_metadata")
 
-    def __init__(self, metadata: MetadataStore) -> None:
+    def __init__(self, metadata: MetadataStore, audit: TransactionalAuditRecorder) -> None:
         self._metadata = metadata
+        self._audit = audit
 
     def list(self, tenant_id: str, cursor: str | None, limit: int) -> PortPage[SystemRecord]:
         counts = self._source_counts(tenant_id)
@@ -536,8 +580,17 @@ class SystemPortAdapter:
         expected_version: int,
         actor: str,
         at: datetime,
+        audit: AuditEntryFor[SystemRecord] | None = None,
     ) -> SystemRecord:
         del actor  # the route audits the actor
+        source_count = self._source_counts(tenant_id).get(system_id, 0)
+        on_write: TransactionHook[MetadataSystem] | None = None
+        if audit is not None:
+            entry_for = audit
+
+            def on_write(connection: Connection | None, stored: MetadataSystem) -> None:
+                self._audit.append_on(connection, entry_for(_system_record(stored, source_count)))
+
         try:
             stored = self._metadata.rename_system(
                 tenant_id,
@@ -546,12 +599,13 @@ class SystemPortAdapter:
                 description=description,
                 expected_version=expected_version,
                 now=at,
+                on_write=on_write,
             )
         except MetadataNotFoundError:
             raise DecisionError("not_found") from None
         except MetadataStaleError:
             raise DecisionError("stale_version") from None
-        return _system_record(stored, self._source_counts(tenant_id).get(system_id, 0))
+        return _system_record(stored, source_count)
 
     def ping(self) -> bool:
         return self._metadata.ping()
@@ -694,14 +748,16 @@ def assemble_data_ports(
     entities: EntityRepository,
     metadata: MetadataStore,
     settings: LinkerSettings,
+    audit: TransactionalAuditRecorder,
     clock: Callable[[], datetime] | None = None,
 ) -> DataPorts:
-    """The adapters over any implementations of the three stores (tests pass the in-memory
-    ones; :func:`build_data_ports` the PostgreSQL ones)."""
+    """The adapters over any implementations of the three stores and the audit log the
+    mutating ports append to inside their transactions (tests pass the in-memory ones;
+    :func:`build_data_ports` the PostgreSQL ones)."""
     return DataPorts(
-        links=LinkPortAdapter(links, metadata, settings, clock=clock),
-        entities=EntityPortAdapter(entities, links),
-        systems=SystemPortAdapter(metadata),
+        links=LinkPortAdapter(links, metadata, settings, audit, clock=clock),
+        entities=EntityPortAdapter(entities, links, audit),
+        systems=SystemPortAdapter(metadata, audit),
         sources=SourcePortAdapter(metadata),
         fields=FieldPortAdapter(metadata),
     )
@@ -711,11 +767,12 @@ def build_data_ports(
     engine: Engine, settings: CoreSettings, *, clock: Callable[[], datetime] | None = None
 ) -> DataPorts:
     """The production ports of ``carto-core api``: every store on the one PostgreSQL engine the
-    identity stores use (migration 0004)."""
+    identity stores use (migration 0004), the audit log included."""
     return assemble_data_ports(
         links=PostgresLinkRepository(engine),
         entities=PostgresEntityRepository(engine),
         metadata=PostgresMetadataStore(engine),
         settings=settings.linker,
+        audit=PostgresAuditLog(engine),
         clock=clock,
     )

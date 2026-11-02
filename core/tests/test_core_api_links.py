@@ -25,6 +25,8 @@ from carto_core.api.memory_ports import (
 )
 from carto_core.api.ports import ApiPorts, DecisionError
 from carto_core.api.routes_links import DECISION_STATUS, decision_problem
+from carto_core.audit import AuditEntry
+from carto_core.audit_postgres import AuditStoreError
 from carto_core.settings import SESSION_COOKIE_NAME, ApiSettings, CoreSettings
 from carto_schema.api import EvidenceView, LinkStatus, RejectReason, Role
 
@@ -199,6 +201,39 @@ def test_a_decision_writes_one_audit_row_with_metadata_only() -> None:
     assert entry.user_agent is not None
     assert entry.at == NOW
     assert world.context.metrics.get("carto_api_audit_rows_total") == 1
+
+
+class FailingAuditLog(InMemoryAuditLog):
+    """An audit store whose append fails (lock timeout, pool exhausted)."""
+
+    def record(self, entry: AuditEntry) -> str:
+        del entry
+        raise AuditStoreError("audit append failed: OperationalError")
+
+
+def test_a_failing_audit_append_rolls_the_decision_back() -> None:
+    """Spec 2.3 invariant 6: no decision without its row. The state change and the audit
+    append are one transaction, so the link keeps its status and version and the answer is
+    a 500 (ADR 0070)."""
+    settings = CoreSettings(_env_file=None, api=ApiSettings(insecure_http=True))
+    ports = seeded_ports(audit=FailingAuditLog())
+    app = create_app(settings, ports, clock=lambda: NOW)
+    world = World(
+        TestClient(app, base_url="https://testserver", raise_server_exceptions=False), app, ports
+    )
+    headers = world.login(Role.INTEGRATION_ENGINEER)
+    response = world.client.post(
+        f"{LINKS}/lnk_01/accept", json={}, headers={**headers, "If-Match": 'W/"1"'}
+    )
+    assert response.status_code == 500, response.text
+    assert "OperationalError" not in response.text
+    link = world.links.get("default", "lnk_01")
+    assert link is not None
+    assert link.status is LinkStatus.PROPOSED and link.version == 1
+    assert world.links.decisions == []
+    assert world.audit.entries() == []
+    assert world.context.metrics.get("carto_api_audit_rows_total") == 0
+    assert world.context.metrics.get("carto_api_decisions_total") == 0
 
 
 def test_reject_needs_a_reason_and_is_final() -> None:

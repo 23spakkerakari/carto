@@ -4,8 +4,9 @@ Everything here is what the edge reported or the profiler computed; the console 
 text (spec 13), and connector configuration arrives without secrets (``secret_ref`` is a name).
 The one write is ``PATCH /systems/{id}`` (name and description), which spec 14.2 files under
 "name entities and nodes", so it is ``review_links``; ``manage_sources`` stays for the
-control plane of M6. Fields are addressed by their ``field_ref`` (``system/template/path``), so
-the path parameter takes slashes.
+control plane of M6. Its audit row is appended in the transaction of the rename (ADR 0070).
+Fields are addressed by their ``field_ref`` (``system/template/path``), so the path parameter
+takes slashes.
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ from starlette.concurrency import run_in_threadpool
 
 from carto_common.logging import get_logger
 from carto_core.api.auth import Principal
-from carto_core.api.context import ApiContext, context_of, record_audit
+from carto_core.api.context import ApiContext, audit_entry, context_of
 from carto_core.api.etag import etag_of, require_if_match
 from carto_core.api.ports import (
     MAX_CURSOR_LEN,
@@ -29,6 +30,7 @@ from carto_core.api.ports import (
 from carto_core.api.problems import Problem
 from carto_core.api.routes_links import decision_problem
 from carto_core.api.sessions import Guard
+from carto_core.audit import AuditEntry
 from carto_core.ingest.health import SourceHealthRecord
 from carto_schema.api import (
     MAX_PAGE_SIZE,
@@ -176,6 +178,19 @@ async def patch_system(
     current = await _load_system(context, system_id)
     expected = require_if_match(request, current.version)
     at = context.clock()
+    before = _system_audit(current)
+
+    def entry_for(stored: SystemRecord) -> AuditEntry:
+        return audit_entry(
+            context,
+            request,
+            principal,
+            action="system.patch",
+            target=f"system:{system_id}",
+            before=before,
+            after=_system_audit(stored),
+        )
+
     try:
         updated = await run_in_threadpool(
             lambda: context.ports.systems.patch(
@@ -186,20 +201,13 @@ async def patch_system(
                 expected_version=expected,
                 actor=principal.subject,
                 at=at,
+                audit=entry_for,
             )
         )
     except DecisionError as exc:
         raise decision_problem(exc) from None
     context.metrics.inc("carto_api_decisions_total")
-    await record_audit(
-        context,
-        request,
-        principal,
-        action="system.patch",
-        target=f"system:{system_id}",
-        before=_system_audit(current),
-        after=_system_audit(updated),
-    )
+    context.metrics.inc("carto_api_audit_rows_total")
     log.info("system patched", system_id=system_id, subject=principal.subject)
     response.headers["ETag"] = etag_of(updated.version)
     return system_view(updated)

@@ -39,6 +39,8 @@ from carto_core.api.memory_ports import (
 )
 from carto_core.api.ports import MAX_CURSOR_LEN, ApiPorts, DecisionError
 from carto_core.api.server import build_ports, data_ports
+from carto_core.audit import AuditEntry
+from carto_core.audit_postgres import AuditStoreError, PostgresAuditLog
 from carto_core.ingest.health import SourceHealthRecord
 from carto_core.linker.families import FamilyBuilder
 from carto_core.linker.model import Direction, LinkRole, LinkStatus, LinkType, PairFeatures
@@ -244,7 +246,12 @@ def world() -> World:
         now=NOW - timedelta(minutes=30),
     )
     data = assemble_data_ports(
-        links=links, entities=entities, metadata=metadata, settings=settings.linker, clock=clock
+        links=links,
+        entities=entities,
+        metadata=metadata,
+        settings=settings.linker,
+        audit=audit,
+        clock=clock,
     )
     ports = ApiPorts(
         links=data.links,
@@ -389,6 +396,110 @@ def test_the_port_itself_refuses_a_version_the_header_let_through() -> None:
             TENANT, EXACT_ID, actor="x", expected_version=1, reason=None, note="", at=NOW
         )
     assert reason.value.kind == "reason_required"
+
+
+class FailingAuditLog(InMemoryAuditLog):
+    def record(self, entry: AuditEntry) -> str:
+        del entry
+        raise AuditStoreError("audit append failed: OperationalError")
+
+
+def _entry(action: str, target: str) -> AuditEntry:
+    return AuditEntry(
+        at=NOW,
+        actor="alice",
+        action=action,
+        target=target,
+        before=None,
+        after=None,
+        reason="",
+        request_id="req-1",
+        ip="10.0.0.2",
+        user_agent="pytest",
+        tenant_id=TENANT,
+    )
+
+
+def test_the_adapters_run_the_audit_append_inside_the_state_change() -> None:
+    """ADR 0070: the port calls the route's entry builder with the stored record inside the
+    repository's transaction and appends it there; the happy path writes one row carrying the
+    record after the change, and a failing append leaves every store untouched."""
+    w = world()
+    seen: list[object] = []
+
+    def entry_for(updated: object) -> AuditEntry:
+        seen.append(updated)
+        return _entry("link.accept", f"link:{EXACT_ID}")
+
+    accepted = w.data.links.accept(
+        TENANT,
+        EXACT_ID,
+        actor="alice",
+        expected_version=1,
+        reason=None,
+        note="",
+        at=NOW,
+        audit=entry_for,
+    )
+    assert accepted.version == 2 and seen and seen[0] == accepted
+    assert [(e.action, e.ip) for e in w.audit.entries(TENANT)] == [("link.accept", "10.0.0.2")]
+
+    settings = CoreSettings(_env_file=None, api=ApiSettings(insecure_http=True))
+    failing = assemble_data_ports(
+        links=w.links,
+        entities=w.entities,
+        metadata=w.metadata,
+        settings=settings.linker,
+        audit=FailingAuditLog(),
+        clock=w.clock,
+    )
+    with pytest.raises(AuditStoreError):
+        failing.links.reject(
+            TENANT,
+            EXACT_ID,
+            actor="alice",
+            expected_version=2,
+            reason=RejectReason.COINCIDENCE,
+            note="",
+            at=NOW,
+            audit=lambda _updated: _entry("link.reject", f"link:{EXACT_ID}"),
+        )
+    stored = w.links.get(TENANT, EXACT_ID)
+    assert stored is not None and stored.status == LinkStatus.ACCEPTED and stored.version == 2
+    assert len(w.links.decisions(TENANT, EXACT_ID)) == 1, "no decision row either"
+
+    system = next(s for s in w.metadata.list_systems(TENANT) if s.id == "sys_a")
+    with pytest.raises(AuditStoreError):
+        failing.systems.patch(
+            TENANT,
+            "sys_a",
+            name="Shop",
+            description=None,
+            expected_version=updated_at_version(system.updated_at),
+            actor="alice",
+            at=NOW,
+            audit=lambda _updated: _entry("system.patch", "system:sys_a"),
+        )
+    assert next(s for s in w.metadata.list_systems(TENANT) if s.id == "sys_a").name == (
+        "Order system"
+    )
+
+    FamilyBuilder(w.links, w.entities, namer=lambda _m: "Order").rebuild(TENANT, now=NOW)
+    [entity] = w.entities.list_entities(TENANT)
+    with pytest.raises(AuditStoreError):
+        failing.entities.patch(
+            TENANT,
+            entity.id,
+            name="Customer order",
+            description=None,
+            expected_version=updated_at_version(entity.updated_at),
+            actor="alice",
+            at=NOW,
+            audit=lambda _updated: _entry("entity.patch", f"entity:{entity.id}"),
+        )
+    unchanged = w.entities.get(TENANT, entity.id)
+    assert unchanged is not None and not unchanged.name_confirmed
+    assert [e.action for e in w.audit.entries(TENANT)] == ["link.accept"]
 
 
 def test_reject_needs_a_reason_and_association_changes_the_role() -> None:
@@ -714,6 +825,50 @@ def test_the_postgres_ports_serve_one_request_per_port(
     assert audit_rows["items"][0]["action"] == "link.accept"
     assert audit_rows["items"][0]["target"] == f"link:{EXACT_ID}"
     assert len(audit_rows["items"]) == 1, "the route writes the one row"
+
+    # ADR 0070: the audit append runs on the decision's connection; when it fails the UPDATE
+    # and the decision row roll back with it.
+    class FailingPostgresAudit(PostgresAuditLog):
+        def append_on(self, connection: sqlalchemy.Connection | None, entry: AuditEntry) -> str:
+            super().append_on(connection, entry)
+            raise AuditStoreError("audit append failed: OperationalError")
+
+    failing = assemble_data_ports(
+        links=links,
+        entities=entities,
+        metadata=metadata,
+        settings=settings.linker,
+        audit=FailingPostgresAudit(engine),
+        clock=clock,
+    )
+    with pytest.raises(AuditStoreError):
+        failing.links.reject(
+            TENANT,
+            EXACT_ID,
+            actor="alice",
+            expected_version=2,
+            reason=RejectReason.COINCIDENCE,
+            note="",
+            at=clock.tick(minutes=1),
+            audit=lambda _updated: AuditEntry(
+                at=clock(),
+                actor="alice",
+                action="link.reject",
+                target=f"link:{EXACT_ID}",
+                before=None,
+                after=None,
+                reason="",
+                request_id=None,
+                ip=None,
+                user_agent=None,
+                tenant_id=TENANT,
+            ),
+        )
+    unchanged = links.get(TENANT, EXACT_ID)
+    assert unchanged is not None and unchanged.version == 2
+    assert unchanged.status == LinkStatus.ACCEPTED
+    assert len(links.decisions(TENANT, EXACT_ID)) == 1
+    assert len(client.get(f"{API_PREFIX}/audit").json()["items"]) == 1, "the row rolled back"
 
     FamilyBuilder(links, entities, namer=lambda _m: "Order").rebuild(
         TENANT, now=clock.tick(minutes=1)

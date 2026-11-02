@@ -5,10 +5,12 @@ package A: ``sessions``, ``users``, ``groups``, ``role_bindings``).
 roles and the reveal grant in ``roles_json`` (``{"roles": [...], "reveal": bool}``). Pending
 logins share the table so a login survives a restart between ``/auth/login`` and the callback
 without a table of their own: a pending row has an empty ``subject``, the PKCE verifier in
-``csrf_token``, ``{"pending": true, "nonce": ...}`` in ``roles_json`` and the ten-minute
-deadline in ``expires_at``; the session resolver refuses rows with an empty subject, and
-:meth:`PostgresSessionStore.pop` deletes the row as it reads it so a state is usable once.
-Expired rows of both kinds are swept opportunistically on every create.
+``csrf_token``, ``{"pending": true, "nonce": ..., "binding": <sha256 of the login cookie>}``
+in ``roles_json`` (ADR 0070) and the ten-minute deadline in ``expires_at``; the session
+resolver refuses rows with an empty subject, and :meth:`PostgresSessionStore.pop` deletes the
+row as it reads it so a state is usable once (a pending row without a binding, from before
+ADR 0070, pops as ``None`` and the login starts over). Expired rows of both kinds are swept
+opportunistically on every create.
 
 SQLAlchemy Core text with bound parameters only (spec 14.7). Errors surface as
 :class:`StoreError` with the exception type, never a statement or a value.
@@ -136,7 +138,9 @@ class PostgresSessionStore:
             raise _fail("session delete", exc) from exc
 
     def put(self, attempt: LoginAttempt) -> None:
-        roles_json = json.dumps({"pending": True, "nonce": attempt.nonce})
+        roles_json = json.dumps(
+            {"pending": True, "nonce": attempt.nonce, "binding": attempt.binding_hash}
+        )
         try:
             with self._engine.begin() as connection:
                 connection.execute(
@@ -171,7 +175,8 @@ class PostgresSessionStore:
         if not isinstance(data, dict) or not data.get("pending"):
             return None
         nonce = data.get("nonce")
-        if not isinstance(nonce, str):
+        binding = data.get("binding")
+        if not isinstance(nonce, str) or not isinstance(binding, str) or not binding:
             return None
         return LoginAttempt(
             state_hash=row.id,
@@ -180,6 +185,7 @@ class PostgresSessionStore:
             nonce=nonce,
             created_at=row.authenticated_at,
             expires_at=row.expires_at,
+            binding_hash=binding,
         )
 
     def ping(self) -> bool:

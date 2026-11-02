@@ -11,6 +11,10 @@ accepted, rejected or marked as an association; ``accepted`` may be rejected or 
 ``rejected`` is final until the linker re-proposes it (score up by more than 0.2), which is
 the linker's job, not the API's. Every decision bumps ``version`` and sets ``decided_by`` and
 ``decided_at``.
+
+The mutating ports take the route's ``audit`` builder (:data:`~carto_core.api.ports.AuditEntryFor`)
+and append its row under their own lock before the record lands, so a failing append leaves
+the record as it was: the in-memory shape of the one-transaction rule of ADR 0070.
 """
 
 from __future__ import annotations
@@ -19,10 +23,11 @@ import threading
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from carto_core.api.ports import (
     ApiPorts,
+    AuditEntryFor,
     AuditRow,
     DecisionError,
     EntityFieldRecord,
@@ -38,9 +43,12 @@ from carto_core.api.ports import (
     SystemRecord,
     UserRecord,
 )
-from carto_core.audit import GENESIS_HASH, AuditEntry, chain_hash, scrub
+from carto_core.audit import GENESIS_HASH, AuditEntry, AuditRecorder, chain_hash, scrub
 from carto_core.ingest.health import SourceHealthRecord
 from carto_schema.api import Direction, LinkRole, LinkStatus, LinkType, RejectReason, Role
+
+if TYPE_CHECKING:
+    from sqlalchemy import Connection
 
 __all__ = [
     "InMemoryAuditLog",
@@ -79,10 +87,24 @@ def _page[T](ordered: Sequence[T], key: Any, cursor: str | None, limit: int) -> 
     return PortPage(items, key(items[-1]) if items and more else None)
 
 
+def _append[T](audit: AuditEntryFor[T] | None, recorder: AuditRecorder | None, stored: T) -> None:
+    """The in-memory ports' transaction hook: build the row from the stored record and append
+    it before the record lands (module docstring)."""
+    if audit is None:
+        return
+    if recorder is None:
+        msg = "this port was built without an audit recorder"
+        raise RuntimeError(msg)
+    recorder.record(audit(stored))
+
+
 class InMemoryLinkPort:
-    def __init__(self, links: Iterable[LinkRecord] = ()) -> None:
+    def __init__(
+        self, links: Iterable[LinkRecord] = (), *, audit: AuditRecorder | None = None
+    ) -> None:
         self._lock = threading.Lock()
         self._links: dict[tuple[str, str], LinkRecord] = {}
+        self._audit = audit
         self.decisions: list[tuple[str, str, str, int]] = []
         """``(link_id, action, actor, version)`` per decision, like ``key_link_decisions``."""
         self.ready = True
@@ -121,6 +143,7 @@ class InMemoryLinkPort:
         expected_version: int,
         reason: RejectReason | None,
         at: datetime,
+        audit: AuditEntryFor[LinkRecord] | None,
     ) -> LinkRecord:
         with self._lock:
             current = self._links.get((tenant_id, link_id))
@@ -142,6 +165,7 @@ class InMemoryLinkPort:
                 updated_at=at,
                 version=current.version + 1,
             )
+            _append(audit, self._audit, updated)
             self._links[(tenant_id, link_id)] = updated
             self.decisions.append((link_id, action, actor, updated.version))
             return updated
@@ -156,6 +180,7 @@ class InMemoryLinkPort:
         reason: RejectReason | None,
         note: str,
         at: datetime,
+        audit: AuditEntryFor[LinkRecord] | None = None,
     ) -> LinkRecord:
         del note
         return self._decide(
@@ -168,6 +193,7 @@ class InMemoryLinkPort:
             expected_version=expected_version,
             reason=reason,
             at=at,
+            audit=audit,
         )
 
     def reject(
@@ -180,6 +206,7 @@ class InMemoryLinkPort:
         reason: RejectReason | None,
         note: str,
         at: datetime,
+        audit: AuditEntryFor[LinkRecord] | None = None,
     ) -> LinkRecord:
         del note
         return self._decide(
@@ -192,6 +219,7 @@ class InMemoryLinkPort:
             expected_version=expected_version,
             reason=reason,
             at=at,
+            audit=audit,
         )
 
     def mark_association(
@@ -204,6 +232,7 @@ class InMemoryLinkPort:
         reason: RejectReason | None,
         note: str,
         at: datetime,
+        audit: AuditEntryFor[LinkRecord] | None = None,
     ) -> LinkRecord:
         del note
         return self._decide(
@@ -216,6 +245,7 @@ class InMemoryLinkPort:
             expected_version=expected_version,
             reason=reason,
             at=at,
+            audit=audit,
         )
 
     def ping(self) -> bool:
@@ -223,9 +253,12 @@ class InMemoryLinkPort:
 
 
 class InMemoryEntityPort:
-    def __init__(self, entities: Iterable[EntityRecord] = ()) -> None:
+    def __init__(
+        self, entities: Iterable[EntityRecord] = (), *, audit: AuditRecorder | None = None
+    ) -> None:
         self._lock = threading.Lock()
         self._rows: dict[tuple[str, str], EntityRecord] = {}
+        self._audit = audit
         self.ready = True
         for entity in entities:
             self.put("default", entity)
@@ -256,6 +289,7 @@ class InMemoryEntityPort:
         expected_version: int,
         actor: str,
         at: datetime,
+        audit: AuditEntryFor[EntityRecord] | None = None,
     ) -> EntityRecord:
         del actor
         with self._lock:
@@ -272,6 +306,7 @@ class InMemoryEntityPort:
                 version=current.version + 1,
                 updated_at=at,
             )
+            _append(audit, self._audit, updated)
             self._rows[(tenant_id, entity_id)] = updated
             return updated
 
@@ -280,9 +315,12 @@ class InMemoryEntityPort:
 
 
 class InMemorySystemPort:
-    def __init__(self, systems: Iterable[SystemRecord] = ()) -> None:
+    def __init__(
+        self, systems: Iterable[SystemRecord] = (), *, audit: AuditRecorder | None = None
+    ) -> None:
         self._lock = threading.Lock()
         self._rows: dict[tuple[str, str], SystemRecord] = {}
+        self._audit = audit
         self.ready = True
         for system in systems:
             self.put("default", system)
@@ -313,6 +351,7 @@ class InMemorySystemPort:
         expected_version: int,
         actor: str,
         at: datetime,
+        audit: AuditEntryFor[SystemRecord] | None = None,
     ) -> SystemRecord:
         del actor
         with self._lock:
@@ -328,6 +367,7 @@ class InMemorySystemPort:
                 version=current.version + 1,
                 updated_at=at,
             )
+            _append(audit, self._audit, updated)
             self._rows[(tenant_id, system_id)] = updated
             return updated
 
@@ -418,6 +458,11 @@ class InMemoryAuditLog:
             row_hash = chain_hash(prev, clean.content())
             self.rows.append((len(self.rows) + 1, clean, prev, row_hash))
         return row_hash
+
+    def append_on(self, connection: Connection | None, entry: AuditEntry) -> str:
+        """No connection to share in memory: the same as :meth:`record` (ADR 0070)."""
+        del connection
+        return self.record(entry)
 
     def _latest(self, tenant_id: str) -> str:
         for _id, entry, _prev, row_hash in reversed(self.rows):
@@ -511,6 +556,11 @@ class InMemoryLoginAttemptStore:
         with self._lock:
             return self._rows.pop(state_hash, None)
 
+    def rows(self) -> list[LoginAttempt]:
+        """Test hook: the pending attempts."""
+        with self._lock:
+            return list(self._rows.values())
+
     def __len__(self) -> int:
         with self._lock:
             return len(self._rows)
@@ -584,13 +634,15 @@ def memory_ports(
     sources: Iterable[SourceRecord] = (),
     fields: Iterable[FieldRecord] = (),
     bindings: Iterable[RoleBinding] = (),
+    audit: InMemoryAuditLog | None = None,
 ) -> ApiPorts:
-    """An :class:`ApiPorts` over fresh in-memory stores seeded for tenant ``default``."""
-    audit = InMemoryAuditLog()
+    """An :class:`ApiPorts` over fresh in-memory stores seeded for tenant ``default``; the
+    one audit log backs the recorder, the reader and the mutating ports' appends."""
+    audit = audit if audit is not None else InMemoryAuditLog()
     return ApiPorts(
-        links=InMemoryLinkPort(links),
-        entities=InMemoryEntityPort(entities),
-        systems=InMemorySystemPort(systems),
+        links=InMemoryLinkPort(links, audit=audit),
+        entities=InMemoryEntityPort(entities, audit=audit),
+        systems=InMemorySystemPort(systems, audit=audit),
         sources=InMemorySourcePort(sources),
         fields=InMemoryFieldPort(fields),
         audit=audit,
@@ -761,7 +813,9 @@ def example_field(field_id: str = "shop/t-order-created/order.id") -> FieldRecor
     )
 
 
-def seeded_ports(bindings: Iterable[RoleBinding] = ()) -> ApiPorts:
+def seeded_ports(
+    bindings: Iterable[RoleBinding] = (), *, audit: InMemoryAuditLog | None = None
+) -> ApiPorts:
     """One of everything (plus a second, lower-ranked link and a source without health)."""
     return memory_ports(
         links=[example_link(), example_link("lnk_02", score=0.6, affected_volume=100)],
@@ -770,4 +824,5 @@ def seeded_ports(bindings: Iterable[RoleBinding] = ()) -> ApiPorts:
         sources=[example_source(), example_source("wms_db", with_health=False)],
         fields=[example_field(), example_field("wms/t-pick/orderRef")],
         bindings=bindings,
+        audit=audit,
     )

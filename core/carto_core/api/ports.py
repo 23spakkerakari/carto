@@ -16,22 +16,29 @@ row moved (spec 12 "ETag/If-Match on mutable resources to prevent lost updates")
 
 Nothing in a record is a token or a raw value (spec 2.3 invariant 2): evidence is counts,
 shares and lags; fields carry shapes; sources carry configuration without secrets (ADR 0050).
+
+A mutation and its audit row are one transaction (spec 2.3 invariant 6; ADR 0070): the route
+passes an :data:`AuditEntryFor` callable that builds the :class:`~carto_core.audit.AuditEntry`
+from the stored record, and the port runs it inside the transaction of the state change and
+appends the entry on the same connection, so a failed append rolls the change back and the
+route answers a 500 with nothing changed.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Final, Literal, Protocol, runtime_checkable
 
-from carto_core.audit import AuditRecorder
+from carto_core.audit import AuditEntry, AuditRecorder
 from carto_core.ingest.health import SourceHealthRecord
 from carto_schema.api import Direction, LinkRole, LinkStatus, LinkType, RejectReason, Role
 
 __all__ = [
     "MAX_CURSOR_LEN",
     "ApiPorts",
+    "AuditEntryFor",
     "AuditPort",
     "AuditRow",
     "DecisionError",
@@ -63,6 +70,10 @@ MAX_CURSOR_LEN: Final = 256
 """``Page.next_cursor`` is bounded to this in the contract; a port never returns a longer one."""
 
 DecisionErrorKind = Literal["not_found", "stale_version", "invalid_transition", "reason_required"]
+
+type AuditEntryFor[T] = Callable[[T], AuditEntry]
+"""Builds the audit row of a mutation from the record as stored; the port appends it inside
+the transaction of the state change (module docstring)."""
 
 
 class DecisionError(Exception):
@@ -153,9 +164,11 @@ class LinkPort(Protocol):
         reason: RejectReason | None,
         note: str,
         at: datetime,
+        audit: AuditEntryFor[LinkRecord] | None = None,
     ) -> LinkRecord:
         """``proposed``, ``stale`` or ``auto_accepted`` to ``accepted``; appends a decision row
-        (``key_link_decisions``) and bumps ``version``. Raises :class:`DecisionError`."""
+        (``key_link_decisions``) and bumps ``version``. Raises :class:`DecisionError`. With
+        ``audit``, the row it builds is appended in the same transaction (ADR 0070)."""
         ...
 
     def reject(
@@ -168,6 +181,7 @@ class LinkPort(Protocol):
         reason: RejectReason | None,
         note: str,
         at: datetime,
+        audit: AuditEntryFor[LinkRecord] | None = None,
     ) -> LinkRecord:
         """To ``rejected``; ``reason`` is required (``reason_required`` otherwise)."""
         ...
@@ -182,6 +196,7 @@ class LinkPort(Protocol):
         reason: RejectReason | None,
         note: str,
         at: datetime,
+        audit: AuditEntryFor[LinkRecord] | None = None,
     ) -> LinkRecord:
         """Accept with ``role = association`` (spec 9.6 "Mark as association")."""
         ...
@@ -234,9 +249,11 @@ class EntityPort(Protocol):
         expected_version: int,
         actor: str,
         at: datetime,
+        audit: AuditEntryFor[EntityRecord] | None = None,
     ) -> EntityRecord:
         """Rename or describe; a new ``name`` sets ``name_confirmed`` (spec 9.6 naming).
-        Raises :class:`DecisionError` (``not_found``, ``stale_version``)."""
+        Raises :class:`DecisionError` (``not_found``, ``stale_version``). With ``audit``, the
+        row is appended in the same transaction (ADR 0070)."""
         ...
 
     def ping(self) -> bool: ...
@@ -277,7 +294,11 @@ class SystemPort(Protocol):
         expected_version: int,
         actor: str,
         at: datetime,
-    ) -> SystemRecord: ...
+        audit: AuditEntryFor[SystemRecord] | None = None,
+    ) -> SystemRecord:
+        """Rename or describe under ``If-Match``; with ``audit``, the row is appended in the
+        same transaction (ADR 0070)."""
+        ...
 
     def ping(self) -> bool: ...
 
@@ -419,7 +440,10 @@ class SessionStore(Protocol):
 @dataclass(frozen=True, slots=True)
 class LoginAttempt:
     """What ``GET /auth/login`` keeps server-side until the callback: the PKCE verifier, the
-    nonce and the state (spec 14.1, PKCE). Keyed by the SHA-256 of ``state``."""
+    nonce and the state (spec 14.1, PKCE). Keyed by the SHA-256 of ``state``. ``binding_hash``
+    is the SHA-256 of the ``__Host-carto_login`` cookie the same response set, so the callback
+    completes only in the browser that started the login (ADR 0070); the value itself is never
+    stored."""
 
     state_hash: str
     tenant_id: str
@@ -427,6 +451,7 @@ class LoginAttempt:
     nonce: str
     created_at: datetime
     expires_at: datetime
+    binding_hash: str
 
 
 @runtime_checkable
@@ -502,6 +527,8 @@ class ApiPorts:
     fields: FieldPort
     audit: AuditPort
     audit_recorder: AuditRecorder
+    """For rows outside a port transaction (login, logout, a refused login); the decision
+    ports append their own rows inside theirs (module docstring)."""
     sessions: SessionStore
     login_attempts: LoginAttemptStore
     users: UserStore

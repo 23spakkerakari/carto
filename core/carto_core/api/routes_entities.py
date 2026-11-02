@@ -2,7 +2,7 @@
 naming, 12). Naming is ``review_links`` (spec 14.2 "Review links, name entities and nodes").
 A patch carries ``If-Match``; a new name becomes the confirmed name (the heuristic or LLM
 suggestion stays in ``suggested_name`` until then, spec 9.9). Audited with name, confirmation
-flag and version only.
+flag and version only, in the transaction of the patch (ADR 0070).
 """
 
 from __future__ import annotations
@@ -14,12 +14,13 @@ from starlette.concurrency import run_in_threadpool
 
 from carto_common.logging import get_logger
 from carto_core.api.auth import Principal
-from carto_core.api.context import ApiContext, context_of, record_audit
+from carto_core.api.context import ApiContext, audit_entry, context_of
 from carto_core.api.etag import etag_of, require_if_match
 from carto_core.api.ports import MAX_CURSOR_LEN, DecisionError, EntityRecord
 from carto_core.api.problems import Problem
 from carto_core.api.routes_links import decision_problem
 from carto_core.api.sessions import Guard
+from carto_core.audit import AuditEntry
 from carto_schema.api import (
     MAX_PAGE_SIZE,
     EntityFieldView,
@@ -120,6 +121,19 @@ async def patch_entity(
     current = await _load(context, entity_id)
     expected = require_if_match(request, current.version)
     at = context.clock()
+    before = _audit_view(current)
+
+    def entry_for(stored: EntityRecord) -> AuditEntry:
+        return audit_entry(
+            context,
+            request,
+            principal,
+            action="entity.patch",
+            target=f"entity:{entity_id}",
+            before=before,
+            after=_audit_view(stored),
+        )
+
     try:
         updated = await run_in_threadpool(
             lambda: context.ports.entities.patch(
@@ -130,20 +144,13 @@ async def patch_entity(
                 expected_version=expected,
                 actor=principal.subject,
                 at=at,
+                audit=entry_for,
             )
         )
     except DecisionError as exc:
         raise decision_problem(exc) from None
     context.metrics.inc("carto_api_decisions_total")
-    await record_audit(
-        context,
-        request,
-        principal,
-        action="entity.patch",
-        target=f"entity:{entity_id}",
-        before=_audit_view(current),
-        after=_audit_view(updated),
-    )
+    context.metrics.inc("carto_api_audit_rows_total")
     log.info("entity patched", entity_id=entity_id, subject=principal.subject)
     response.headers["ETag"] = etag_of(updated.version)
     return entity_view(updated)

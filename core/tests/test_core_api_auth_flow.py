@@ -45,7 +45,9 @@ from carto_core.api.oidc import (
     build_backchannel_client,
 )
 from carto_core.api.ports import ApiPorts
+from carto_core.api.routes_auth import LOGIN_ATTEMPT_TTL, LOGIN_COOKIE_NAME
 from carto_core.api.sessions import hash_session_id
+from carto_core.audit import ANONYMOUS_ACTOR
 from carto_core.settings import (
     SESSION_COOKIE_NAME,
     ApiSettings,
@@ -386,7 +388,12 @@ def test_a_bad_id_token_is_refused(secret_file: Path, override: dict[str, Any], 
     assert step in body["detail"]
     assert "eyJ" not in response.text, "no token fragment in the problem"
     assert len(world.sessions) == 0
-    assert "set-cookie" not in response.headers
+    assert SESSION_COOKIE_NAME not in response.headers.get("set-cookie", "")
+    assert _cleared(response, LOGIN_COOKIE_NAME), "the login cookie is cleared on failure"
+    failed = world.audit.entries()[-1]
+    assert failed.action == "auth.login_failed" and failed.actor == ANONYMOUS_ACTOR
+    assert failed.target == step
+    assert "eyJ" not in failed.reason and "not-the-nonce" not in failed.reason
 
 
 def test_a_token_signed_by_another_key_is_refused(secret_file: Path) -> None:
@@ -413,6 +420,106 @@ def test_groups_without_a_binding_grant_no_role(secret_file: Path) -> None:
 def _issued_value(response: httpx.Response) -> str:
     cookie = response.headers["set-cookie"]
     return cookie.split(";", 1)[0].split("=", 1)[1]
+
+
+def _cookie_lines(response: httpx.Response, name: str) -> list[str]:
+    return [line for line in response.headers.get_list("set-cookie") if line.startswith(f"{name}=")]
+
+
+def _cleared(response: httpx.Response, name: str) -> bool:
+    """One ``Set-Cookie`` for ``name`` with an empty value and ``Max-Age=0``."""
+    lines = _cookie_lines(response, name)
+    if len(lines) != 1:
+        return False
+    head, _, rest = lines[0].partition(";")
+    return head.split("=", 1)[1].strip('"') == "" and "max-age=0" in rest.lower()
+
+
+# --- the login cookie binds the callback to the browser that started it (ADR 0070, M7) -------
+
+
+def test_login_sets_the_binding_cookie_and_the_attempt_keeps_only_its_hash(
+    secret_file: Path,
+) -> None:
+    world = _world(secret_file)
+    response = world.client.get(LOGIN)
+    assert response.status_code == 302
+    [line] = _cookie_lines(response, LOGIN_COOKIE_NAME)
+    lowered = line.lower()
+    assert "httponly" in lowered and "secure" in lowered and "samesite=lax" in lowered
+    assert "path=/" in lowered and "domain=" not in lowered
+    assert f"max-age={int(LOGIN_ATTEMPT_TTL.total_seconds())}" in lowered
+    value = world.client.cookies.get(LOGIN_COOKIE_NAME)
+    assert value and len(value) >= 32
+    attempts = world.ports.login_attempts
+    assert isinstance(attempts, InMemoryLoginAttemptStore)
+    [attempt] = attempts.rows()
+    assert attempt.binding_hash == hashlib.sha256(value.encode()).hexdigest()
+    assert value not in repr(attempt), "only the hash is stored"
+
+
+def test_callback_without_the_login_cookie_is_refused(secret_file: Path) -> None:
+    """Login CSRF: an attacker starts a login and hands the callback URL to a victim whose
+    browser never saw the login cookie."""
+    world = _world(secret_file)
+    query = world.start_login()
+    world.client.cookies.delete(LOGIN_COOKIE_NAME)
+    response = world.finish_login(query)
+    assert response.status_code == 400, response.text
+    assert "state" in response.json()["detail"]
+    assert len(world.sessions) == 0
+    assert world.provider.token_requests == [], "the code is never exchanged"
+    assert world.audit.entries()[-1].action == "auth.login_failed"
+    assert world.context.metrics.get("carto_api_login_failures_total") == 1
+
+
+def test_callback_with_another_attempts_cookie_is_refused(secret_file: Path) -> None:
+    world = _world(secret_file)
+    victim = world.start_login()
+    victim_cookie = world.client.cookies.get(LOGIN_COOKIE_NAME)
+    assert victim_cookie
+    world.client.cookies.clear()
+    attacker = world.start_login()
+    assert world.client.cookies.get(LOGIN_COOKIE_NAME) != victim_cookie
+    # The victim's browser (its own cookie) opens the attacker's callback URL.
+    world.client.cookies.set(LOGIN_COOKIE_NAME, victim_cookie)
+    response = world.finish_login(attacker)
+    assert response.status_code == 400
+    assert len(world.sessions) == 0
+    assert _cleared(response, LOGIN_COOKIE_NAME)
+    attempts = world.ports.login_attempts
+    assert isinstance(attempts, InMemoryLoginAttemptStore)
+    assert len(attempts) == 1, "the attacker's state was consumed; the victim's own waits"
+    # The victim's own flow still completes with its own cookie.
+    world.provider.nonce = victim["nonce"]
+    assert world.finish_login(victim).status_code == 302
+
+
+def test_callback_clears_the_login_cookie_and_sets_the_session(secret_file: Path) -> None:
+    world = _world(secret_file)
+    response = world.login()
+    assert response.status_code == 302, response.text
+    assert _cookie_lines(response, SESSION_COOKIE_NAME)
+    assert _cleared(response, LOGIN_COOKIE_NAME)
+    assert world.client.cookies.get(LOGIN_COOKIE_NAME) is None
+    assert world.client.get(ME).status_code == 200
+
+
+def test_a_failed_login_writes_an_anonymous_audit_row_without_claim_values(
+    secret_file: Path,
+) -> None:
+    world = _world(secret_file)
+    response = world.client.get(
+        CALLBACK, params={"code": "c-secret", "state": "s-secret"}, headers={"X-Request-Id": "r9"}
+    )
+    assert response.status_code == 400
+    [entry] = world.audit.entries()
+    assert entry.action == "auth.login_failed" and entry.actor == ANONYMOUS_ACTOR
+    assert entry.target == "state" and entry.reason == "unknown or expired state"
+    assert entry.request_id == "r9" and entry.ip == "testclient"
+    assert "c-secret" not in repr(entry) and "s-secret" not in repr(entry)
+    assert world.context.metrics.get("carto_api_login_failures_total") == 1
+    assert world.context.metrics.get("carto_api_audit_rows_total") == 1
 
 
 def test_login_issues_a_new_session_id_every_time(secret_file: Path) -> None:

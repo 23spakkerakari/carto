@@ -9,23 +9,36 @@ and ``carto-core audit verify`` use. The first row chains from :data:`GENESIS_HA
 from metadata (a link's status and score, an entity's name), and :func:`scrub` drops any key
 that names a secret or a token as a backstop. The application role has INSERT and SELECT only
 on ``audit_log`` and a trigger rejects UPDATE and DELETE (migration 0004).
+
+A human decision and its audit row commit together (spec 2.3 invariant 6; ADR 0070): the
+store that owns the state change takes a :data:`TransactionHook` and calls it with its open
+connection and the stored row, and the hook appends through
+:meth:`TransactionalAuditRecorder.append_on` on that connection, so a failed append rolls the
+decision back with it. Rows of actions nobody is signed in for (a refused login) carry
+:data:`ANONYMOUS_ACTOR`.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Final, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Final, Protocol, runtime_checkable
+
+if TYPE_CHECKING:
+    from sqlalchemy import Connection
 
 __all__ = [
+    "ANONYMOUS_ACTOR",
     "GENESIS_HASH",
     "SECRET_KEY_MARKERS",
     "AuditEntry",
     "AuditRecorder",
     "ChainBreak",
+    "TransactionHook",
+    "TransactionalAuditRecorder",
     "canonical_json",
     "chain_hash",
     "scrub",
@@ -33,6 +46,9 @@ __all__ = [
 ]
 
 GENESIS_HASH: Final = "0" * 64
+ANONYMOUS_ACTOR: Final = "anonymous"
+"""The ``actor`` of a row written for a request with no signed-in principal (spec 14.9 wants
+an actor on every row; a refused login has none)."""
 SECRET_KEY_MARKERS: Final[tuple[str, ...]] = (
     "secret",
     "password",
@@ -142,3 +158,21 @@ class AuditRecorder(Protocol):
     def latest_hash(self, tenant_id: str) -> str:
         """The chain head (``GENESIS_HASH`` when empty): the daily anchor (spec 14.9)."""
         ...
+
+
+@runtime_checkable
+class TransactionalAuditRecorder(AuditRecorder, Protocol):
+    """A recorder that can also append inside a transaction another store opened, so the
+    state change and its row commit or roll back together (ADR 0070)."""
+
+    def append_on(self, connection: Connection | None, entry: AuditEntry) -> str:
+        """Append on ``connection`` (the caller's open transaction, which the caller commits)
+        and return the new ``row_hash``; ``None`` appends in a transaction of the recorder's
+        own, like :meth:`AuditRecorder.record`."""
+        ...
+
+
+type TransactionHook[T] = Callable[[Connection | None, T], None]
+"""What a store that changes state runs inside its transaction, after the write and before the
+commit, with the connection and the stored row (``None`` for the in-memory stores, which have
+no connection). An exception from the hook rolls the write back."""

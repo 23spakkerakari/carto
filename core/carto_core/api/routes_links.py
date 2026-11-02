@@ -7,7 +7,9 @@ reviewer saw in ``If-Match`` (428 without it, 412 when the link moved); the port
 again under its own lock and raises ``stale_version`` for the race the header cannot catch.
 ``reject`` needs a reason (spec 9.6). Every decision writes one audit row with ``before`` and
 ``after`` limited to status, role, score and version (never evidence, never field paths), the
-request id, the socket address and the user agent.
+request id, the client address and the user agent; the route builds it and the port appends
+it inside the transaction of the decision, so a decision never lands without its row and a
+failed append answers 500 with the link unchanged (ADR 0070).
 
 A view is built from the record only; the evidence keys the contract does not name are dropped
 and evidence that does not validate degrades to zero counts with a warning, so one bad row
@@ -25,11 +27,12 @@ from starlette.concurrency import run_in_threadpool
 
 from carto_common.logging import get_logger
 from carto_core.api.auth import Principal
-from carto_core.api.context import ApiContext, context_of, record_audit
+from carto_core.api.context import ApiContext, audit_entry, context_of
 from carto_core.api.etag import etag_of, require_if_match
 from carto_core.api.ports import MAX_CURSOR_LEN, DecisionError, LinkEndRecord, LinkRecord
 from carto_core.api.problems import Problem
 from carto_core.api.sessions import Guard
+from carto_core.audit import AuditEntry
 from carto_schema.api import (
     MAX_PAGE_SIZE,
     DecisionRequest,
@@ -193,6 +196,20 @@ async def _decide(
     expected = require_if_match(request, current.version)
     at = context.clock()
     port_method = method(context)
+    before = _audit_view(current)
+
+    def entry_for(stored: LinkRecord) -> AuditEntry:
+        return audit_entry(
+            context,
+            request,
+            principal,
+            action=action,
+            target=f"link:{link_id}",
+            before=before,
+            after=_audit_view(stored),
+            reason=(reason.value if reason is not None else "") or body.note,
+        )
+
     try:
         updated = await run_in_threadpool(
             lambda: port_method(
@@ -203,21 +220,13 @@ async def _decide(
                 reason=reason,
                 note=body.note,
                 at=at,
+                audit=entry_for,
             )
         )
     except DecisionError as exc:
         raise decision_problem(exc) from None
     context.metrics.inc("carto_api_decisions_total")
-    await record_audit(
-        context,
-        request,
-        principal,
-        action=action,
-        target=f"link:{link_id}",
-        before=_audit_view(current),
-        after=_audit_view(updated),
-        reason=(reason.value if reason is not None else "") or body.note,
-    )
+    context.metrics.inc("carto_api_audit_rows_total")
     log.info("link decision", action=action, link_id=link_id, subject=principal.subject)
     response.headers["ETag"] = etag_of(updated.version)
     return link_view(updated)

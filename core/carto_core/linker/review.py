@@ -18,6 +18,8 @@ API alike:
   validated, ``key_links`` and ``key_link_decisions`` change in one transaction guarded by
   ``expected_version`` (the API's ``If-Match``), and one audit row records ``status``, ``score``,
   ``role`` and ``version`` before and after; nothing else, so no token can reach the audit log.
+  The console passes ``on_write``, run by the repository inside that transaction, and appends
+  its row there (ADR 0070); the service's own recorder is then the no-op one (ADR 0058, 1).
 
 Errors are :class:`DecisionError` with a :class:`DecisionKind` the API maps to a status code;
 their messages never carry data.
@@ -44,7 +46,7 @@ from carto_core.linker.model import (
 from carto_core.linker.repository import DecisionWrite, NotFoundError, StaleVersionError
 
 if TYPE_CHECKING:
-    from carto_core.audit import AuditRecorder
+    from carto_core.audit import AuditRecorder, TransactionHook
     from carto_core.linker.repository import LinkRepository
     from carto_core.settings import LinkerSettings
     from carto_core.store.model import FieldForm
@@ -401,6 +403,7 @@ class ReviewService:
         expected_version: int,
         note: str | None = None,
         context: RequestContext | None = None,
+        on_write: TransactionHook[KeyLink] | None = None,
     ) -> KeyLink:
         link = self._load(tenant_id, link_id, expected_version, _ACCEPT_FROM)
         write = DecisionWrite(
@@ -411,7 +414,7 @@ class ReviewService:
             note=note,
             baseline_match_rate=link.features.c_ab,
         )
-        return self._apply(tenant_id, link, write, "link.accept", "", context)
+        return self._apply(tenant_id, link, write, "link.accept", "", context, on_write)
 
     def reject(
         self,
@@ -423,6 +426,7 @@ class ReviewService:
         reason: RejectReason | None,
         note: str | None = None,
         context: RequestContext | None = None,
+        on_write: TransactionHook[KeyLink] | None = None,
     ) -> KeyLink:
         if reason is None:
             raise DecisionError(DecisionKind.REASON_REQUIRED)
@@ -435,7 +439,7 @@ class ReviewService:
             reject_reason=reason,
             note=note,
         )
-        return self._apply(tenant_id, link, write, "link.reject", reason.value, context)
+        return self._apply(tenant_id, link, write, "link.reject", reason.value, context, on_write)
 
     def mark_association(
         self,
@@ -446,6 +450,7 @@ class ReviewService:
         expected_version: int,
         note: str | None = None,
         context: RequestContext | None = None,
+        on_write: TransactionHook[KeyLink] | None = None,
     ) -> KeyLink:
         """Spec 9.6 "Mark as association": the link is real but never merges records. It is
         stored accepted with the association role, so the map shows it and families skip it."""
@@ -461,7 +466,7 @@ class ReviewService:
             note=note,
             baseline_match_rate=link.features.c_ab,
         )
-        return self._apply(tenant_id, link, write, "link.association", "", context)
+        return self._apply(tenant_id, link, write, "link.association", "", context, on_write)
 
     # -- internals ------------------------------------------------------------------------------
 
@@ -489,10 +494,11 @@ class ReviewService:
         action: str,
         reason: str,
         context: RequestContext | None,
+        on_write: TransactionHook[KeyLink] | None = None,
     ) -> KeyLink:
         try:
             stored = self._links.decide(
-                tenant_id, link.id, expected_version=link.version, write=write
+                tenant_id, link.id, expected_version=link.version, write=write, on_write=on_write
             )
         except NotFoundError as exc:
             raise DecisionError(DecisionKind.NOT_FOUND) from exc

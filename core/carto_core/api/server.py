@@ -8,8 +8,11 @@ browsers never reach this listener, only the web nginx does (role ``web``), and 
 (``web`` and ``api`` everywhere, any certificate of the install CA on the health routes),
 recorded by the same h11 protocol hook as the ingest listener (ADR 0031). Plain HTTP needs
 ``api.insecure_http`` and is for a TLS-terminating proxy on a private network or tests. uvicorn
-adds no ``Server`` header, trusts no proxy headers (the socket address is what the audit log
-records in M2) and logs through the root logger, redaction included (spec 14.12).
+adds no ``Server`` header, trusts no proxy headers itself (the application reads
+``X-Forwarded-For`` only from the ``web`` role, :func:`carto_core.api.context.client_ip`, ADR
+0070), writes no access log (the OIDC ``code`` and ``state`` travel in the callback's query
+string, and the structured request log already covers every request) and logs through the
+root logger, redaction included (spec 14.12).
 
 The identity stores (sessions, users, role bindings, audit) are the PostgreSQL ones of
 :mod:`carto_core.api.stores_postgres` and :mod:`carto_core.audit_postgres`. The data ports
@@ -132,7 +135,9 @@ def build_uvicorn_config(
         port=listener.port,
         log_config=None,
         log_level=log_level,
-        access_log=True,
+        # No access log: it would print the callback's query string with the OIDC code and
+        # state (ADR 0070); RequestIdMiddleware's structured line covers each request.
+        access_log=False,
         # h11 bounds a request line plus headers at 16 KiB (spec 2.3 invariant 8); the hook
         # records each connection's certificate role for PeerRoleMiddleware (ADR 0031).
         http=peer_role_h11_protocol(),

@@ -1601,7 +1601,7 @@
     },
     "/api/v1/auth/callback": {
       "get": {
-        "description": "Finish the flow: code to ID token to session.",
+        "description": "Finish the flow: cookie to attempt, code to ID token to session.",
         "operationId": "callback_api_v1_auth_callback_get",
         "parameters": [
           {
@@ -1680,7 +1680,7 @@
     },
     "/api/v1/auth/login": {
       "get": {
-        "description": "Send the browser to the identity provider.",
+        "description": "Send the browser to the identity provider, bound to it by the login cookie.",
         "operationId": "login_api_v1_auth_login_get",
         "responses": {
           "302": {

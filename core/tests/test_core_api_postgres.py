@@ -137,10 +137,11 @@ def test_pending_logins_pop_once_and_never_resolve_as_sessions(engine: sqlalchem
         nonce="n" * 43,
         created_at=NOW,
         expires_at=NOW + timedelta(minutes=10),
+        binding_hash="f" * 64,
     )
     store.put(attempt)
     assert store.get("d" * 64) is None, "a pending login is not a session"
-    assert store.pop("d" * 64) == attempt
+    assert store.pop("d" * 64) == attempt, "the browser binding survives the round trip"
     assert store.pop("d" * 64) is None
     store.create(_session("e" * 64))
     assert store.pop("e" * 64) is None, "a session is not a login attempt"
@@ -229,6 +230,44 @@ def test_audit_rows_chain_per_tenant_and_verify(engine: sqlalchemy.Engine) -> No
         ).first()
     assert row is not None and row.prev_hash == GENESIS_HASH
     assert row.row_hash == chain_hash(GENESIS_HASH, normalize(entries[0]).content())
+
+
+def test_append_on_a_callers_connection_chains_and_rolls_back_with_it(
+    engine: sqlalchemy.Engine,
+) -> None:
+    """ADR 0070: a port appends the audit row on its own transaction's connection; the row
+    chains from the head like any other and disappears when that transaction rolls back."""
+    log = PostgresAuditLog(engine)
+    head = log.latest_hash("txn")
+    entry = AuditEntry(
+        at=NOW,
+        actor="alice",
+        action="link.accept",
+        target="link:txn",
+        before=None,
+        after={"status": "accepted"},
+        reason="",
+        request_id="req-txn",
+        ip="10.0.0.2",
+        user_agent="pytest",
+        tenant_id="txn",
+    )
+    with engine.begin() as connection:
+        committed = log.append_on(connection, entry)
+    assert committed == chain_hash(head, normalize(entry).content())
+    assert log.latest_hash("txn") == committed
+
+    class AbortError(Exception):
+        pass
+
+    with pytest.raises(AbortError), engine.begin() as connection:
+        log.append_on(connection, replace(entry, target="link:rolled-back"))
+        raise AbortError
+    assert log.latest_hash("txn") == committed, "the row left with the transaction"
+    assert verify_audit_log(engine, "txn") is None
+    assert log.append_on(None, replace(entry, target="link:own")) != committed, (
+        "without a connection the recorder opens its own transaction"
+    )
 
 
 def test_tampering_is_rejected_or_detected(engine: sqlalchemy.Engine) -> None:

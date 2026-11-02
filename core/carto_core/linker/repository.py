@@ -46,6 +46,8 @@ from carto_core.store.model import FieldForm
 if TYPE_CHECKING:
     from sqlalchemy import Connection, Engine
 
+    from carto_core.audit import TransactionHook
+
 __all__ = [
     "Decision",
     "DecisionWrite",
@@ -145,10 +147,18 @@ class LinkRepository(Protocol):
         ...
 
     def decide(
-        self, tenant_id: str, link_id: str, *, expected_version: int, write: DecisionWrite
+        self,
+        tenant_id: str,
+        link_id: str,
+        *,
+        expected_version: int,
+        write: DecisionWrite,
+        on_write: TransactionHook[KeyLink] | None = None,
     ) -> KeyLink:
         """Apply ``write`` to the link and insert its decision row atomically. Raises
-        :class:`NotFoundError` or :class:`StaleVersionError`."""
+        :class:`NotFoundError` or :class:`StaleVersionError`. ``on_write`` runs inside the
+        same transaction with the stored link (the console's audit append, ADR 0070); when it
+        raises, nothing is committed."""
         ...
 
     def decisions(self, tenant_id: str, link_id: str) -> list[Decision]:
@@ -183,8 +193,10 @@ class EntityRepository(Protocol):
         name: str,
         description: str | None,
         now: datetime,
+        on_write: TransactionHook[Entity] | None = None,
     ) -> Entity:
-        """Confirm a name (spec 9.6). Raises :class:`NotFoundError`."""
+        """Confirm a name (spec 9.6). Raises :class:`NotFoundError`. ``on_write`` runs inside
+        the transaction with the stored entity (ADR 0070)."""
         ...
 
     def ping(self) -> bool: ...
@@ -279,7 +291,13 @@ class InMemoryLinkRepository:
             return stored
 
     def decide(
-        self, tenant_id: str, link_id: str, *, expected_version: int, write: DecisionWrite
+        self,
+        tenant_id: str,
+        link_id: str,
+        *,
+        expected_version: int,
+        write: DecisionWrite,
+        on_write: TransactionHook[KeyLink] | None = None,
     ) -> KeyLink:
         with self._lock:
             link = self._links.get((tenant_id, link_id))
@@ -304,6 +322,8 @@ class InMemoryLinkRepository:
                     else link.baseline_match_rate
                 ),
             )
+            if on_write is not None:
+                on_write(None, stored)  # before the write lands: a raise leaves it unchanged
             self._links[(tenant_id, link_id)] = stored
             self._decisions.append(
                 Decision(
@@ -375,6 +395,7 @@ class InMemoryEntityRepository:
         name: str,
         description: str | None,
         now: datetime,
+        on_write: TransactionHook[Entity] | None = None,
     ) -> Entity:
         with self._lock:
             entity = self._entities.get((tenant_id, entity_id))
@@ -384,6 +405,8 @@ class InMemoryEntityRepository:
             stored = replace(
                 entity, name=name, name_confirmed=True, description=description, updated_at=now
             )
+            if on_write is not None:
+                on_write(None, stored)
             self._entities[(tenant_id, entity_id)] = stored
             return stored
 
@@ -618,7 +641,13 @@ class PostgresLinkRepository:
         return _link_from_row(first)
 
     def decide(
-        self, tenant_id: str, link_id: str, *, expected_version: int, write: DecisionWrite
+        self,
+        tenant_id: str,
+        link_id: str,
+        *,
+        expected_version: int,
+        write: DecisionWrite,
+        on_write: TransactionHook[KeyLink] | None = None,
     ) -> KeyLink:
         parameters = {
             "tenant_id": tenant_id,
@@ -658,9 +687,12 @@ class PostgresLinkRepository:
                         "score_at_decision": write.score_at_decision,
                     },
                 )
+                stored = _link_from_row(updated)
+                if on_write is not None:
+                    on_write(connection, stored)
         except SQLAlchemyError as exc:
             raise _wrap("link decision", exc) from exc
-        return _link_from_row(updated)
+        return stored
 
     def decisions(self, tenant_id: str, link_id: str) -> list[Decision]:
         try:
@@ -741,18 +773,18 @@ class PostgresEntityRepository:
             raise _wrap("entity list", exc) from exc
         return [_entity_from_row(row, members.get(row.id, [])) for row in rows]
 
+    def _get_on(self, connection: Connection, tenant_id: str, entity_id: str) -> Entity | None:
+        row = connection.execute(_SELECT_ENTITY, {"tenant_id": tenant_id, "id": entity_id}).first()
+        if row is None:
+            return None
+        return _entity_from_row(row, self._members(connection, tenant_id).get(entity_id, []))
+
     def get(self, tenant_id: str, entity_id: str) -> Entity | None:
         try:
             with self._engine.connect() as connection:
-                row = connection.execute(
-                    _SELECT_ENTITY, {"tenant_id": tenant_id, "id": entity_id}
-                ).first()
-                if row is None:
-                    return None
-                members = self._members(connection, tenant_id).get(entity_id, [])
+                return self._get_on(connection, tenant_id, entity_id)
         except SQLAlchemyError as exc:
             raise _wrap("entity read", exc) from exc
-        return _entity_from_row(row, members)
 
     def replace_all(self, tenant_id: str, entities: Sequence[Entity], now: datetime) -> None:
         try:
@@ -797,6 +829,7 @@ class PostgresEntityRepository:
         name: str,
         description: str | None,
         now: datetime,
+        on_write: TransactionHook[Entity] | None = None,
     ) -> Entity:
         try:
             with self._engine.begin() as connection:
@@ -813,12 +846,14 @@ class PostgresEntityRepository:
                 if int(result.rowcount) == 0:
                     msg = "entity not found"
                     raise NotFoundError(msg)
+                entity = self._get_on(connection, tenant_id, entity_id)
+                if entity is None:  # pragma: no cover - the UPDATE just matched the row
+                    msg = "entity not found"
+                    raise NotFoundError(msg)
+                if on_write is not None:
+                    on_write(connection, entity)
         except SQLAlchemyError as exc:
             raise _wrap("entity rename", exc) from exc
-        entity = self.get(tenant_id, entity_id)
-        if entity is None:
-            msg = "entity not found"
-            raise NotFoundError(msg)
         return entity
 
     def ping(self) -> bool:

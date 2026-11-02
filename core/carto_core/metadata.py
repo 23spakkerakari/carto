@@ -47,6 +47,7 @@ if TYPE_CHECKING:
     from sqlalchemy import Engine
     from sqlalchemy.engine import Connection, Row
 
+    from carto_core.audit import TransactionHook
     from carto_schema.inventory import EdgeInventory, InventoryFieldPolicy
 
 __all__ = [
@@ -270,11 +271,14 @@ class MetadataStore(Protocol):
         description: str | None,
         expected_version: int,
         now: datetime,
+        on_write: TransactionHook[SystemRecord] | None = None,
     ) -> SystemRecord:
         """The console's ``PATCH /systems/{id}`` (spec 12): set the name and/or description
         when :func:`updated_at_version` of the stored row equals ``expected_version``, stamping
         ``updated_at = now``. Raises :class:`MetadataNotFoundError` or
-        :class:`MetadataStaleError`. The edge's next inventory overwrites the name (ADR 0050)."""
+        :class:`MetadataStaleError`. The edge's next inventory overwrites the name (ADR 0050).
+        ``on_write`` runs inside the transaction with the stored row (the console's audit
+        append, ADR 0070); when it raises, the rename is rolled back."""
         ...
 
     def list_sources(self, tenant_id: str) -> list[SourceRecord]: ...
@@ -507,6 +511,7 @@ class InMemoryMetadataStore:
         description: str | None,
         expected_version: int,
         now: datetime,
+        on_write: TransactionHook[SystemRecord] | None = None,
     ) -> SystemRecord:
         with self._lock:
             current = self._systems.get((tenant_id, system_id))
@@ -522,6 +527,8 @@ class InMemoryMetadataStore:
                 description=description if description is not None else current.description,
                 updated_at=now,
             )
+            if on_write is not None:
+                on_write(None, updated)
             self._systems[(tenant_id, system_id)] = updated
             return updated
 
@@ -1108,6 +1115,7 @@ class PostgresMetadataStore:
         description: str | None,
         expected_version: int,
         now: datetime,
+        on_write: TransactionHook[SystemRecord] | None = None,
     ) -> SystemRecord:
         parameters = {
             "tenant_id": tenant_id,
@@ -1129,10 +1137,13 @@ class PostgresMetadataStore:
                         raise MetadataNotFoundError(msg)
                     msg = "system changed"
                     raise MetadataStaleError(msg)
+                stored = _system_from(row)
+                if on_write is not None:
+                    on_write(connection, stored)
         except SQLAlchemyError as exc:
             msg = f"system rename failed: {type(exc).__name__}"
             raise MetadataError(msg) from exc
-        return _system_from(row)
+        return stored
 
     def list_sources(self, tenant_id: str) -> list[SourceRecord]:
         rows = self._rows(_SOURCES, {"tenant_id": tenant_id}, "sources")

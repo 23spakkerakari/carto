@@ -23,10 +23,11 @@ with warnings.catch_warnings():
 from carto_common.ids import ULID_PATTERN
 from carto_common.mtls import ActAsRole
 from carto_core.api.app import API_PREFIX, create_app
-from carto_core.api.context import ApiContext
-from carto_core.api.memory_ports import InMemoryLinkPort, seeded_ports
+from carto_core.api.context import ApiContext, forwarded_client
+from carto_core.api.memory_ports import InMemoryAuditLog, InMemoryLinkPort, seeded_ports
 from carto_core.api.ports import ApiPorts
 from carto_core.api.problems import PROBLEM_CONTENT_TYPE
+from carto_core.api.server import build_uvicorn_config
 from carto_core.settings import SESSION_COOKIE_NAME, ApiSettings, CoreSettings
 from carto_schema.api import Role
 
@@ -295,3 +296,79 @@ def test_without_require_client_cert_no_role_is_checked() -> None:
     world = _world()
     client = TestClient(ActAsRole(world.app, None), base_url="https://testserver")
     assert client.get(f"{API_PREFIX}/links").status_code == 401
+
+
+# --- the client address behind the web proxy (ADR 0070, M5) ----------------------------------
+
+
+def test_forwarded_client_takes_the_last_hop_and_refuses_junk() -> None:
+    assert forwarded_client("203.0.113.5, 10.0.0.2") == "10.0.0.2"
+    assert forwarded_client("203.0.113.5") == "203.0.113.5"
+    assert forwarded_client(" 2001:db8::1 ") == "2001:db8::1"
+    assert forwarded_client("203.0.113.005") is None, "no ambiguous octets"
+    assert forwarded_client("not-an-ip") is None
+    assert forwarded_client("203.0.113.5, ") is None
+    assert forwarded_client("") is None
+    assert forwarded_client(None) is None
+    assert forwarded_client("1.1.1.1, " * 100 + "10.0.0.2") is None, "bounded length"
+
+
+def _settings_with_login_limit(per_minute: int) -> CoreSettings:
+    return CoreSettings(
+        _env_file=None,
+        api=ApiSettings(insecure_http=True, login_rate_per_minute_per_ip=per_minute),
+    )
+
+
+def test_the_login_limiter_keys_on_the_forwarded_address_behind_the_web_role() -> None:
+    """Two browsers behind nginx get two buckets; the last hop is what nginx appended."""
+    app = create_app(_settings_with_login_limit(2), seeded_ports(), clock=lambda: NOW)
+    web = TestClient(ActAsRole(app, "web"), base_url="https://testserver")
+    alice = {"X-Forwarded-For": "203.0.113.5, 10.0.0.2"}
+    bob = {"X-Forwarded-For": "10.0.0.3"}
+    login = f"{API_PREFIX}/auth/login"
+    assert [web.get(login, headers=alice).status_code for _ in range(3)] == [503, 503, 429]
+    assert web.get(login, headers=bob).status_code == 503, "another address, its own bucket"
+    assert web.get(login, headers={"X-Forwarded-For": "junk"}).status_code == 503
+    assert web.get(login, headers={"X-Forwarded-For": "junk"}).status_code == 503
+    assert web.get(login, headers={"X-Forwarded-For": "junk"}).status_code == 429, (
+        "a malformed header falls back to the socket peer's bucket"
+    )
+    assert web.get(login).status_code == 429, "the socket peer's bucket is spent"
+
+
+def test_the_forwarded_header_is_ignored_without_the_web_role() -> None:
+    login = f"{API_PREFIX}/auth/login"
+    for role in ("api", None):
+        app = create_app(_settings_with_login_limit(2), seeded_ports(), clock=lambda: NOW)
+        client = TestClient(ActAsRole(app, role), base_url="https://testserver")
+        statuses = [
+            client.get(login, headers={"X-Forwarded-For": f"10.0.0.{n}"}).status_code
+            for n in range(3)
+        ]
+        assert statuses == [503, 503, 429], (role, statuses)
+
+
+def test_the_audit_row_records_the_forwarded_address_behind_the_web_role() -> None:
+    world = _world()
+    headers = world.login(Role.INTEGRATION_ENGINEER)
+    web = TestClient(ActAsRole(world.app, "web"), base_url="https://testserver")
+    web.cookies = world.client.cookies
+    response = web.post(
+        f"{API_PREFIX}/links/lnk_01/accept",
+        json={},
+        headers={**headers, "If-Match": 'W/"1"', "X-Forwarded-For": "203.0.113.5, 10.0.0.2"},
+    )
+    assert response.status_code == 200, response.text
+    audit = world.ports.audit
+    assert isinstance(audit, InMemoryAuditLog)
+    [entry] = audit.entries()
+    assert entry.ip == "10.0.0.2"
+
+
+def test_the_api_listener_writes_no_access_log_and_trusts_no_proxy_headers() -> None:
+    world = _world()
+    config = build_uvicorn_config(world.app, world.context.settings.api)
+    assert config.access_log is False, "the OIDC code and state must not reach uvicorn's log"
+    assert config.proxy_headers is False
+    assert config.server_header is False
