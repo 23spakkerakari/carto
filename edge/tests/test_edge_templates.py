@@ -3,12 +3,11 @@ ADR 0016)."""
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-
 import hashlib
 import json
 import subprocess
 import sys
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
