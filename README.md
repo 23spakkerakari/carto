@@ -1,24 +1,33 @@
 # carto
 
-Codename for an integration observability product: a read-only layer over the systems a company
+Alright, here we go again lol.
+
+Carto is an integration observability product: a read-only layer over the systems a company
 already runs that maps how data moves between them, traces any business record across every
 system it touched, watches for stalls and silent failures, and shows where a person is still
-doing the talking. The one-line pitch: *"We show you how your systems talk to each other, and
-where a person is still doing the talking."*
+doing the talking.
 
-The build spec in [`docs/SPEC.md`](docs/SPEC.md) is the source of truth. Decisions that deviate
-from or extend it are in [`docs/adr/`](docs/adr/). Milestone plans are in
+Possible one-line pitches: _"We show you how your systems talk to each other, and
+where a person is still doing the talking."_
+
+"For the first time, you can see how your integrations talk to each other, where they're
+failing, and how your best humans can spend time away from manual, high-latency workflows."
+
+I put the build spec in [`docs/SPEC.md`](docs/SPEC.md). That's our source of truth. Decisions
+that deviate from or extend it are in [`docs/adr/`](docs/adr/). Milestone plans are in
 [`docs/plans/`](docs/plans/).
 
 ## Status
 
-M0 (foundations) built on 2026-10-06; see [`docs/plans/M0.md`](docs/plans/M0.md). M1 (edge
-pipeline and offline analyzer) is next.
+M0 (foundations) and M1 (edge pipeline and offline analyzer) are on `main`. M2 (map discovery)
+is built on `m2-map-discovery` and waits on the design-partner gate. M3 (trace) is in
+progress on `m3-demo` as the demo cut described in [`docs/plans/M3-demo.md`](docs/plans/M3-demo.md).
+The milestone status in [`CLAUDE.md`](CLAUDE.md) has the detail.
 
 ## Layout
 
 ```
-packages/carto-schema/   canonical event and edge-to-core contract models, JSON Schema export
+packages/carto-schema/   canonical event and edge-to-core contract models, JSON Schema export. This is where all our contracts live
 packages/carto-common/   settings, logging with redaction, ids
 edge/                    carto-edge: connectors, pipeline, gateway, offline analyzer (M1)
 core/                    carto-core: ingest, profiler, linker, assembler, detector, notifier, api
