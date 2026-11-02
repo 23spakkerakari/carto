@@ -709,7 +709,8 @@ def test_assembly_rows_carry_the_requested_ends_only_in_stored_order(store: Even
     assert sorted(row.stored_at for row in late) == [T1, T1, T1, T2, T2]
     assert [row.stored_at for row in late[-2:]] == [T2, T2], "stored order, then event id"
     assert store.assembly_rows(TENANT, W, ends=[], limit=10) == []
-    assert store.assembly_rows(OTHER, W, ends=[ORDER_ID], limit=10) == []
+    other = store.assembly_rows(OTHER, W, ends=[ORDER_ID], limit=10)
+    assert len(other) == 2 and not {row.event_id for row in other} & {row.event_id for row in rows}
 
 
 def test_transaction_events_take_the_latest_row_per_event_in_spec_order(loaded: Loaded) -> None:
