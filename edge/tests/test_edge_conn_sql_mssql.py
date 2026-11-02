@@ -149,9 +149,18 @@ class FakeEngine:
 
 class Harness:
     def __init__(
-        self, *, insert: int = 0, alter: int = 0, sysadmin: int = 0, clock: bool = True
+        self,
+        *,
+        insert: int = 0,
+        alter: int = 0,
+        sysadmin: int = 0,
+        database_delete: int = 0,
+        linked_servers: tuple[str, ...] = (),
+        clock: bool = True,
     ) -> None:
         self.insert, self.alter, self.sysadmin = insert, alter, sysadmin
+        self.database_delete = database_delete
+        self.linked_servers = linked_servers
         self.clock = clock
         self.engine: FakeEngine | None = None
         self.dbapi: list[FakeDbapiConnection] = []
@@ -173,6 +182,19 @@ class Harness:
     def respond(self, sql: str, params: dict[str, Any]) -> list[dict[str, Any]]:
         if sql == CLOCK:
             return [{"now": DB_NOW}] if self.clock else []
+        if "'DATABASE'" in sql:
+            assert params == {}
+            assert "HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'DELETE')" in sql
+            return [
+                {
+                    "can_insert": 0,
+                    "can_update": 0,
+                    "can_delete": self.database_delete,
+                    "can_alter": 0,
+                }
+            ]
+        if "sys.servers" in sql:
+            return [{"name": name} for name in self.linked_servers]
         if "HAS_PERMS_BY_NAME" in sql:
             assert params == {"t": "dbo.purchase_orders"}
             return [
@@ -455,7 +477,13 @@ async def test_read_only_login_is_verified() -> None:
     assert result.can_enable
     assert result.visible == ("dbo.purchase_orders",)
     names = [check.name for check in result.checks]
-    assert names == ["query purchase_orders", "privileges dbo.purchase_orders", "privileges role"]
+    assert names == [
+        "query purchase_orders",
+        "privileges dbo.purchase_orders",
+        "privileges database",
+        "privileges role",
+        "privileges linked servers",
+    ]
     assert harness.engine is not None
     log = harness.engine.log
     assert any(sql == CLOCK for sql, _ in log)  # :upper comes from the database clock
@@ -464,6 +492,9 @@ async def test_read_only_login_is_verified() -> None:
     assert first_poll["upper"] == UPPER
     assert any("HAS_PERMS_BY_NAME(:t, 'OBJECT', 'INSERT')" in sql for sql, _ in log)
     assert any("IS_SRVROLEMEMBER('sysadmin')" in sql for sql, _ in log)
+    # ADR 0037 item 2: database-scope writes and linked servers are checked as well.
+    assert any("HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'INSERT')" in sql for sql, _ in log)
+    assert any(sql == "SELECT name FROM sys.servers WHERE server_id <> 0" for sql, _ in log)
 
 
 async def test_an_unreadable_database_clock_fails_the_test_and_the_read() -> None:
@@ -473,7 +504,9 @@ async def test_an_unreadable_database_clock_fails_the_test_and_the_read() -> Non
     assert [check.name for check in result.checks] == [
         "database clock",
         "privileges dbo.purchase_orders",
+        "privileges database",
         "privileges role",
+        "privileges linked servers",
     ]
     assert "database clock" in result.problems[0]
     assert harness.polls() == []  # a time-range query never runs without :upper
@@ -495,6 +528,63 @@ async def test_sysadmin_makes_the_login_write_capable() -> None:
     result = await make(Harness(sysadmin=1)).test()
     assert result.read_only is ReadOnlyStatus.WRITE_CAPABLE
     assert "sysadmin" in result.problems[-1]
+
+
+async def test_a_database_scope_write_permission_makes_the_login_write_capable() -> None:
+    """ADR 0037 item 2: DELETE granted on the database reaches every table, present or future,
+    so HAS_PERMS_BY_NAME on the referenced tables alone would miss it."""
+    result = await make(Harness(database_delete=1)).test()
+    assert not result.ok
+    assert result.read_only is ReadOnlyStatus.WRITE_CAPABLE
+    assert "login can DELETE at database scope" in result.problems[-1]
+    database = next(check for check in result.checks if check.name == "privileges database")
+    assert not database.ok
+
+
+async def test_a_login_that_sees_a_linked_server_is_write_capable() -> None:
+    """ADR 0037 item 2: a visible linked server is a path to writes on another server."""
+    result = await make(Harness(linked_servers=("WMS-ARCHIVE",))).test()
+    assert not result.ok
+    assert result.read_only is ReadOnlyStatus.WRITE_CAPABLE
+    assert "login sees linked server WMS-ARCHIVE" in result.problems[-1]
+
+
+@pytest.mark.parametrize(
+    ("sql", "reason"),
+    [
+        (
+            (
+                "SELECT TOP (:batch) id, updated_at FROM dbo.purchase_orders WITH (NOLOCK) "
+                "WHERE updated_at > :watermark AND updated_at <= :upper ORDER BY updated_at"
+            ),
+            "table hints",
+        ),
+        (
+            (
+                "SELECT TOP (:batch) * FROM OPENQUERY(lnk, 'DELETE FROM x') "
+                "WHERE updated_at > :watermark AND updated_at <= :upper"
+            ),
+            "OPENQUERY",
+        ),
+        (
+            (
+                "SELECT TOP (:batch) NEXT VALUE FOR dbo.seq, updated_at FROM dbo.purchase_orders "
+                "WHERE updated_at > :watermark AND updated_at <= :upper"
+            ),
+            "NEXT VALUE FOR",
+        ),
+        (
+            (
+                "SELECT TOP (:batch) * FROM dbo.purchase_orders CROSS APPLY OPENJSON(payload) "
+                "WHERE updated_at > :watermark AND updated_at <= :upper"
+            ),
+            "openjson",
+        ),
+    ],
+)
+def test_adr_0037_refusals_reach_the_source_config(sql: str, reason: str) -> None:
+    with pytest.raises(InvalidConfigError, match=reason):
+        make(Harness(), query=sql)
 
 
 async def test_ssrf_refusal_and_bad_secret_are_connector_errors() -> None:

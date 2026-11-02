@@ -15,8 +15,14 @@ Spec 8.1.1 limits: accepted extensions ``.log .txt .json .ndjson .csv .xml .gz .
 file, streamed; 20 GB per upload; zip archives with at most 10,000 entries, a compression ratio
 of at most 100:1 per entry and in total, at most 50 GB uncompressed, no absolute paths, no
 ``..``, no symlink entries. Entries are streamed straight out of the archive, never extracted
-to disk. Symlinks on the file system are never followed. The cursor is ``{"file", "line"}``
-so a resumed run skips what was already handed over.
+to disk. The cursor is ``{"file", "line"}`` so a resumed run skips what was already handed over.
+
+Confinement (M1 review, package C): symlinks and Windows junctions are never followed, neither
+as a configured path nor inside a walked or globbed tree, and every file is checked by its real
+path. With ``base_dir`` set (the offline analyzer passes ``--input``) every configured path and
+every file found must lie under it; without it, a directory walk or glob may not leave the
+directory it started from. CSV rows are read with a 16 MiB field limit, and a row the reader
+cannot parse is skipped and counted, never fatal.
 """
 
 from __future__ import annotations
@@ -79,6 +85,8 @@ MAX_ZIP_RATIO: Final = 100
 MAX_ZIP_TOTAL_BYTES: Final = 50 * GIB
 MAX_LINE_BYTES: Final = 16 * MIB
 """Lines longer than this are cut (``size_bytes`` keeps the real length) to bound memory."""
+MAX_CSV_FIELD_BYTES: Final = 16 * MIB
+"""``csv.field_size_limit`` while rows are read: one cell may not hold more than a line."""
 
 YIELD_EVERY: Final = 1000
 _GLOB_MAGIC: Final = re.compile(r"[*?\[]")
@@ -147,6 +155,31 @@ class _Input:
     @property
     def suffix(self) -> str:
         return self.path.suffix.lower()
+
+
+def _is_link(path: Path) -> bool:
+    """A symlink or a Windows junction: neither is followed, wherever it appears."""
+    return path.is_symlink() or os.path.isjunction(path)
+
+
+def _within(path: str, root: str) -> bool:
+    """``path`` is ``root`` or below it; both are real paths already."""
+    try:
+        return os.path.commonpath([os.path.normcase(path), os.path.normcase(root)]) == (
+            os.path.normcase(root)
+        )
+    except ValueError:  # different drives or one relative, one absolute
+        return False
+
+
+def _static_prefix(target: Path) -> Path:
+    """The part of a pattern before its first glob segment: what its matches may not leave."""
+    parts: list[str] = []
+    for part in target.parts:
+        if _GLOB_MAGIC.search(part):
+            break
+        parts.append(part)
+    return Path(*parts) if parts else target
 
 
 def _is_safe_entry_name(name: str) -> bool:
@@ -276,30 +309,49 @@ class UploadConnector:
     # -- file discovery -------------------------------------------------------------------------
 
     def _candidates(self) -> tuple[list[_Input], list[str]]:
-        """Resolve the configured paths to regular files (sorted, deduplicated) plus problems."""
+        """Resolve the configured paths to regular files (sorted, deduplicated) plus problems.
+
+        Every file is confined: under ``base_dir`` when one is configured, else under the
+        directory its own entry starts from. Links and junctions are never followed, so a file
+        reached through one resolves outside and is skipped, and the count is a problem."""
         found: dict[str, _Input] = {}
         problems: list[str] = []
+        base = os.path.realpath(self._base) if self.config.base_dir else None
         for entry in self.config.paths:
             raw = Path(entry)
             target = raw if raw.is_absolute() else self._base / raw
+            start = os.path.realpath(_static_prefix(target))
+            if base is not None and not _within(start, base):
+                problems.append(f"path {entry!r} is outside the base directory")
+                continue
+            confine = base if base is not None else start
+            outside = 0
             if _GLOB_MAGIC.search(str(target)):
                 # glob.glob: the pattern is absolute and may hold ** (Path.glob needs relative)
                 matches = [Path(m) for m in glob.glob(str(target), recursive=True)]  # noqa: PTH207
                 if not matches:
                     problems.append(f"pattern {entry!r} matched no file")
                 for match in matches:
-                    self._add(found, match)
-            elif target.is_symlink():
-                problems.append(f"path {entry!r} is a symlink; symlinks are not followed")
+                    outside += self._add(found, match, confine)
+            elif _is_link(target):
+                kind = "junction" if os.path.isjunction(target) else "symlink"
+                problems.append(f"path {entry!r} is a {kind}; links are not followed")
             elif target.is_dir():
                 for root, directories, files in os.walk(target, followlinks=False):
-                    directories.sort()
+                    directories[:] = sorted(
+                        name for name in directories if not _is_link(Path(root) / name)
+                    )
                     for file_name in sorted(files):
-                        self._add(found, Path(root) / file_name)
+                        outside += self._add(found, Path(root) / file_name, confine)
             elif target.is_file():
-                self._add(found, target)
+                outside += self._add(found, target, confine)
             else:
                 problems.append(f"path {entry!r} does not exist")
+            if outside:
+                problems.append(
+                    f"path {entry!r}: {outside} file(s) resolve outside it and were skipped; "
+                    "links are not followed"
+                )
         inputs = [found[key] for key in sorted(found)]
         if self.config.kind != "files":
             inputs = [
@@ -307,18 +359,26 @@ class UploadConnector:
             ]
         return inputs, problems
 
-    def _add(self, found: dict[str, _Input], path: Path) -> None:
+    def _add(self, found: dict[str, _Input], path: Path, confine: str) -> int:
+        """Record a regular file whose real path lies under ``confine``; returns 1 when the file
+        was skipped for resolving outside it, else 0."""
         try:
             info = os.lstat(path)
         except OSError:
-            return
+            return 0
         if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-            return
+            return 0
+        real = os.path.realpath(path)
+        if not _within(real, confine):
+            return 1
         if self.config.include and not any(
             fnmatch.fnmatch(path.name, pattern) for pattern in self.config.include
         ):
-            return
-        found[str(path)] = _Input(path, info.st_size, info.st_mtime)
+            return 0
+        # Keyed by real path, so two spellings of one file (``sub/../a.log``) read it once;
+        # the spelled path stays the cursor's ``file`` value.
+        found.setdefault(os.path.normcase(real), _Input(path, info.st_size, info.st_mtime))
+        return 0
 
     def _check_limits(self, inputs: list[_Input]) -> list[str]:
         problems: list[str] = []
@@ -508,15 +568,34 @@ class UploadConnector:
         text_stream = io.TextIOWrapper(
             stream, encoding=self.config.encoding, errors="replace", newline=""
         )
+        csv.field_size_limit(MAX_CSV_FIELD_BYTES)  # process-wide in the csv module
+        skipped = 0
         try:
             reader = csv.DictReader(text_stream)
-            if not reader.fieldnames:
+            try:
+                header = reader.fieldnames
+            except csv.Error as exc:
+                msg = f"{name}: the CSV header row could not be read: {type(exc).__name__}"
+                raise ConnectorError(msg) from exc
+            if not header:
                 msg = f"{name}: a CSV header row is required for kind 'rows'"
                 raise ConnectorError(msg)
-            if primary_key not in reader.fieldnames:
+            if primary_key not in header:
                 msg = f"{name}: primary_key column {primary_key!r} is not in the CSV header"
                 raise ConnectorError(msg)
-            for number, row in enumerate(reader, start=1):
+            number = 0
+            while True:
+                try:
+                    row = next(reader)
+                except StopIteration:
+                    break
+                except csv.Error:
+                    # One row the reader cannot parse (a cell past the field limit, broken
+                    # quoting) is skipped; it keeps its row number so the cursor stays honest.
+                    number += 1
+                    skipped += 1
+                    continue
+                number += 1
                 if number <= after:
                     continue
                 fields = {
@@ -544,6 +623,13 @@ class UploadConnector:
             # The caller owns the binary stream: detach so the wrapper neither closes it nor
             # warns about being collected while open.
             text_stream.detach()
+            if skipped:
+                logger.warning(
+                    "upload csv rows skipped source_id=%s table=%s skipped=%d",
+                    self.source.id,
+                    table,
+                    skipped,
+                )
 
     def _file_record(self, item: _Input) -> RawRecord:
         mtime = datetime.fromtimestamp(item.mtime, tz=UTC)

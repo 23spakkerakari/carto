@@ -13,7 +13,9 @@ made: the connector never opens, reads, writes, renames or deletes a file (spec 
   only. ``known_hosts=None`` would make asyncssh trust any key without asking; it is never
   used here.
 - SSRF (spec 14.7, ADR 0018): the connection is opened to the address the network policy
-  pinned for the configured host.
+  pinned for the configured host. The user's SSH configuration (``~/.ssh/config``: proxy
+  commands, identities, host aliases) and agent are never consulted (``config=None``,
+  ``agent_path=None``); the source config and its secret are the whole connection.
 - ``local://`` (spec 8.1.5 "Local and SMB/NFS-mounted directories"): the same connector lists
   a local directory with ``os.scandir`` and ``stat``; symlinks are not followed.
 - Credentials: the secret is a private key (PEM text, or JSON ``{"private_key": ...,
@@ -252,6 +254,7 @@ class SftpConnector:
                     port=resolved.port,
                     known_hosts=([], [], []),
                     client_factory=lambda: _PinnedHostKeyClient(expected),
+                    config=None,  # never ~/.ssh/config: no ProxyCommand, identities or aliases
                     agent_path=None,
                     connect_timeout=self.config.connect_timeout_seconds,
                     login_timeout=self.config.connect_timeout_seconds,

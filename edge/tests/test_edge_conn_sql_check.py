@@ -7,11 +7,15 @@ import pytest
 
 from carto_edge.connectors.base import InvalidConfigError, ResolvedHost
 from carto_edge.connectors.sql_dialects import (
+    ALLOWED_FUNCTION_TYPES,
+    ALLOWED_FUNCTIONS,
     PrivilegeQuery,
     StatementCheckError,
     check_statement,
     mssql_connection_string,
     mysql_connect_kwargs,
+    mysql_grants_using_sql,
+    mysql_roles,
     mysql_session_statements,
     postgres_connect_kwargs,
     privilege_queries,
@@ -122,6 +126,260 @@ def test_mysql_and_mssql_denied_functions() -> None:
 
 def test_statement_check_error_is_an_invalid_config_error() -> None:
     assert issubclass(StatementCheckError, InvalidConfigError)
+
+
+# ---------------------------------------------------------------------------------------------
+# ADR 0037 item 1: allowlists, base tables and CTEs only
+# ---------------------------------------------------------------------------------------------
+
+
+def test_everyday_scalar_and_aggregate_functions_are_allowed() -> None:
+    """A template may shape its columns with the usual functions without anyone listing them
+    per install (ADR 0037 Consequences: a missing function is a one-line code change)."""
+    postgres = (
+        "SELECT id, COALESCE(status, 'unknown') AS status, LOWER(TRIM(created_by)) AS actor, "
+        "DATE_TRUNC('day', updated_at) AS day, EXTRACT(EPOCH FROM updated_at) AS epoch, "
+        "TO_CHAR(updated_at, 'YYYY-MM-DD') AS printed, payload ->> 'order_ref' AS order_ref, "
+        "jsonb_extract_path_text(payload, 'po', 'num') AS po_num, "
+        "CAST(amount AS TEXT) AS amount, ROUND(amount, 2) AS rounded, "
+        "CASE WHEN qty > 0 THEN 'some' ELSE 'none' END AS qty_class, "
+        "COUNT(*) OVER () AS total, ROW_NUMBER() OVER (ORDER BY updated_at) AS rn, "
+        "updated_at AT TIME ZONE 'UTC' AS utc, age(updated_at) AS age, "
+        "updated_at + INTERVAL '1 day' AS next_day, NOW() AS seen "
+        "FROM purchase_orders WHERE updated_at > :watermark AND updated_at <= :upper "
+        "AND EXISTS (SELECT 1 FROM warehouses w WHERE w.code = warehouse_code) "
+        "ORDER BY updated_at LIMIT :batch"
+    )
+    assert check_statement(postgres, "postgresql", upper=True).tables == (
+        "purchase_orders",
+        "warehouses",
+    )
+    mysql = (
+        "SELECT id, IFNULL(status, 'unknown') AS status, DATE_FORMAT(updated_at, '%Y') AS y, "
+        "UNIX_TIMESTAMP(updated_at) AS epoch, CONVERT_TZ(updated_at, '+00:00', 'UTC') AS utc, "
+        "JSON_UNQUOTE(JSON_EXTRACT(payload, '$.ref')) AS ref, CONCAT_WS('-', a, b) AS ab, "
+        "TIMESTAMPDIFF(SECOND, created_at, updated_at) AS secs, GROUP_CONCAT(tag) AS tags "
+        "FROM purchase_orders WHERE updated_at > :watermark AND updated_at <= :upper "
+        "GROUP BY id ORDER BY updated_at LIMIT :batch"
+    )
+    assert check_statement(mysql, "mysql", upper=True).tables == ("purchase_orders",)
+    mssql = (
+        "SELECT TOP (:batch) id, ISNULL(status, 'unknown') AS status, "
+        "CONVERT(VARCHAR(10), updated_at, 120) AS printed, DATEADD(day, 1, updated_at) AS nxt, "
+        "DATEDIFF(second, created_at, updated_at) AS secs, FORMAT(updated_at, 'yyyy') AS y, "
+        "IIF(qty > 0, 'some', 'none') AS qty_class, JSON_VALUE(payload, '$.ref') AS ref, "
+        "SYSUTCDATETIME() AS seen, LEN(po_num) AS n, CHARINDEX('-', po_num) AS dash, "
+        "TRY_CAST(amount AS INT) AS amount, STRING_AGG(tag, ',') AS tags "
+        "FROM dbo.purchase_orders WHERE updated_at > :watermark AND updated_at <= :upper "
+        "GROUP BY id ORDER BY updated_at"
+    )
+    assert check_statement(mssql, "mssql", upper=True).tables == ("dbo.purchase_orders",)
+
+
+@pytest.mark.parametrize(
+    ("sql", "dialect", "reason"),
+    [
+        # Functions off the allowlist, named in the refusal
+        (
+            "SELECT nextval('s'), id FROM t WHERE a > :watermark LIMIT :batch",
+            "postgresql",
+            "nextval",
+        ),
+        (
+            (
+                "SELECT id FROM t WHERE a > :watermark AND b = set_config('x', 'y', false) "
+                "LIMIT :batch"
+            ),
+            "postgresql",
+            "set_config",
+        ),
+        (
+            "SELECT id FROM t WHERE a > :watermark AND b = pg_read_file('x') LIMIT :batch",
+            "postgresql",
+            "pg_read_file",
+        ),
+        (
+            "SELECT id, (SELECT lo_import('/etc/passwd')) FROM t WHERE a > :watermark LIMIT :batch",
+            "postgresql",
+            "lo_import",
+        ),
+        (
+            "SELECT id FROM t WHERE a > :watermark AND b = get_lock('x', 1) LIMIT :batch",
+            "mysql",
+            "get_lock",
+        ),
+        (
+            "SELECT id FROM t WHERE a > :watermark AND b = sys_exec('x') LIMIT :batch",
+            "mysql",
+            "sys_exec",
+        ),
+        (
+            "SELECT TOP (:batch) id FROM t WHERE a > :watermark AND b = sp_executesql('x')",
+            "mssql",
+            "sp_executesql",
+        ),
+        (
+            "SELECT TOP (:batch) id FROM t WHERE a > :watermark AND b = dbo.fn_custom(a)",
+            "mssql",
+            "fn_custom",
+        ),
+        (
+            "SELECT id FROM t WHERE a > :watermark AND b = my_udf(a) LIMIT :batch",
+            "postgresql",
+            "my_udf",
+        ),
+        (
+            (
+                "SELECT id FROM t WHERE a > :watermark AND b = query_to_xml('x', true, true, '') "
+                "LIMIT :batch"
+            ),
+            "postgresql",
+            "query_to_xml",
+        ),
+        # Table-valued functions and remote sources in FROM
+        (
+            "SELECT * FROM generate_series(1, 10) WHERE a > :watermark LIMIT :batch",
+            "postgresql",
+            "table-valued function",
+        ),
+        (
+            "SELECT * FROM t, LATERAL unnest(t.arr) u WHERE a > :watermark LIMIT :batch",
+            "postgresql",
+            "unnest",
+        ),
+        (
+            (
+                "SELECT * FROM dblink('x', 'DELETE FROM t') AS r(a int) WHERE a > :watermark "
+                "LIMIT :batch"
+            ),
+            "postgresql",
+            "DBLINK",
+        ),
+        (
+            (
+                "SELECT a FROM t, JSON_TABLE(t.j, '$[*]' COLUMNS (x INT PATH '$.x')) jt "
+                "WHERE a > :watermark LIMIT :batch"
+            ),
+            "mysql",
+            "jsontable",
+        ),
+        (
+            "SELECT TOP (:batch) * FROM OPENQUERY(lnk, 'DELETE FROM x') WHERE a > :watermark",
+            "mssql",
+            "OPENQUERY",
+        ),
+        (
+            (
+                "SELECT TOP (:batch) * FROM OPENROWSET('SQLNCLI', 'x', 'DELETE FROM x') "
+                "WHERE a > :watermark"
+            ),
+            "mssql",
+            "OPENROWSET",
+        ),
+        (
+            (
+                "SELECT TOP (:batch) * FROM OPENDATASOURCE('SQLNCLI', 'x').db.dbo.t "
+                "WHERE a > :watermark"
+            ),
+            "mssql",
+            "OPENDATASOURCE",
+        ),
+        ("SELECT TOP (:batch) * FROM lnk.db.dbo.t WHERE a > :watermark", "mssql", "linked server"),
+        (
+            "SELECT TOP (:batch) * FROM dbo.fn_split('a,b') WHERE a > :watermark",
+            "mssql",
+            "table-valued function fn_split",
+        ),
+        (
+            "SELECT TOP (:batch) * FROM t CROSS APPLY STRING_SPLIT(t.x, ',') WHERE a > :watermark",
+            "mssql",
+            "string_split",
+        ),
+        (
+            "SELECT TOP (:batch) * FROM t CROSS APPLY OPENJSON(t.j) WHERE a > :watermark",
+            "mssql",
+            "openjson",
+        ),
+        # Hints, sequences and tableless statements
+        ("SELECT TOP (:batch) * FROM t WITH (NOLOCK) WHERE a > :watermark", "mssql", "table hints"),
+        (
+            "SELECT TOP (:batch) * FROM t WITH (TABLOCKX, HOLDLOCK) WHERE a > :watermark",
+            "mssql",
+            "not allowed on t",
+        ),
+        ("SELECT * FROM t USE INDEX (i) WHERE a > :watermark LIMIT :batch", "mysql", "table hints"),
+        (
+            "SELECT /*+ MAX_EXECUTION_TIME(0) */ a FROM t WHERE a > :watermark LIMIT :batch",
+            "mysql",
+            "optimizer hints",
+        ),
+        (
+            "SELECT TOP (:batch) NEXT VALUE FOR dbo.seq, a FROM t WHERE a > :watermark",
+            "mssql",
+            "NEXT VALUE FOR",
+        ),
+        (
+            "SELECT TOP (:batch) a FROM t WHERE a > :watermark AND b = NEXT VALUE FOR dbo.seq",
+            "mssql",
+            "NEXT VALUE FOR",
+        ),
+        ("SELECT 1 WHERE 1 > :watermark LIMIT :batch", "postgresql", "at least one table"),
+        (
+            "WITH x AS (SELECT 1 AS a) SELECT a FROM x WHERE a > :watermark LIMIT :batch",
+            "postgresql",
+            "at least one table",
+        ),
+    ],
+)
+def test_adr_0037_refusals(sql: str, dialect: str, reason: str) -> None:
+    with pytest.raises(StatementCheckError, match=reason):
+        check_statement(sql, dialect)  # type: ignore[arg-type]
+
+
+def test_reads_that_are_not_writes_stay_allowed() -> None:
+    """Derived tables, joins, set operations, temporal and sampled reads only read."""
+    for sql, dialect in [
+        ("SELECT * FROM (SELECT id FROM t WHERE a > :watermark) s LIMIT :batch", "postgresql"),
+        (
+            "SELECT t.a FROM t LEFT JOIN u ON u.id = t.id WHERE a > :watermark LIMIT :batch",
+            "postgresql",
+        ),
+        ("SELECT a FROM ONLY t WHERE a > :watermark LIMIT :batch", "postgresql"),
+        ("SELECT a FROM t TABLESAMPLE SYSTEM (1) WHERE a > :watermark LIMIT :batch", "postgresql"),
+        ("SELECT a FROM t PARTITION (p0) WHERE a > :watermark LIMIT :batch", "mysql"),
+        ("SELECT TOP (:batch) a FROM t FOR SYSTEM_TIME ALL WHERE a > :watermark", "mssql"),
+        ("SELECT TOP (:batch) a FROM db.dbo.t WHERE a > :watermark", "mssql"),
+    ]:
+        assert check_statement(sql, dialect).tables  # type: ignore[arg-type]
+
+
+def test_the_allowlists_hold_no_table_valued_or_writing_function() -> None:
+    """The lists are code, so a reviewer sees every addition; this pins what must never be
+    on them."""
+    names = {cls.__name__.lower() for cls in ALLOWED_FUNCTION_TYPES}
+    assert names.isdisjoint({"unnest", "openjson", "jsontable", "explode", "generateseries"})
+    for dialect, allowed in ALLOWED_FUNCTIONS.items():
+        assert allowed == {name.lower() for name in allowed}, dialect
+        assert allowed.isdisjoint(
+            {
+                "nextval",
+                "setval",
+                "pg_sleep",
+                "sleep",
+                "load_file",
+                "xp_cmdshell",
+                "sp_executesql",
+                "openquery",
+                "openrowset",
+                "opendatasource",
+                "dblink",
+                "get_lock",
+                "sys_exec",
+                "set_config",
+                "pg_read_file",
+                "lo_import",
+            }
+        ), dialect
 
 
 def test_statement_length_limit() -> None:
@@ -254,7 +512,9 @@ def test_postgres_privilege_queries_and_findings() -> None:
 
 
 def test_mysql_grant_parsing() -> None:
-    query = privilege_queries("mysql", ["purchase_orders"])[0]
+    roles_query, query = privilege_queries("mysql", ["purchase_orders"])
+    assert roles_query.sql == "SELECT CURRENT_ROLE() AS roles"
+    assert write_findings("mysql", roles_query, [{"roles": "`r`@`%`"}]) == []
     assert query.sql == "SHOW GRANTS FOR CURRENT_USER()"
     read_only = [
         {"Grants for carto_ro@%": "GRANT USAGE ON *.* TO `carto_ro`@`%`"},
@@ -278,10 +538,67 @@ def test_mysql_grant_parsing() -> None:
     assert "login has BACKUP_ADMIN on *.*" in findings
 
 
+def test_mysql_roles_are_collected_and_expanded() -> None:
+    """ADR 0037 item 3: CURRENT_ROLE() and the role-grant lines name the roles; the connector
+    then asks SHOW GRANTS ... USING them. Role lines themselves are not write findings."""
+    lines = [
+        "GRANT USAGE ON *.* TO `carto_ro`@`%`",
+        "GRANT SELECT ON `wms`.`purchase_orders` TO `carto_ro`@`%`",
+        "GRANT `wms_writer`@`%`,`auditor`@`localhost` TO `carto_ro`@`%`",
+    ]
+    assert mysql_roles("NONE", lines) == ["`wms_writer`@`%`", "`auditor`@`localhost`"]
+    assert mysql_roles("`active`@`%`", lines) == [
+        "`active`@`%`",
+        "`wms_writer`@`%`",
+        "`auditor`@`localhost`",
+    ]
+    assert mysql_roles(None, []) == []
+    assert mysql_roles("`wms_writer`@`%`", lines)[0] == "`wms_writer`@`%`"  # deduplicated
+    assert (
+        mysql_grants_using_sql(["`wms_writer`@`%`", "`auditor`@`localhost`"])
+        == "SHOW GRANTS FOR CURRENT_USER() USING `wms_writer`@`%`, `auditor`@`localhost`"
+    )
+    _roles, grants = privilege_queries("mysql", ["purchase_orders"])
+    rows = [{"Grants for carto_ro@%": line} for line in lines]
+    assert write_findings("mysql", grants, rows) == []
+    # A name with a backtick cannot be rebuilt into an account, so it never reaches the query.
+    assert mysql_roles("`bad``name`@`%`", []) == ["`name`@`%`"]
+
+
+def test_an_unreadable_mysql_grant_line_is_a_write_finding() -> None:
+    """ADR 0037 item 3: the parser does not know the line is harmless, so it is not."""
+    _roles, grants = privilege_queries("mysql", ["purchase_orders"])
+    rows = [
+        {"Grants for u@%": "GRANT SELECT ON `wms`.`purchase_orders` TO `u`@`%`"},
+        {"Grants for u@%": "SOMETHING NEW THE SERVER SAYS"},
+        {"Grants for u@%": "REVOKE INSERT ON `wms`.* FROM `u`@`%`"},
+    ]
+    findings = write_findings("mysql", grants, rows)
+    assert findings == ["grant line could not be read: 'SOMETHING NEW THE SERVER SAYS'"]
+    long_line = "X" * 500
+    assert write_findings("mysql", grants, [{"g": long_line}]) == [
+        f"grant line could not be read: {'X' * 80!r}"
+    ]
+
+
 def test_mssql_privilege_queries_and_findings() -> None:
     queries = privilege_queries("mssql", ["dbo.purchase_orders"])
+    assert [query.name for query in queries] == ["table", "database", "role", "linked servers"]
     assert "HAS_PERMS_BY_NAME(:t, 'OBJECT', 'INSERT')" in queries[0].sql
-    assert "IS_SRVROLEMEMBER('sysadmin')" in queries[1].sql
+    assert "HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'INSERT')" in queries[1].sql
+    assert queries[1].params == {}
+    assert "IS_SRVROLEMEMBER('sysadmin')" in queries[2].sql
+    assert queries[3].sql == "SELECT name FROM sys.servers WHERE server_id <> 0"
+    # ADR 0037 item 2: database-scope writes and visible linked servers are findings.
+    assert write_findings(
+        "mssql", queries[1], [{"can_insert": 0, "can_update": 1, "can_delete": 0, "can_alter": 0}]
+    ) == ["login can UPDATE at database scope"]
+    assert write_findings("mssql", queries[3], []) == []
+    assert write_findings("mssql", queries[3], [{"name": "WMS-ARCHIVE"}, {"name": "ERP"}]) == [
+        "login sees linked server WMS-ARCHIVE",
+        "login sees linked server ERP",
+    ]
+    queries = privilege_queries("mssql", ["dbo.purchase_orders"])
     assert (
         write_findings(
             "mssql",
@@ -298,7 +615,7 @@ def test_mssql_privilege_queries_and_findings() -> None:
     ]
     assert write_findings(
         "mssql",
-        queries[1],
+        queries[2],
         [{"sysadmin": 1, "db_owner": 0, "db_datawriter": None, "db_ddladmin": 0}],
     ) == ["login has the sysadmin attribute"]
     assert isinstance(queries[0], PrivilegeQuery)

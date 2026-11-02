@@ -2,13 +2,14 @@
 
 Admin-written query templates (Appendix A) are checked by ``sqlglot`` at construction
 (:func:`carto_edge.connectors.sql_dialects.check_statement`: one SELECT, ``:watermark``,
-``:batch`` and, for time-typed watermarks, ``:upper``), run through SQLAlchemy 2 core ``text()``
-on synchronous engines driven with ``asyncio.to_thread``, inside read-only sessions (PostgreSQL
+``:batch`` and, for time-typed watermarks, ``:upper``; base tables, CTEs and allowlisted
+functions only, ADR 0037), run through SQLAlchemy 2 core ``text()`` on synchronous engines
+driven with ``asyncio.to_thread``, inside read-only sessions (PostgreSQL
 ``default_transaction_read_only`` plus ``BEGIN READ ONLY``; MySQL ``START TRANSACTION READ
 ONLY``; SQL Server ``ApplicationIntent=ReadOnly``). ``test()`` runs every query with ``batch=1``
-and then inspects the login's privileges on every referenced table; a login that can INSERT,
-UPDATE, DELETE or alter anything makes the result ``WRITE_CAPABLE`` and the source cannot be
-enabled.
+and then inspects the login's privileges on every referenced table, at database scope and
+through its roles; a login that can INSERT, UPDATE, DELETE or alter anything, or that sees a
+linked server, makes the result ``WRITE_CAPABLE`` and the source cannot be enabled.
 
 Each poll opens a fresh DBAPI connection (``NullPool``) through a ``creator``, so credentials are
 resolved at use (spec 14.3) and the host is validated by the network policy at every connect
@@ -61,9 +62,12 @@ from carto_edge.connectors.sql_dialects import (
     CLOCK_SQL,
     CheckedStatement,
     Dialect,
+    PrivilegeQuery,
     check_statement,
     mssql_connection_string,
     mysql_connect_kwargs,
+    mysql_grants_using_sql,
+    mysql_roles,
     mysql_session_statements,
     postgres_connect_kwargs,
     privilege_queries,
@@ -591,14 +595,35 @@ class SqlConnector:
             columns = ", ".join(rows[0].keys()) if rows else "no rows yet"
             checks.append(TestCheck(f"query {query.name}", True, columns))
         findings: list[str] = []
-        for privilege_query in privilege_queries(self.config.dialect, self.tables):
+        current_role: object = None
+        pending = list(privilege_queries(self.config.dialect, self.tables))
+        while pending:
+            privilege_query = pending.pop(0)
             try:
                 rows = await self._run_async(privilege_query.sql, privilege_query.params)
             except ConnectorError as exc:
                 checks.append(TestCheck(f"privileges {privilege_query.name}", False, str(exc)))
                 problems.append(f"privilege check {privilege_query.name!r} failed: {exc}")
                 continue
-            found = write_findings(self.config.dialect, privilege_query, rows)
+            if self.config.dialect == "mysql":
+                if privilege_query.name == "roles":
+                    current_role = next(iter(rows[0].values()), None) if rows else None
+                elif privilege_query.name == "grants":
+                    # ADR 0037 item 3: the login's roles carry privileges SHOW GRANTS lists
+                    # only when asked USING them.
+                    lines = [str(value) for row in rows for value in row.values()]
+                    roles = mysql_roles(current_role, lines)
+                    if roles:
+                        pending.append(
+                            PrivilegeQuery(
+                                "grants through roles", mysql_grants_using_sql(roles), {}
+                            )
+                        )
+            found = [
+                finding
+                for finding in write_findings(self.config.dialect, privilege_query, rows)
+                if finding not in findings
+            ]
             findings.extend(found)
             label = privilege_query.table or privilege_query.name
             checks.append(
