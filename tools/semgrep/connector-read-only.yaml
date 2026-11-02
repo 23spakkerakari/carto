@@ -10,6 +10,8 @@
 # build_request + send, SQLAlchemy execute(text(...)) and exec_driver_sql, asyncssh SFTP open
 # modes and command execution, pathlib and os file mutation. A rule that only knew .post() and
 # cursor.execute("...") matched nothing in the Splunk and SQL connectors.
+# The 2026-11-02 review added httpx stream() and Request(), os.open and SFTP open with
+# integer flags, and the SFTP mput/mcopy/setstat/utime calls.
 rules:
   - id: carto-connector-read-only
     message: >-
@@ -38,6 +40,10 @@ rules:
       - pattern: $C.truncate(...)
       - pattern: $C.symlink(...)
       - pattern: $C.link(...)
+      - pattern: $C.mput(...)
+      - pattern: $C.mcopy(...)
+      - pattern: $C.setstat(...)
+      - pattern: $C.utime(...)
       - pattern: $C.write_text(...)
       - pattern: $C.write_bytes(...)
       - pattern: os.replace(...)
@@ -54,6 +60,18 @@ rules:
       - pattern: $C.open(mode="=~/^[rbt]*[wax+][rwaxbt+]*$/", ...)
       - pattern: open($P, "=~/^[rbt]*[wax+][rwaxbt+]*$/", ...)
       - pattern: open($P, mode="=~/^[rbt]*[wax+][rwaxbt+]*$/", ...)
+      # Opening with integer flags: os.open(path, os.O_WRONLY | ...) and asyncssh's
+      # SFTPClient.open(path, FXF_WRITE | ...). A flag that writes, creates, truncates or
+      # appends, or a bare integer, is refused; os.O_RDONLY and FXF_READ alone are reads. The
+      # pflags_or_mode= keyword is refused outright: only the integer-flags call uses it.
+      - patterns:
+          - pattern-either:
+              - pattern: $C.open($P, $M, ...)
+              - pattern: $C.open($P, flags=$M, ...)
+          - metavariable-regex:
+              metavariable: $M
+              regex: ^(0[xXoObB][0-9a-fA-F_]+|[0-9][0-9_]*)$|O_(WRONLY|RDWR|CREAT|TRUNC|APPEND)|FXF_(WRITE|APPEND|CREAT|TRUNC|EXCL)
+      - pattern: $C.open($P, pflags_or_mode=$M, ...)
       # Command execution on an SSH connection (asyncssh SSHClientConnection)
       - pattern: $C.run(...)
       - pattern: $C.create_process(...)
@@ -80,6 +98,23 @@ rules:
       - pattern: $C.build_request(method="PUT", ...)
       - pattern: $C.build_request(method="PATCH", ...)
       - pattern: $C.build_request(method="DELETE", ...)
+      # httpx streaming requests and request objects built by hand, then sent
+      - pattern: $C.stream("POST", ...)
+      - pattern: $C.stream("PUT", ...)
+      - pattern: $C.stream("PATCH", ...)
+      - pattern: $C.stream("DELETE", ...)
+      - pattern: $C.stream(method="POST", ...)
+      - pattern: $C.stream(method="PUT", ...)
+      - pattern: $C.stream(method="PATCH", ...)
+      - pattern: $C.stream(method="DELETE", ...)
+      - pattern: httpx.Request("POST", ...)
+      - pattern: httpx.Request("PUT", ...)
+      - pattern: httpx.Request("PATCH", ...)
+      - pattern: httpx.Request("DELETE", ...)
+      - pattern: httpx.Request(method="POST", ...)
+      - pattern: httpx.Request(method="PUT", ...)
+      - pattern: httpx.Request(method="PATCH", ...)
+      - pattern: httpx.Request(method="DELETE", ...)
       # SQL DML and DDL
       # Semgrep regex strings have no \b, so the keyword boundary is spelled out (updated_at in a
       # SELECT must not match).

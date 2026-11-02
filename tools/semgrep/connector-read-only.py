@@ -5,8 +5,11 @@
 import os
 import shutil
 
+import asyncssh
+import httpx
 import sqlalchemy
 import sqlalchemy as sa
+from asyncssh import FXF_CREAT, FXF_READ, FXF_TRUNC, FXF_WRITE
 from sqlalchemy import text
 
 
@@ -163,3 +166,104 @@ def sqlalchemy_core(connection, session, sql):
     session.exec_driver_sql("  DROP TABLE t")
     # ruleid: carto-connector-read-only
     session.exec_driver_sql("EXEC sp_who")
+
+
+async def sftp_mutation(sftp, path, other, attrs):
+    # ok: carto-connector-read-only
+    await sftp.lstat(path)
+    # ok: carto-connector-read-only
+    await sftp.getcwd()
+    # ruleid: carto-connector-read-only
+    await sftp.mput("local*.csv", path)
+    # ruleid: carto-connector-read-only
+    await sftp.mcopy(path, other)
+    # ruleid: carto-connector-read-only
+    await sftp.setstat(path, attrs)
+    # ruleid: carto-connector-read-only
+    await sftp.utime(path)
+    # ruleid: carto-connector-read-only
+    await sftp.chmod(path, 0o600)
+    # ruleid: carto-connector-read-only
+    await sftp.chown(path, 0, 0)
+    # ruleid: carto-connector-read-only
+    await sftp.rmdir(path)
+    # ruleid: carto-connector-read-only
+    await sftp.unlink(path)
+    # ruleid: carto-connector-read-only
+    await sftp.symlink(path, other)
+    # ruleid: carto-connector-read-only
+    await sftp.truncate(path, 0)
+    # ruleid: carto-connector-read-only
+    await sftp.posix_rename(path, other)
+    # ruleid: carto-connector-read-only
+    await sftp.copy(path, other)
+
+
+async def sftp_integer_flags(sftp, path):
+    # ok: carto-connector-read-only
+    async with sftp.open(path, FXF_READ) as handle:
+        await handle.read()
+    # ok: carto-connector-read-only
+    async with sftp.open(path, asyncssh.FXF_READ) as handle:
+        await handle.read()
+    # ruleid: carto-connector-read-only
+    async with sftp.open(path, FXF_WRITE) as handle:
+        await handle.write(b"x")
+    # ruleid: carto-connector-read-only
+    async with sftp.open(path, FXF_READ | FXF_WRITE) as handle:
+        await handle.write(b"x")
+    # ruleid: carto-connector-read-only
+    async with sftp.open(path, asyncssh.FXF_CREAT | asyncssh.FXF_TRUNC) as handle:
+        await handle.write(b"x")
+    # ruleid: carto-connector-read-only
+    async with sftp.open(path, FXF_CREAT) as handle:
+        await handle.write(b"x")
+    # ruleid: carto-connector-read-only
+    async with sftp.open(path, 0x2) as handle:
+        await handle.write(b"x")
+    # ruleid: carto-connector-read-only
+    async with sftp.open(path, pflags_or_mode=FXF_READ) as handle:
+        await handle.read()
+    # ruleid: carto-connector-read-only
+    async with sftp.open(path, pflags_or_mode=FXF_WRITE) as handle:
+        await handle.write(b"x")
+
+
+def os_open(path):
+    # ok: carto-connector-read-only
+    os.open(path, os.O_RDONLY)
+    # ok: carto-connector-read-only
+    os.open(path, os.O_RDONLY | os.O_CLOEXEC)
+    # ruleid: carto-connector-read-only
+    os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    # ruleid: carto-connector-read-only
+    os.open(path, os.O_RDWR)
+    # ruleid: carto-connector-read-only
+    os.open(path, os.O_RDONLY | os.O_CREAT)
+    # ruleid: carto-connector-read-only
+    os.open(path, flags=os.O_APPEND | os.O_WRONLY)
+    # ruleid: carto-connector-read-only
+    os.open(path, 1)
+
+
+def httpx_stream_and_request(client, url):
+    # ok: carto-connector-read-only
+    client.stream("GET", url, params={"output_mode": "json"})
+    # ok: carto-connector-read-only
+    client.stream(method="HEAD", url=url)
+    # ok: carto-connector-read-only
+    httpx.Request("GET", url)
+    # ok: carto-connector-read-only
+    httpx.Request(method="HEAD", url=url)
+    # ruleid: carto-connector-read-only
+    client.stream("POST", url, data={"search": "x"})
+    # ruleid: carto-connector-read-only
+    client.stream("DELETE", url)
+    # ruleid: carto-connector-read-only
+    client.stream(method="PUT", url=url)
+    # ruleid: carto-connector-read-only
+    httpx.Request("POST", url, data={"search": "x"})
+    # ruleid: carto-connector-read-only
+    httpx.Request("PATCH", url)
+    # ruleid: carto-connector-read-only
+    httpx.Request(method="DELETE", url=url)

@@ -14,9 +14,12 @@ commands with every release, so the check names what is allowed:
   implicit ``search`` unless the text starts with ``|`` (a generating command). Inside brackets
   the first word is taken as a command (``appendpipe`` and ``foreach`` run it as one), unless
   it is a ``key=value`` term or a quoted string. Macros (backquoted names) are refused: they
-  expand to text the check cannot see. ``from`` may read only ``datamodel:`` and ``lookup:``
-  datasets: ``from savedsearch:<name>`` runs a saved search the check cannot see, the same
-  thing the refused ``savedsearch`` command does. Anything the scanner cannot read with
+  expand to text the check cannot see. The commands that take dataset arguments (``from``,
+  ``union``, ``join`` and ``append``, :data:`DATASET_COMMANDS`) may name only ``datamodel:``
+  and ``lookup:`` datasets beside their subsearches: ``savedsearch:<name>`` in any of them
+  runs a saved search the check cannot see, the same thing the refused ``savedsearch``
+  command does, and a dataset of any other kind is refused with it. Anything the scanner
+  cannot read with
   certainty (an unterminated quote, an unbalanced bracket, an empty stage, an unquoted
   backslash right before ``|``, ``[``, ``]`` or a backtick, which Splunk may not treat as an
   escape) is refused.
@@ -33,11 +36,12 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable
-from typing import Final
+from typing import Final, NoReturn
 
 from carto_edge.connectors.base import InvalidConfigError
 
 __all__ = [
+    "DATASET_COMMANDS",
     "READ_CAPABILITIES",
     "READ_CAPABILITY_PREFIXES",
     "READ_ONLY_COMMANDS",
@@ -152,9 +156,19 @@ READ_CAPABILITY_PREFIXES: Final = ("list_", "get_")
 
 MAX_DEPTH: Final = 8
 _COMMAND: Final = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+DATASET_COMMANDS: Final = frozenset({"append", "from", "join", "union"})
+"""Read-only commands that take a dataset argument beside (or instead of) a subsearch; their
+arguments are checked by :func:`_check_dataset_arguments` (2026-11-01 review H1, 2026-11-02
+review H2)."""
+_DATASET_KINDS: Final = frozenset({"datamodel", "lookup"})
+"""The dataset kinds those commands may read: ``datamodel:<name>`` and ``lookup:<name>`` (also
+the function form ``lookup(<name>)``). ``savedsearch:<name>`` is not among them."""
 _FROM_DATASET: Final = re.compile(r"\s*(datamodel|lookup)\s*[:(]", re.IGNORECASE)
-"""The dataset kinds ``from`` may read: ``datamodel:<name>`` and ``lookup:<name>`` (also the
-function form ``lookup(<name>)``). ``savedsearch:<name>`` is not among them."""
+"""``from`` names its dataset first and names nothing else: the first argument must be one
+of the two kinds."""
+_DATASET_REFERENCE: Final = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\s*[:(]")
+"""A ``<kind>:<name>`` or ``<kind>(<name>)`` token: a dataset reference of that kind."""
+_SAVED_SEARCH: Final = "savedsearch"
 _ESCAPE_DELIMITERS: Final = frozenset("|[]`")
 
 
@@ -267,16 +281,41 @@ def _implicit_search(stage: str) -> bool:
     return "=" in first or first.startswith(('"', "(", "[", "-", "*"))
 
 
-def _check_from_dataset(stage: str) -> None:
-    """``from`` reads a dataset by kind; only data models and lookups are datasets carto can
-    see through (2026-11-01 review, H1)."""
-    rest = stage.lstrip()[len("from") :]
-    if _FROM_DATASET.match(rest) is None:
-        msg = (
-            "'from' may read only 'datamodel:' and 'lookup:' datasets (ADR 0037); "
-            "'from savedsearch:' runs a saved search carto cannot check"
-        )
-        raise SearchCheckError(msg)
+def _refuse_dataset(name: str) -> NoReturn:
+    msg = (
+        f"'{name}' may read only 'datamodel:' and 'lookup:' datasets (ADR 0037); a "
+        "'savedsearch' or other dataset kind runs a search carto cannot check"
+    )
+    raise SearchCheckError(msg)
+
+
+def _is_option(token: str) -> bool:
+    """``key=value``: an option of the command (``type=left``, ``maxout=100``) or a ``join``
+    condition (``L.id=R.id``), not a dataset."""
+    head, sep, _ = token.partition("=")
+    return bool(sep) and ":" not in head and "(" not in head
+
+
+def _check_dataset_arguments(name: str, stage: str) -> None:
+    """``from``, ``union``, ``join`` and ``append`` read datasets by kind; only data models and
+    lookups are datasets carto can see through (2026-11-01 review H1, 2026-11-02 review H2).
+    Every argument token of the stage is judged: subsearches are already blanked to ``[]`` and
+    options are ``key=value``; anything else that starts with ``savedsearch`` (any case, any
+    form, quoted or not) or reads as ``<kind>:`` / ``<kind>(`` with another kind is refused.
+    Bare words pass, because ``join`` names its fields that way; ``from`` alone must name a
+    dataset of an allowed kind first and is refused with a bare name or nothing."""
+    rest = stage.lstrip()[len(name) :]
+    if name == "from" and _FROM_DATASET.match(rest) is None:
+        _refuse_dataset(name)
+    for argument in rest.split():
+        if argument == "[]" or _is_option(argument):
+            continue
+        candidate = argument.lstrip('"')
+        if candidate.lower().startswith(_SAVED_SEARCH):
+            _refuse_dataset(name)
+        reference = _DATASET_REFERENCE.match(candidate)
+        if reference is not None and reference.group(1).lower() not in _DATASET_KINDS:
+            _refuse_dataset(name)
 
 
 def _walk(text: str, *, nested: bool, depth: int, found: list[str]) -> None:
@@ -301,8 +340,8 @@ def _walk(text: str, *, nested: bool, depth: int, found: list[str]) -> None:
                 "ask for a read-only command to be added"
             )
             raise SearchCheckError(msg)
-        if name == "from":
-            _check_from_dataset(stage)
+        if name in DATASET_COMMANDS:
+            _check_dataset_arguments(name, stage)
         found.append(name)
         for subsearch in subsearches:
             _walk(subsearch, nested=True, depth=depth + 1, found=found)
