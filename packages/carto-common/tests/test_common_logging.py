@@ -1004,6 +1004,24 @@ def test_http_client_request_lines_never_reach_the_log(clean_structlog: None) ->
         assert logging.getLogger(name).getEffectiveLevel() >= logging.WARNING
 
 
+def test_detector_and_miner_debug_lines_never_reach_the_log(clean_structlog: None) -> None:
+    """presidio logs the raw words around a detected entity at DEBUG (``Context list is``), and
+    Drain3 the message it mines; the 2026-11-02 leak run caught an amount that way (spec 2.3
+    invariant 7)."""
+    stream = io.StringIO()
+    configure_logging("edge", level="debug", stream=stream)
+    logging.getLogger("presidio-analyzer").debug("Context list is: 434.58 3 quokka@example.com")
+    logging.getLogger("decision_process").info("Supportive context word: quokka-77")
+    logging.getLogger("drain3.template_miner").info("Starting Drain3 template miner")
+    logging.getLogger("spacy").info("loaded model quokka-77")
+    logging.getLogger("presidio-analyzer").warning("recognizer failed to load")
+    text = stream.getvalue()
+    assert "434.58" not in text
+    assert "quokka" not in text
+    assert "Starting Drain3" not in text
+    assert "recognizer failed to load" in text
+
+
 def test_contextvars_are_merged_and_masked(clean_structlog: None) -> None:
     stream = io.StringIO()
     configure_logging("edge", stream=stream)
