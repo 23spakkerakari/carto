@@ -118,7 +118,10 @@ def test_ensure_local_keys_only_creates_for_the_local_provider(tmp_path: Path) -
     cfg = settings(
         tmp_path,
         kms=KmsSettings(
-            provider="vault", vault_url="https://vault.internal:8200", vault_token_file=token_file
+            provider="vault",
+            vault_url="https://vault.internal:8200",
+            vault_token_file=token_file,
+            vault_ca_file=tmp_path / "vault-ca.pem",  # checked when the client is built
         ),
     )
     with pytest.raises(KeyManagementError, match="vault KMS"):

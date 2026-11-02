@@ -31,6 +31,7 @@ from carto_edge.config import EdgeSettings, KmsSettings, RevealSettings
 from carto_edge.keys import (
     ASSERTION_PUBLIC_KEY_FILE,
     LOCAL_KMS_KEY_FILE,
+    MAX_OVERLAP_DAYS,
     ROTATION_FILE,
     VAULT_DATA_KEY_FILE,
     KeyManagementError,
@@ -236,6 +237,29 @@ def test_default_overlap_is_at_least_the_event_retention(tmp_path: Path, clock: 
     assert rotation["overlap_days"] == 45
 
 
+def test_rotate_enforces_the_overlap_ceiling(
+    settings: EdgeSettings, manager: KeyManager, tmp_path: Path, clock: FakeClock
+) -> None:
+    """Review of 2026-11-02: the ceiling the CLI flag had is enforced by ``rotate`` itself, and
+    it is the events retention ceiling so the default always fits."""
+    assert MAX_OVERLAP_DAYS == 400
+    for bad in (0, -1, MAX_OVERLAP_DAYS + 1, 10_000):
+        with pytest.raises(KeyManagementError, match="between 1 and 400"):
+            manager.rotate(overlap_days=bad)
+    assert read_json(settings.keys_dir / ROTATION_FILE)["active_version"] == 1  # nothing changed
+    manager.rotate(overlap_days=MAX_OVERLAP_DAYS)
+    assert read_json(settings.keys_dir / ROTATION_FILE)["overlap_days"] == MAX_OVERLAP_DAYS
+    longest = EdgeSettings(
+        state_dir=tmp_path / "longest",
+        tenant_id="acme",
+        retention=RetentionSettings(events_days=400, txn_membership_days=400),
+    )
+    other = KeyManager(longest, clock=clock)
+    other.init(create_local_kms=True)
+    other.rotate()
+    assert read_json(longest.keys_dir / ROTATION_FILE)["overlap_days"] == 400
+
+
 def test_rotate_before_init_fails(settings: EdgeSettings) -> None:
     LocalKms.create(settings.local_kms_key_file)
     with pytest.raises(KeyManagementError):
@@ -346,13 +370,69 @@ def test_build_kms_local(settings: EdgeSettings) -> None:
     assert kms.key_id == created.key_id
 
 
+def _ca_bundle(tmp_path: Path) -> Path:
+    from carto_common.pki import create_ca  # noqa: PLC0415
+
+    bundle = tmp_path / "vault-ca.pem"
+    bundle.write_bytes(create_ca().certificate_pem)
+    return bundle
+
+
+def test_kms_settings_vault_requires_the_ca_bundle(tmp_path: Path) -> None:
+    """Review of 2026-11-02 (Medium): without a bundle the only context the edge could build
+    would be the default one, which honours ``SSL_CERT_FILE``; the setting is refused by name."""
+    token_file = tmp_path / "vault.token"
+    with pytest.raises(ValueError, match=r"kms\.vault_ca_file"):
+        KmsSettings(
+            provider="vault", vault_url="https://vault.internal:8200", vault_token_file=token_file
+        )
+    with pytest.raises(ValueError, match=r"kms\.vault_url and kms\.vault_token_file"):
+        KmsSettings(provider="vault", vault_ca_file=tmp_path / "ca.pem")
+    assert KmsSettings(vault_url="https://vault.internal:8200").vault_ca_file is None  # local
+
+
+def test_build_kms_vault_passes_the_ca_bundle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    token_file = tmp_path / "vault.token"
+    token_file.write_text("hvs.secret\n", encoding="utf-8")
+    bundle = _ca_bundle(tmp_path)
+    settings = EdgeSettings(
+        state_dir=tmp_path / "state",
+        kms=KmsSettings(
+            provider="vault",
+            vault_url="https://vault.internal:8200",
+            vault_token_file=token_file,
+            vault_ca_file=bundle,
+        ),
+    )
+    seen: dict[str, object] = {}
+
+    class Recording:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            seen.update(kwargs)
+
+    monkeypatch.setattr("carto_edge.keys.VaultTransitKms", Recording)
+    build_kms(settings)
+    assert seen["ca_file"] == bundle
+    monkeypatch.undo()
+    assert isinstance(build_kms(settings), VaultTransitKms)
+    bundle.unlink()
+    with pytest.raises(KeyManagementError, match="ca_file") as info:
+        build_kms(settings)
+    assert "hvs.secret" not in str(info.value)
+
+
 def test_build_kms_vault_caps_the_token_file_size(tmp_path: Path) -> None:
     """The same 4096-byte cap as ``carto-ctl key init`` (ADR 0070 section 7)."""
     token_file = tmp_path / "vault.token"
     settings = EdgeSettings(
         state_dir=tmp_path / "state",
         kms=KmsSettings(
-            provider="vault", vault_url="https://vault.internal:8200", vault_token_file=token_file
+            provider="vault",
+            vault_url="https://vault.internal:8200",
+            vault_token_file=token_file,
+            vault_ca_file=_ca_bundle(tmp_path),
         ),
     )
     token_file.write_bytes(b"h" * 4097)
@@ -373,6 +453,7 @@ def test_build_kms_vault_reads_the_token_from_a_file(tmp_path: Path) -> None:
             vault_transit_key="carto-edge",
             vault_mount="kms",
             vault_token_file=token_file,
+            vault_ca_file=_ca_bundle(tmp_path),
         ),
     )
     with pytest.raises(KeyManagementError, match="token file"):
@@ -433,6 +514,7 @@ def test_key_manager_through_vault_transit(tmp_path: Path, clock: FakeClock) -> 
             provider="vault",
             vault_url="https://vault.internal:8200",
             vault_token_file=tmp_path / "token",
+            vault_ca_file=tmp_path / "vault-ca.pem",
         ),
     )
     manager = KeyManager(settings, kms, clock=clock)

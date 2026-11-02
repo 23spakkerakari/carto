@@ -13,7 +13,13 @@ from pathlib import Path
 import httpx
 import pytest
 
-from carto_common.crypto import LocalKms, VaultTransitKms, WrappedKey, key_fingerprint
+from carto_common.crypto import (
+    CryptoError,
+    LocalKms,
+    VaultTransitKms,
+    WrappedKey,
+    key_fingerprint,
+)
 from carto_ctl.cli import main
 from carto_ctl.exit_codes import EXIT_FAILURE, EXIT_OK, EXIT_USAGE
 from carto_ctl.keyinit import DEFAULT_STATE_DIR, KeyInitOptions, initialize_keys
@@ -123,10 +129,53 @@ def test_vault_requires_url_and_token_file(
     state = tmp_path / "state"
     assert _run(state, "--kms", "vault") == EXIT_USAGE
     err = capsys.readouterr().err
-    assert "--vault-url" in err and "--vault-token-file" in err
+    assert "--vault-url" in err and "--vault-token-file" in err and "--vault-ca-file" in err
     assert not state.exists()
     assert _run(state, "--kms", "vault", "--vault-url", "https://vault:8200") == EXIT_USAGE
     assert not state.exists()
+    token_file = tmp_path / "vault-token"
+    token_file.write_text("s.test-token\n", encoding="utf-8")
+    url_and_token = ("--vault-url", "https://vault:8200", "--vault-token-file", str(token_file))
+    assert _run(state, "--kms", "vault", *url_and_token) == EXIT_USAGE
+    assert "--vault-ca-file" in capsys.readouterr().err
+    assert not state.exists()
+
+
+def test_vault_ca_file_reaches_the_transit_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Review of 2026-11-02 (Medium): ``key init --kms vault`` verifies Vault against the
+    bundle it is given, never the system trust store."""
+    token_file = tmp_path / "vault-token"
+    token_file.write_text("s.test-token\n", encoding="utf-8")
+    bundle = tmp_path / "vault-ca.pem"
+    bundle.write_bytes(b"not read by the fake")
+    seen: dict[str, object] = {}
+
+    class Recording:
+        provider = "vault"
+        key_id = "vault:transit/carto"
+
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            seen.update(kwargs)
+            msg = "stop here"
+            raise CryptoError(msg)
+
+    monkeypatch.setattr("carto_ctl.keyinit.VaultTransitKms", Recording)
+    code = _run(
+        tmp_path / "state",
+        "--kms",
+        "vault",
+        "--vault-url",
+        "https://vault.internal:8200",
+        "--vault-token-file",
+        str(token_file),
+        "--vault-ca-file",
+        str(bundle),
+    )
+    assert code == EXIT_FAILURE
+    assert seen["ca_file"] == bundle
+    assert "s.test-token" not in capsys.readouterr().err
 
 
 def test_vault_token_is_never_an_option_value(
@@ -185,8 +234,12 @@ def test_vault_transit_wraps_through_the_transit_api(tmp_path: Path) -> None:
 def test_unreachable_vault_fails_cleanly_without_writing_a_tenant_key(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    from carto_common.pki import create_ca  # noqa: PLC0415
+
     token_file = tmp_path / "vault-token"
     token_file.write_text("s.test-token\n", encoding="utf-8")
+    bundle = tmp_path / "vault-ca.pem"
+    bundle.write_bytes(create_ca().certificate_pem)
     state = tmp_path / "state"
     code = _run(
         state,
@@ -196,6 +249,8 @@ def test_unreachable_vault_fails_cleanly_without_writing_a_tenant_key(
         "https://127.0.0.1:1",
         "--vault-token-file",
         str(token_file),
+        "--vault-ca-file",
+        str(bundle),
     )
     assert code == EXIT_FAILURE
     err = capsys.readouterr().err
@@ -216,6 +271,8 @@ def test_missing_vault_token_file_is_a_failure(
         "https://vault:8200",
         "--vault-token-file",
         str(tmp_path / "absent"),
+        "--vault-ca-file",
+        str(tmp_path / "vault-ca.pem"),
     )
     assert code == EXIT_FAILURE
     assert "cannot read Vault token file" in capsys.readouterr().err

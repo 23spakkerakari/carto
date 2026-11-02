@@ -22,8 +22,10 @@ see the same state volume and KMS.
   until the operator has verified the backups and destroys it; with Vault Transit, rotate the
   transit key in Vault first, then ``rewrap`` wraps with its latest version. An interrupted
   rewrap is resumed by running the command again (ADR 0070 section 7): the staged ``.new``
-  master is the only key for the files already re-wrapped, so no message ever asks for it to
-  be removed.
+  master is written whole or not at all (temporary file and rename) and may be the only key
+  for the files already re-wrapped, so no message asks for it to be removed while any file
+  depends on it; a ``.new`` that cannot be opened is named for removal only once every
+  wrapped file is shown to unwrap under the current master.
 - ``secret`` (ADR 0013, spec 14.3): the ``local://`` store for Compose pilots. A value is read
   from ``--from-file`` or standard input (a prompt without echo on a terminal), never from an
   argument, so it cannot land in shell history or a process listing; ``list`` prints names only.
@@ -58,13 +60,14 @@ from carto_common.crypto import (
     LocalKms,
     WrappedKey,
     fsync_directory,
+    generate_key,
     write_private_file,
 )
 from carto_edge.audit import AuditChainError, EdgeAudit
 from carto_edge.config import ConfigError, EdgeSettings, SourceType, load_sources_file
 from carto_edge.connectors.base import ConnectorContext, ConnectorError, ReadConnector, TestResult
 from carto_edge.connectors.registry import build_connector
-from carto_edge.keys import KeyManagementError, KeyManager, build_kms
+from carto_edge.keys import MAX_OVERLAP_DAYS, KeyManagementError, KeyManager, build_kms
 from carto_edge.net.ssrf import DefaultNetworkPolicy
 from carto_edge.secrets import EdgeSecretResolver, LocalSecretStore, SecretError
 
@@ -74,8 +77,6 @@ EXIT_OK: Final = 0
 EXIT_FAILURE: Final = 1
 EXIT_USAGE: Final = 2
 MAX_SECRET_BYTES: Final = 64 * 1024
-MAX_OVERLAP_DAYS: Final = 366
-"""``--overlap-days`` ceiling: a year; ``timedelta`` would accept far more than any retention."""
 RETIRED_SUFFIX: Final = ".retired"
 NEW_SUFFIX: Final = ".new"
 RESUME_HINT: Final = "re-run `carto-edge key rewrap` to resume"
@@ -287,10 +288,17 @@ def _rewrap_local(manager: KeyManager, master: Path) -> tuple[list[Path], str, b
 
     Resumable (ADR 0070 section 7): a ``.new`` file from an interrupted run is opened, not
     replaced, since the files that run already re-wrapped unwrap under it alone; the staged
-    master is never deleted by this command. The install order keeps a master on disk at every
-    instant: the old master is copied to ``.retired`` first, then ``.new`` is renamed over the
-    master. A ``.retired`` without a ``.new`` is an earlier, completed rewrap the operator has
-    not finished (runbook: verify the backups, then destroy it), and the command refuses."""
+    master is never deleted by this command. It is written through
+    :func:`write_private_file` (a temporary file, fsync, rename), so a crash leaves a whole
+    ``.new`` or none, never a truncated one. One that still cannot be opened (review of
+    2026-11-02) is named for removal only when every wrapped key file is shown to unwrap
+    under the current master, so nothing can depend on it; otherwise the message says to keep
+    every file (:func:`_unreadable_staged_master`). The install order keeps a master on disk
+    at every instant: the old master is copied to ``.retired`` first, then ``.new`` is renamed
+    over the master; an interrupt after either step is resumed by the next run, which copies
+    and renames again. A ``.retired`` without a ``.new`` is an earlier, completed rewrap the
+    operator has not finished (runbook: verify the backups, then destroy it), and the command
+    refuses."""
     fresh_path = master.with_name(master.name + NEW_SUFFIX)
     retired = master.with_name(master.name + RETIRED_SUFFIX)
     resumed = fresh_path.exists()
@@ -304,13 +312,13 @@ def _rewrap_local(manager: KeyManager, master: Path) -> tuple[list[Path], str, b
         try:
             fresh = LocalKms.open(fresh_path)
         except CryptoError as exc:
-            msg = (
-                f"{fresh_path} was staged by an interrupted rewrap but cannot be opened; keep "
-                "it and see 'Rewrap interrupted' in docs/runbooks/key-rotation.md"
-            )
-            raise KeyManagementError(msg) from exc
+            raise KeyManagementError(
+                _unreadable_staged_master(manager, master, fresh_path)
+            ) from exc
     else:
-        fresh = LocalKms.create(fresh_path)
+        material = generate_key()
+        write_private_file(fresh_path, material)
+        fresh = LocalKms(material)
     # From here on the staged master may be the only key for some files: it is never removed.
     rewritten = manager.rewrap(fresh)
     try:
@@ -324,6 +332,33 @@ def _rewrap_local(manager: KeyManager, master: Path) -> tuple[list[Path], str, b
         )
         raise KeyManagementError(msg) from exc
     return rewritten, fresh.key_id, resumed
+
+
+def _unreadable_staged_master(manager: KeyManager, master: Path, fresh_path: Path) -> str:
+    """The message for a staged master that cannot be opened. Every wrapped key file is
+    unwrapped under the current master first: only when all of them are is it safe to say
+    that the unreadable ``.new`` may be removed (nothing depends on it); a file under any
+    other key may depend on the key ``.new`` was meant to hold, and then the message says to
+    keep every file and follow the runbook. Fails closed: a file that cannot be read counts as
+    dependent."""
+    current = manager.kms
+    dependent: list[str] = []
+    for path in manager.wrapped_key_files():
+        try:
+            current.unwrap(WrappedKey.read(path))
+        except (CryptoError, OSError):
+            dependent.append(path.name)
+    if dependent:
+        return (
+            f"{fresh_path} was staged by an interrupted rewrap but cannot be opened, and "
+            f"{', '.join(dependent)} do not unwrap under the current master {master.name}: keep "
+            "every file and see 'Rewrap interrupted' in docs/runbooks/key-rotation.md"
+        )
+    return (
+        f"{fresh_path} was staged by an interrupted rewrap but cannot be opened; every wrapped "
+        f"key file still unwraps under the current master {master.name}, so nothing depends on "
+        f"it: remove only {fresh_path.name} and re-run `carto-edge key rewrap`"
+    )
 
 
 # ---------------------------------------------------------------------------------------------

@@ -178,6 +178,15 @@ Six smaller findings of the same audit, recorded together because each is one na
   the backups and destroy it per the runbook, not to remove anything. The runbook gains a
   "Rewrap interrupted" section. Tests cut the power on the second staging replace and show
   the next run finishing with every file under the new master.
+  *Amendment (review of 2026-11-02, Low).* `.new` was created with `LocalKms.create`, so an
+  interrupt while it was written left a truncated `.new` the next run could neither open nor
+  name for removal. It is now written through `write_private_file` (temporary file, fsync,
+  rename): whole or absent. When a `.new` still cannot be opened, the command unwraps every
+  wrapped key file under the current master first; only when all of them unwrap does it say
+  to remove `.new` alone and re-run (nothing depends on it); otherwise it names the files
+  that do not and says to keep everything. Tests cover the truncated `.new` in both states,
+  an interrupt after the last staging install (before `.retired` is written) and one between
+  `.retired` and the rename; the next run finishes both.
 - **`VaultTransitKms` builds its own isolated client (C, Medium).** `httpx.Client(timeout=...)`
   left `trust_env` on, so `HTTPS_PROXY` or `SSL_CERT_FILE` in the environment steered the
   Vault token and the plaintext key material to a proxy with an attacker CA. The client is now
@@ -186,6 +195,19 @@ Six smaller findings of the same audit, recorded together because each is one na
   passes `follow_redirects=False` so a caller-supplied client cannot follow either. `ca_file`
   is a constructor parameter; the edge's `KmsSettings` has no `vault_ca_file` field yet and
   `build_kms` passes none (Consequences).
+  *Amendment (review of 2026-11-02, Medium).* "From the system store" was the hole: with no
+  `ca_file` the context was `ssl.create_default_context()`, which loads OpenSSL's default
+  paths and honours `SSL_CERT_FILE` and `SSL_CERT_DIR`, so in the one configuration the edge
+  could use the environment still chose the CA. Now `KmsSettings.vault_ca_file` exists and
+  `provider: vault` is refused at settings validation without it (the message names the
+  field); `build_kms`, `carto-ctl key init --vault-ca-file` and the KV resolver's client pass
+  it to `vault_ssl_context`, which builds `SSLContext(PROTOCOL_TLS_CLIENT)` with the bundle
+  as its only `load_verify_locations`, no `load_default_certs`, TLS 1.2 minimum and the
+  hostname checked, and refuses a missing, unreadable or empty bundle by name.
+  `VaultTransitKms` refuses to build its own client without `ca_file`; a caller-supplied
+  client (tests) is still the exception. `vault://` secret references need the same field,
+  also under the local KMS provider. A test plants a hostile bundle in `SSL_CERT_FILE` and
+  `SSL_CERT_DIR` and asserts the context's CA list is the configured certificate alone.
 - **Certificates are created exclusively, after the key (D, Low).** `write_pem` and the CA
   copies in `carto-ctl pki` wrote certificates with `write_bytes`, following a planted symlink
   and overwriting, and wrote the certificate before the key, so the refusal path left a new
@@ -207,6 +229,14 @@ Six smaller findings of the same audit, recorded together because each is one na
   the command line and keep ten years). The edge's Vault token file is read with the same
   4096-byte cap as `carto-ctl key init`. `carto-edge key rotate --overlap-days` stops at 366.
   The `secret.set.intent` audit row no longer carries the value's byte length.
+  *Amendment (review of 2026-11-02, Low).* The overlap ceiling applied to the CLI flag only;
+  `KeyManager.rotate` now enforces `keys.MAX_OVERLAP_DAYS`, which the CLI imports. It is 400,
+  the ceiling of `RetentionSettings.events_days`, not 366: the default overlap is
+  `max(30, events_days)` (at least the event retention) and a ceiling below the retention
+  ceiling would refuse the default of an install with a 400-day retention. The local secret
+  store refuses a symbolic link at `secrets.sqlite`, dangling or not, before and after its
+  exclusive create (E above: a dangling link made the create fail quietly and SQLite followed
+  it).
 - **Suggestion labels cannot look like links (G, Low).** The label pattern admitted
   `http://evil.co/x`. A `label` is refused when it contains `://`, a `www.` host, or a dot
   followed by two to six letters that end a word (`evil.co`, `Order.COM`); `rationale` gets the
@@ -261,10 +291,10 @@ Six smaller findings of the same audit, recorded together because each is one na
   changed with it.
 - Section 7: an operator who has a `local-kms.key.new` from a run interrupted before this
   change runs `carto-edge key rewrap` once and it finishes; nothing has to be removed by hand.
-  `KmsSettings` still has no `vault_ca_file` field (it lives in `carto_edge.config`, outside
-  this package), so a Vault Transit server signed by a private CA needs that CA in the
-  container's system trust store until the field is added and threaded to
-  `VaultTransitKms(ca_file=...)`; `SSL_CERT_FILE` no longer works for it, on purpose. On
+  `KmsSettings.vault_ca_file` is required with the vault provider and for `vault://` secret
+  references (section 7 amendment of 2026-11-02): a pilot that used a Vault behind a public
+  CA now mounts that CA's bundle too, since the container's system trust store is never
+  consulted; `SSL_CERT_FILE` never works for it, on purpose. On
   POSIX, an install whose `local-kms.key` is group- or world-readable stops starting until the
   mode is fixed; the message says how. `pki init` now also refuses a directory holding a stray
   certificate where it would write one; `--if-missing` is unchanged (a complete run is still

@@ -88,7 +88,11 @@ audit file. The state on disk is safe as long as nothing is deleted:
   every file that already unwraps under it alone, re-wraps the rest, and only then installs the
   masters (`.retired`, then the rename). The output says it resumed. If the second run reports a
   file wrapped under neither key, restore that one file from the backup taken before the rewrap
-  (it was under the old master then) and run the command again.
+  (it was under the old master then) and run the command again. `.new` is written whole or not
+  at all; if it still cannot be opened (a damaged volume), the command first checks that every
+  wrapped file unwraps under `local-kms.key`: only then does it say to remove `.new` and re-run,
+  since nothing depends on it. If a file is under another key it says to keep every file; then
+  the staged master was the only key for that file and the backup is the way back.
 - **Local KMS, stopped while installing the masters.** `local-kms.key.new` and
   `local-kms.key.retired` both exist: every wrapped file is under `.new`. Run the command again;
   it verifies that, rewrites `.retired` from the current master and finishes the rename. A

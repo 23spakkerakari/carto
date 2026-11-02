@@ -9,6 +9,7 @@ import hmac
 import json
 import os
 import re
+import ssl
 import stat
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -40,6 +41,7 @@ from carto_common.crypto import (
     key_fingerprint,
     sign_assertion,
     token,
+    vault_ssl_context,
     verify_assertion,
 )
 
@@ -257,15 +259,65 @@ def test_vault_transit_wrap_unwrap_through_mock_transport() -> None:
     assert "s.token" not in repr(kms)
 
 
+def _ca_der(pem: bytes) -> bytes:
+    from cryptography import x509  # noqa: PLC0415
+    from cryptography.hazmat.primitives.serialization import Encoding  # noqa: PLC0415
+
+    return x509.load_pem_x509_certificate(pem).public_bytes(Encoding.DER)
+
+
+def test_vault_ssl_context_trusts_the_configured_bundle_alone(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Review of 2026-11-02 (Medium): ``create_default_context`` loads OpenSSL's default paths
+    and honours ``SSL_CERT_FILE`` and ``SSL_CERT_DIR``; the Vault context must trust the
+    configured bundle and nothing else, with the hostname checked and TLS 1.2 at least."""
+    from carto_common.pki import create_ca  # noqa: PLC0415
+
+    ours = create_ca("ours").certificate_pem
+    hostile = create_ca("hostile").certificate_pem
+    bundle = tmp_path / "vault-ca.pem"
+    bundle.write_bytes(ours)
+    hostile_dir = tmp_path / "hostile"
+    hostile_dir.mkdir()
+    (hostile_dir / "attacker-ca.pem").write_bytes(hostile)
+    monkeypatch.setenv("SSL_CERT_FILE", str(hostile_dir / "attacker-ca.pem"))
+    monkeypatch.setenv("SSL_CERT_DIR", str(hostile_dir))
+    context = vault_ssl_context(bundle)
+    assert context.get_ca_certs(binary_form=True) == [_ca_der(ours)]
+    assert _ca_der(hostile) not in context.get_ca_certs(binary_form=True)
+    assert context.check_hostname is True
+    assert context.verify_mode is ssl.CERT_REQUIRED
+    assert context.minimum_version is ssl.TLSVersion.TLSv1_2
+    # Against the default context, which is what the fix replaces.
+    polluted = ssl.create_default_context()
+    assert _ca_der(hostile) in polluted.get_ca_certs(binary_form=True)
+    empty = tmp_path / "empty.pem"
+    empty.write_bytes(b"")
+    with pytest.raises(CryptoError, match=r"no CA certificate|cannot be loaded"):
+        vault_ssl_context(empty)
+    with pytest.raises(CryptoError, match="ca_file"):
+        vault_ssl_context(tmp_path / "missing.pem")
+    # The KMS refuses to build its own client without a bundle: the system store is never used.
+    with pytest.raises(CryptoError, match="ca_file"):
+        VaultTransitKms("https://vault.internal:8200", "carto", "s.token")
+    kms = VaultTransitKms("https://vault.internal:8200", "carto", "s.token", ca_file=bundle)
+    assert kms._client.trust_env is False
+
+
 def test_vault_transit_client_ignores_the_environment_and_never_follows_redirects(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """ADR 0070 section 7: ``HTTPS_PROXY`` or ``SSL_CERT_FILE`` in the environment must not
     redirect the Vault token and the key material to a proxy with an attacker CA, and a 3xx
     from Vault must not send them to another host."""
+    from carto_common.pki import create_ca  # noqa: PLC0415
+
     monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:9")
     monkeypatch.setenv("SSL_CERT_FILE", str(tmp_path / "attacker-ca.pem"))
-    kms = VaultTransitKms("https://vault.internal:8200", "carto", "s.token")
+    bundle = tmp_path / "vault-ca.pem"
+    bundle.write_bytes(create_ca().certificate_pem)
+    kms = VaultTransitKms("https://vault.internal:8200", "carto", "s.token", ca_file=bundle)
     client = kms._client
     assert client.trust_env is False
     assert client.follow_redirects is False
@@ -303,7 +355,11 @@ def test_vault_transit_rejects_plain_http_and_bad_key_names() -> None:
         VaultTransitKms("http://vault.internal:8200", "carto", "t")
     with pytest.raises(CryptoError, match="single path segment"):
         VaultTransitKms("https://vault.internal", "a/b", "t")
-    VaultTransitKms("http://127.0.0.1:8200", "carto", "t")  # dev Vault is allowed
+    # Dev Vault over plain http on the loopback is allowed; a bundle is still required for a
+    # client the KMS builds itself, so the dev path hands one in (or, here, a client).
+    with pytest.raises(CryptoError, match="ca_file"):
+        VaultTransitKms("http://127.0.0.1:8200", "carto", "t")
+    VaultTransitKms("http://127.0.0.1:8200", "carto", "t", client=httpx.Client())
 
 
 def test_vault_transit_errors_never_include_material() -> None:

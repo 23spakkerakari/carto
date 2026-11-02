@@ -12,8 +12,9 @@
   "scripts": {
     "dev": "vite",
     "dev:mock": "vite --mode mock",
-    "build": "tsc -b && vite build && node scripts/check-build.mjs && node scripts/check-nginx.mjs",
+    "build": "tsc -b && vite build && node scripts/check-build.mjs && npm run test:scripts && node scripts/check-nginx.mjs",
     "check:nginx": "node scripts/check-nginx.mjs",
+    "test:scripts": "node --test scripts/check-nginx.test.mjs",
     "build:e2e": "vite build --mode e2e",
     "preview": "vite preview",
     "preview:e2e": "vite preview --mode e2e --host 127.0.0.1 --port 4173 --strictPort",

@@ -11,8 +11,10 @@ A ``secret_ref`` is resolved at use through :class:`EdgeSecretResolver`, the edg
   ciphertext moved to another name does not decrypt (spec 14.4 "AAD = tenant + token (or
   secret ID)"). ``put`` and ``delete`` exist for the CLI only; no connector calls them.
 - ``vault://<mount>/<path>[#<field>]``: HashiCorp Vault KV v2, ``GET /v1/<mount>/data/<path>``
-  with the token read from ``kms.vault_token_file`` (never from the environment). The field
-  defaults to ``value``.
+  with the token read from ``kms.vault_token_file`` (never from the environment) over a client
+  that verifies Vault against ``kms.vault_ca_file`` alone, as the Transit KMS does
+  (:func:`carto_common.crypto.vault_ssl_context`; ADR 0070 section 7). The field defaults to
+  ``value``.
 - ``aws-sm://``, ``azure-kv://``, ``gcp-sm://``: refused with a clear message until M6.
 
 Resolved values are cached in memory for at most 15 minutes (spec 14.3), never written to disk
@@ -45,10 +47,10 @@ from carto_common.crypto import (
     WrappedKey,
     _create_private,
     generate_key,
+    vault_ssl_context,
 )
 from carto_common.settings import validate_secret_ref
 from carto_edge.config import EdgeSettings
-from carto_edge.net.http import build_ssl_context
 
 __all__ = [
     "MAX_CACHE_SECONDS",
@@ -148,7 +150,10 @@ class LocalSecretStore:
     file is an empty database to SQLite), and the ``-wal``, ``-shm`` and ``-journal`` files
     SQLite creates under the process umask are restricted to the owner right after the first
     connection, so no file of the store is readable by others at any instant (ADR 0070
-    section 7). The rows are ciphertext either way; the modes are defence in depth."""
+    section 7). A symbolic link at the path, dangling or not, is refused before and after
+    that creation (review of 2026-11-02): the exclusive create fails on a planted link and
+    SQLite would otherwise follow it. The rows are ciphertext either way; the modes are
+    defence in depth."""
 
     __slots__ = ("_box", "_db", "_lock", "_path")
 
@@ -157,11 +162,13 @@ class LocalSecretStore:
         self._box = AesGcmBox(data_key)
         self._lock = threading.Lock()
         path.parent.mkdir(parents=True, exist_ok=True)
+        _refuse_symlink(path)
         try:
             if not path.exists():
                 # A FileExistsError means another process got there first; its file is 0600 too.
                 with contextlib.suppress(FileExistsError):
                     _create_private(path, b"")
+            _refuse_symlink(path)  # planted between the check and the create
             self._db = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
             self._db.execute("PRAGMA journal_mode=WAL")
             self._db.execute(
@@ -245,6 +252,12 @@ class LocalSecretStore:
 
     def __exit__(self, *exc: object) -> None:
         self.close()
+
+
+def _refuse_symlink(path: Path) -> None:
+    if path.is_symlink():
+        msg = f"refusing the local secret store at {path}: it is a symbolic link"
+        raise SecretError(msg)
 
 
 def _restrict_store_files(path: Path) -> None:
@@ -371,10 +384,20 @@ class EdgeSecretResolver:
 
     def _vault_client(self) -> httpx.Client:
         if self._client is None:
+            ca_file = self._settings.kms.vault_ca_file
+            if ca_file is None:  # pragma: no cover - checked by the caller
+                msg = "kms.vault_ca_file is not set"
+                raise SecretError(msg)
+            try:
+                context = vault_ssl_context(ca_file)
+            except CryptoError as exc:
+                msg = f"cannot use the Vault CA bundle {ca_file}: {exc}"
+                raise SecretError(msg) from exc
             self._client = httpx.Client(
                 timeout=VAULT_TIMEOUT_SECONDS,
                 trust_env=False,
-                verify=build_ssl_context(ca_file=None, client_cert=None, verify=True),
+                follow_redirects=False,
+                verify=context,
             )
         return self._client
 
@@ -395,8 +418,11 @@ class EdgeSecretResolver:
 
     def _resolve_vault(self, rest: str) -> str:
         kms = self._settings.kms
-        if kms.vault_url is None or kms.vault_token_file is None:
-            msg = "vault:// secret references need kms.vault_url and kms.vault_token_file"
+        if kms.vault_url is None or kms.vault_token_file is None or kms.vault_ca_file is None:
+            msg = (
+                "vault:// secret references need kms.vault_url, kms.vault_token_file and "
+                "kms.vault_ca_file"
+            )
             raise SecretError(msg)
         location, _, field_name = rest.partition("#")
         mount, _, path = location.partition("/")

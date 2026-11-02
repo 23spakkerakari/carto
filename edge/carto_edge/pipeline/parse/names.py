@@ -21,6 +21,11 @@ adds two rules, per system:
   the entry's content is under ``<parent>.<i>.value``; only the first :data:`MAX_MAP_ENTRIES`
   entries of a record are kept.
 
+A caller that gates words that are not field names (the parser's template channels, ADR
+0039 amendment) counts them under a **namespace**: a parent key of its own from
+:func:`namespace_key`, which no field path can reach, so such words and field names never
+trust each other and never make each other a map.
+
 Untrusted names and record ids are counted under a 16-byte BLAKE2b digest, so the register
 never stores a raw value; trusted names are stored in clear (they travel anyway). Memory is
 bounded by :data:`MAX_PARENTS` per system; past it, every name under a new parent is masked.
@@ -66,6 +71,7 @@ __all__ = [
     "FieldNameStore",
     "GatedRecord",
     "exempt_prefixes",
+    "namespace_key",
 ]
 
 MIN_NAME_RECORDS: Final = 3
@@ -100,6 +106,23 @@ def _join(prefix: str, segment: str) -> str:
     return f"{prefix}.{segment}" if prefix else segment
 
 
+def namespace_key(label: str) -> str:
+    """The register parent key ``<label>@`` under which words that are not field names are
+    counted. A field path's parent keys are made of :func:`safe_segment` outputs, ``#``,
+    ``~<digest>`` and ``value``, and ``safe_segment`` masks any segment with an ``@`` past
+    its first character to ``*``, so no field path ever has this key or a key below it."""
+    if not label or "@" in label or "." in label:
+        msg = "a namespace label is a non-empty string without an @ or a dot"
+        raise ValueError(msg)
+    return f"{label}@"
+
+
+def _is_namespace(key: str) -> bool:
+    return key == "" or (
+        len(key) > 1 and key.endswith("@") and "@" not in key[:-1] and "." not in key
+    )
+
+
 def exempt_prefixes(paths: Iterable[str | None]) -> frozenset[str]:
     """Every path in ``paths`` with each of its prefixes (``meta.ts`` -> ``meta``, ``meta.ts``):
     the segments the configuration names, trusted from the first record."""
@@ -129,7 +152,7 @@ class _Parent:
 @dataclass(slots=True)
 class _System:
     parents: dict[str, _Parent] = field(default_factory=dict)
-    cache: dict[tuple[str | SegmentPath, frozenset[str]], str] = field(default_factory=dict)
+    cache: dict[tuple[str, str | SegmentPath, frozenset[str]], str] = field(default_factory=dict)
     dirty: bool = False
 
 
@@ -222,6 +245,7 @@ class FieldNameStore:
         *,
         structure: Mapping[str, SegmentPath] | None = None,
         record_id: str | None = None,
+        namespace: str = "",
     ) -> GatedRecord:
         """Gate one record's flattened ``fields`` and its ``top_keys``. ``trusted`` comes from
         :meth:`trusted_set`; a path in it is used in clear from the first record. ``structure``
@@ -230,7 +254,12 @@ class FieldNameStore:
         0027); when two paths end up with the same name the first value is kept; a name longer
         than the canonical event allows is dropped. ``record_id`` identifies the record across
         deliveries (the parser passes ``<source_id>:<locator>``): its names count once, however
-        often it is read; without it every call counts."""
+        often it is read; without it every call counts. ``namespace`` is ``""`` for field
+        names, else a key from :func:`namespace_key` under which the paths are counted apart
+        from every field name (anything else is refused)."""
+        if not _is_namespace(namespace):
+            msg = "namespace must be empty or come from namespace_key"
+            raise ValueError(msg)
         system = self._system(system_id)
         record = _Record(None if record_id is None else _digest(record_id))
         out = record.out
@@ -238,29 +267,29 @@ class FieldNameStore:
         for path, value in fields.items():
             segments = structure.get(path) if structure else None
             key: str | SegmentPath = path if segments is None else segments
-            cached = system.cache.get((key, trusted))
+            cached = system.cache.get((namespace, key, trusted))
             if cached is not None:
                 if cached not in out:
                     out[cached] = value
                 continue
             if segments is None:
                 segments = ((path, False),)
-            name, cacheable, hint = self._gate_path(system, segments, trusted, record)
+            name, cacheable, hint = self._gate_path(system, segments, trusted, record, namespace)
             if name is None:
                 continue
             if cacheable:
                 if len(system.cache) >= _MAX_CACHE:
                     system.cache.clear()
-                system.cache[(key, trusted)] = name
+                system.cache[(namespace, key, trusted)] = name
             if name not in out:
                 out[name] = value
                 if hint is not None:
                     name_classes[name] = hint
         gated_keys: list[str] = []
         for key in top_keys:
-            parent = system.parents.get("")
+            parent = system.parents.get(namespace)
             if (parent is not None and parent.is_map) or not (
-                key in trusted or self._name_trusted(system, "", key, record)
+                key in trusted or self._name_trusted(system, namespace, key, record)
             ):
                 gated_keys.append(MASKED_SEGMENT)
             else:
@@ -273,6 +302,7 @@ class FieldNameStore:
         segments: SegmentPath,
         trusted: frozenset[str],
         record: _Record,
+        namespace: str,
     ) -> tuple[str | None, bool, FieldClass | None]:
         """The gated name of one path, whether it may be cached (every segment trusted and in
         clear, no map on the way: a trusted name stays trusted, so the answer cannot change
@@ -285,7 +315,7 @@ class FieldNameStore:
         out = record.out
         out_segments: list[str] = []
         raw_segments: list[str] = []
-        parent_key = ""
+        parent_key = namespace
         cacheable = True
         hidden = False
         for segment, is_index in segments:

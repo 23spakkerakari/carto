@@ -142,6 +142,32 @@ def test_local_store_files_are_owner_only_from_creation(
         os.umask(previous)
 
 
+def test_local_store_refuses_a_planted_symlink(settings: EdgeSettings, kms: LocalKms) -> None:
+    """Review of 2026-11-02 (Low): a dangling symlink at ``secrets.sqlite`` made the exclusive
+    create fail (suppressed) and SQLite then followed the link; the store refuses a link,
+    dangling or not, before and after the create."""
+    database = settings.state_dir / "secrets.sqlite"
+    elsewhere = settings.state_dir / "elsewhere.sqlite"
+    try:
+        database.symlink_to(elsewhere)
+    except (OSError, NotImplementedError) as exc:  # no symlink privilege (Windows)
+        pytest.skip(f"cannot create a symlink here: {type(exc).__name__}")
+    with pytest.raises(SecretError, match="symbolic link"):
+        LocalSecretStore.open(settings, kms)
+    assert not elsewhere.exists(), "the link was followed"
+    assert database.is_symlink()
+    database.unlink()
+    elsewhere.write_bytes(b"")
+    database.symlink_to(elsewhere)  # not dangling: still a link
+    with pytest.raises(SecretError, match="symbolic link"):
+        LocalSecretStore.open(settings, kms)
+    assert elsewhere.read_bytes() == b""
+    database.unlink()
+    store = LocalSecretStore.open(settings, kms)
+    store.close()
+    assert database.is_file() and not database.is_symlink()
+
+
 def test_local_store_values_are_not_in_clear_on_disk(settings: EdgeSettings, kms: LocalKms) -> None:
     store = LocalSecretStore.open(settings, kms)
     store.put("api", "clear-text-marker-xyz")
@@ -253,13 +279,58 @@ def test_resolver_rejects_malformed_refs(settings: EdgeSettings, kms: LocalKms, 
 
 
 def vault_settings(tmp_path: Path, token: str = "s.token-value") -> EdgeSettings:  # noqa: S107
+    from carto_common.pki import create_ca  # noqa: PLC0415
+
     token_file = tmp_path / "vault-token"
     token_file.write_text(token + "\n", encoding="utf-8")
+    bundle = tmp_path / "vault-ca.pem"
+    bundle.write_bytes(create_ca().certificate_pem)
     return EdgeSettings(
         state_dir=tmp_path,
         tenant_id="acme",
-        kms=KmsSettings(vault_url="https://vault.internal:8200", vault_token_file=token_file),
+        kms=KmsSettings(
+            vault_url="https://vault.internal:8200",
+            vault_token_file=token_file,
+            vault_ca_file=bundle,
+        ),
     )
+
+
+def test_resolver_vault_client_trusts_the_configured_bundle_alone(
+    tmp_path: Path, kms: LocalKms, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The KV resolver's client is built like the Transit KMS's: the bundle alone, no system
+    store, no redirects (ADR 0070 section 7, amendment of 2026-11-02)."""
+    settings = vault_settings(tmp_path)
+    seen: list[Path] = []
+    real = __import__("carto_edge.secrets", fromlist=["vault_ssl_context"]).vault_ssl_context
+
+    def recording(ca_file: Path) -> object:
+        seen.append(ca_file)
+        return real(ca_file)
+
+    monkeypatch.setattr("carto_edge.secrets.vault_ssl_context", recording)
+    resolver = EdgeSecretResolver(settings, kms)
+    try:
+        client = resolver._vault_client()
+        assert seen == [settings.kms.vault_ca_file]
+        assert client.trust_env is False and client.follow_redirects is False
+    finally:
+        resolver.close()
+    without = EdgeSettings(
+        state_dir=tmp_path,
+        tenant_id="acme",
+        kms=KmsSettings(
+            vault_url="https://vault.internal:8200",
+            vault_token_file=settings.kms.vault_token_file,
+        ),
+    )
+    with pytest.raises(SecretError, match=r"kms\.vault_ca_file"):
+        EdgeSecretResolver(without, kms).resolve("vault://kv/carto/x")
+    assert settings.kms.vault_ca_file is not None
+    settings.kms.vault_ca_file.write_bytes(b"")
+    with pytest.raises(SecretError, match="CA bundle"):
+        EdgeSecretResolver(settings, kms).resolve("vault://kv/carto/x")
 
 
 def test_resolver_vault_kv_v2(tmp_path: Path, kms: LocalKms) -> None:

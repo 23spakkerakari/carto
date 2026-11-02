@@ -194,7 +194,12 @@ key, so the refusal path left a new certificate beside an old key. `write_pem` n
 nothing is at either path, creates the key, then creates the certificate through
 `crypto.create_public` (`O_CREAT | O_EXCL`, mode 0644), withdraws the key it just wrote if the
 certificate cannot be written, and fsyncs the directory. `create_public` is public because
-`carto-ctl pki` writes its CA copies through it too; `_create_private` keeps its name.
+`carto-ctl pki` writes its CA copies through it too; `_create_private` keeps its name. The
+`--days` ceiling of 398 that the same audit put on `carto-ctl pki init|issue` (`MAX_LEAF_DAYS`,
+ADR 0070 section 7 item F) is a ceiling and nothing more: the default stays 90 days per spec
+14.4, and only an explicit `--days` above 90 lengthens a leaf, never past the public-CA limit
+(`test_ctl_pki.py` pins the default, the ceiling and the refusal above it; review of
+2026-11-02).
 
 ## Consequences
 

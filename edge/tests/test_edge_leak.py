@@ -464,6 +464,23 @@ def test_leak_small_run(scenario: str, tmp_path: Path, restore_logging: None) ->
     verified = verify_bundle(out)
     events = list(iter_events(verified))
     assert len(events) == manifest.counts.events
+    # The probe sources produced their events with the probe words masked (ADR 0039
+    # amendment; review of 2026-11-02): a channel that dropped its records would otherwise
+    # pass the scan for the wrong reason.
+    by_source = Counter(event.source_id for event in events)
+    assert {source: by_source[source] for source in _PROBE_COUNTS} == _PROBE_COUNTS
+    channel_words = {
+        word.lower()
+        for key in ("xml_root", "route_word", "method", "file_name")
+        for word in probes[key]
+    }
+    for event in events:
+        if event.source_id in _PROBE_COUNTS:
+            template = event.template_text.lower()
+            assert not any(word in template for word in channel_words), (
+                event.source_id,
+                event.template_text,
+            )
 
     report = LeakReport(
         Markers.load(markers_file),
@@ -575,6 +592,12 @@ _PROBE_SOURCES: list[dict[str, Any]] = [
 customer text without template mining (ADR 0039 amendment of 2026-11-02): an XML source
 whose root element name is the template, an access-log source whose request line is, and a
 file source whose file name is the ``file_arrived`` hint."""
+
+
+_PROBE_COUNTS: dict[str, int] = {"src_probe_xml": 2, "src_probe_access": 4, "src_probe_files": 2}
+"""Events each source of :data:`_PROBE_SOURCES` must produce in :func:`test_leak_small_run`:
+two XML documents, four access-log lines (two with a probe route, two with a probe method)
+and two dropped files (:func:`_plant_channel_probes`)."""
 
 
 def _plant_probes(sim: Path, layout: Layout, config: Path) -> dict[str, list[str]]:

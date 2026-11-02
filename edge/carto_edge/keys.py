@@ -75,6 +75,7 @@ __all__ = [
     "ASSERTION_PUBLIC_KEY_FILE",
     "DEFAULT_OVERLAP_DAYS",
     "LOCAL_KMS_KEY_FILE",
+    "MAX_OVERLAP_DAYS",
     "PURPOSE_REVEAL_VAULT",
     "PURPOSE_TOKENIZATION",
     "ROTATION_FILE",
@@ -95,6 +96,11 @@ ROTATION_FILE: Final = "rotation.json"
 VAULT_DATA_KEY_FILE: Final = "vault-data-key.json"
 ASSERTION_PUBLIC_KEY_FILE: Final = "assertion-public.key"
 DEFAULT_OVERLAP_DAYS: Final = 30
+MAX_OVERLAP_DAYS: Final = 400
+"""Ceiling of a rotation's overlap, enforced by :meth:`KeyManager.rotate` (and so by the CLI
+flag, review of 2026-11-02): the events retention ceiling (``RetentionSettings.events_days``
+is at most 400), so the default ``max(30, events_days)`` always fits and ``timedelta`` never
+gets a value no retention justifies."""
 PURPOSE_TOKENIZATION: Final = "tokenization"
 PURPOSE_REVEAL_VAULT: Final = "reveal-vault"
 INIT_HINT: Final = "run `carto-ctl key init`"
@@ -175,7 +181,8 @@ def build_kms(settings: EdgeSettings) -> KeyWrapper:
     """The configured KMS: the local master key file or Vault Transit (ADR 0012).
 
     The Vault token is read from ``kms.vault_token_file``, never from the environment (spec
-    8.4). The message of a failure names the file, never its content.
+    8.4), and Vault's certificate is verified against ``kms.vault_ca_file`` alone (ADR 0070
+    section 7). The message of a failure names the file, never its content.
     """
     kms = settings.kms
     if kms.provider == "local":
@@ -189,8 +196,12 @@ def build_kms(settings: EdgeSettings) -> KeyWrapper:
             msg = f"local KMS master key {path} cannot be opened"
             raise KeyManagementError(msg) from exc
     token_file = kms.vault_token_file
-    if kms.vault_url is None or token_file is None:  # KmsSettings validates; keep mypy honest
-        msg = "kms.vault_url and kms.vault_token_file are required for the vault provider"
+    ca_file = kms.vault_ca_file
+    if kms.vault_url is None or token_file is None or ca_file is None:  # KmsSettings validates
+        msg = (
+            "kms.vault_url, kms.vault_token_file and kms.vault_ca_file are required for the "
+            "vault provider"
+        )
         raise KeyManagementError(msg)
     try:
         with token_file.open("rb") as handle:
@@ -211,10 +222,14 @@ def build_kms(settings: EdgeSettings) -> KeyWrapper:
         raise KeyManagementError(msg)
     try:
         return VaultTransitKms(
-            kms.vault_url, kms.vault_transit_key, token_value, mount=kms.vault_mount
+            kms.vault_url,
+            kms.vault_transit_key,
+            token_value,
+            mount=kms.vault_mount,
+            ca_file=ca_file,
         )
     except CryptoError as exc:
-        msg = "Vault Transit settings are invalid"
+        msg = f"Vault Transit settings are invalid: {exc}"
         raise KeyManagementError(msg) from exc
 
 
@@ -383,8 +398,8 @@ class KeyManager:
         old_wrapped = self._read_active(rotation)
         kms = self.kms
         overlap = overlap_days if overlap_days is not None else self._default_overlap_days()
-        if overlap < 1:
-            msg = "overlap_days must be at least 1"
+        if not 1 <= overlap <= MAX_OVERLAP_DAYS:
+            msg = f"overlap_days must be between 1 and {MAX_OVERLAP_DAYS}"
             raise KeyManagementError(msg)
         now = self._clock()
         new_version = rotation.active_version + 1

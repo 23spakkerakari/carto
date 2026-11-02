@@ -10,7 +10,9 @@ Creates, under ``<state-dir>/keys/``, exactly what the edge ``KeyManager`` reads
   "Rotation", default overlap 30 days).
 
 ``--kms vault`` wraps through Vault Transit; the token is read from ``--vault-token-file``,
-never from an option or the environment (spec 8.4 "No key material in environment variables").
+never from an option or the environment (spec 8.4 "No key material in environment variables"),
+and Vault's certificate is verified against ``--vault-ca-file`` alone, never the system trust
+store or ``SSL_CERT_FILE`` (ADR 0070 section 7).
 Existing key files are never overwritten. With ``--if-missing`` a complete earlier run (the
 tenant key, the rotation state and, for ``--kms local``, the master key all present) is a
 success that writes nothing, which is what the Compose ``key-init`` job needs on its second
@@ -79,6 +81,7 @@ class KeyInitOptions:
     vault_transit_key: str = "carto"
     vault_mount: str = "transit"
     vault_token_file: Path | None = None
+    vault_ca_file: Path | None = None
 
     @property
     def keys_dir(self) -> Path:
@@ -144,6 +147,12 @@ def configure_key_init(parser: argparse.ArgumentParser) -> None:
         metavar="FILE",
         help="File holding the Vault token (never an option value or an environment variable)",
     )
+    parser.add_argument(
+        "--vault-ca-file",
+        type=Path,
+        metavar="FILE",
+        help="CA bundle that alone verifies Vault's certificate (required with --kms vault)",
+    )
 
 
 def _read_token_file(path: Path) -> str:
@@ -166,8 +175,12 @@ def _read_token_file(path: Path) -> str:
 def _build_kms(options: KeyInitOptions) -> tuple[KeyWrapper, Path | None]:
     if options.kms == "local":
         return LocalKms.create(options.local_kms_file), options.local_kms_file
-    if options.vault_url is None or options.vault_token_file is None:
-        msg = "the vault KMS needs --vault-url and --vault-token-file"
+    if (
+        options.vault_url is None
+        or options.vault_token_file is None
+        or options.vault_ca_file is None
+    ):
+        msg = "the vault KMS needs --vault-url, --vault-token-file and --vault-ca-file"
         raise CryptoError(msg)
     return (
         VaultTransitKms(
@@ -175,6 +188,7 @@ def _build_kms(options: KeyInitOptions) -> tuple[KeyWrapper, Path | None]:
             options.vault_transit_key,
             _read_token_file(options.vault_token_file),
             mount=options.vault_mount,
+            ca_file=options.vault_ca_file,
         ),
         None,
     )
@@ -223,9 +237,12 @@ def initialize_keys(options: KeyInitOptions, *, kms: KeyWrapper | None = None) -
 
 def key_init(invocation: Invocation) -> int:
     args = invocation.args
-    if args.kms == "vault" and (args.vault_url is None or args.vault_token_file is None):
+    if args.kms == "vault" and (
+        args.vault_url is None or args.vault_token_file is None or args.vault_ca_file is None
+    ):
         invocation.err.write(
-            "carto-ctl key init: --vault-url and --vault-token-file are required with --kms vault\n"
+            "carto-ctl key init: --vault-url, --vault-token-file and --vault-ca-file are "
+            "required with --kms vault\n"
         )
         return EXIT_USAGE
     options = KeyInitOptions(
@@ -236,6 +253,7 @@ def key_init(invocation: Invocation) -> int:
         vault_transit_key=args.vault_transit_key,
         vault_mount=args.vault_mount,
         vault_token_file=args.vault_token_file,
+        vault_ca_file=args.vault_ca_file,
     )
     if args.if_missing and keys_complete(options):
         invocation.out.write(

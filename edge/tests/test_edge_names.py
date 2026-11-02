@@ -18,6 +18,7 @@ from carto_edge.pipeline.parse.names import (
     FieldNameStore,
     GatedRecord,
     exempt_prefixes,
+    namespace_key,
 )
 from carto_edge.pipeline.pii import PiiHit
 
@@ -265,3 +266,49 @@ def test_exempt_prefixes() -> None:
 def test_an_invalid_system_id_is_refused() -> None:
     with pytest.raises(ValueError, match="system_id"):
         store().apply("../x", {"a": "1"}, ("a",))
+
+
+def test_a_namespace_keeps_its_names_apart_from_field_names(tmp_path: Path) -> None:
+    """Words that are not field names (the parser's template channels) count under a key no
+    field path reaches: a trusted field path never trusts the same words in a namespace,
+    the cache keeps the two apart, and the namespace survives a restart."""
+    names = store(directory=tmp_path)
+    route = namespace_key("route")
+    assert route == "route@"
+    fields = {"customers.alice": "1"}
+    structure = {"customers.alice": segments_of("customers.alice")}
+    for n in range(MIN_NAME_RECORDS):
+        gated = names.apply(SYS, fields, ("customers",), structure=structure, record_id=f"r{n}")
+    assert gated.fields == {"customers.alice": "1"}
+    assert gated.top_keys == ("customers",)
+    # The same path in the namespace has counted nothing yet.
+    spaced = names.apply(
+        SYS, fields, ("customers",), structure=structure, record_id="a0", namespace=route
+    )
+    assert spaced.fields == {"*.*": "1"}
+    assert spaced.top_keys == ("*",)
+    for n in range(1, MIN_NAME_RECORDS):
+        spaced = names.apply(
+            SYS, fields, ("customers",), structure=structure, record_id=f"a{n}", namespace=route
+        )
+    assert spaced.fields == {"customers.alice": "1"}
+    names.flush()
+    again = store(directory=tmp_path)
+    first = again.apply(
+        SYS,
+        {"users.bob": "1"},
+        (),
+        structure={"users.bob": segments_of("users.bob")},
+        record_id="b0",
+        namespace=route,
+    )
+    assert first.fields == {"*.*": "1"}  # new words still count from one
+    kept = again.apply(SYS, fields, (), structure=structure, record_id="a9", namespace=route)
+    assert kept.fields == {"customers.alice": "1"}
+    with pytest.raises(ValueError, match="namespace"):
+        names.apply(SYS, fields, (), namespace="route")
+    with pytest.raises(ValueError, match="namespace"):
+        names.apply(SYS, fields, (), namespace="customers.alice@")
+    for label in ("", "a@b", "a.b"):
+        with pytest.raises(ValueError, match="namespace"):
+            namespace_key(label)

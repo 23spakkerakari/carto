@@ -583,6 +583,65 @@ def test_parser_access_log_route_segments_the_detector_flags_stay_parameters() -
     assert record.template_text == f"GET /customers/{MASK} 2xx"
 
 
+def test_parser_a_field_named_like_a_channel_never_trusts_the_channels_words() -> None:
+    """The channels count their words in a register namespace no field path reaches
+    (ADR 0039 amendment of 2026-11-02): a JSON source of the same system with a top-level
+    key ``$route``, ``$xml`` or ``$hint`` neither pre-trusts the channel's words nor turns
+    the channel into a map, however many records carry it."""
+    parser = gated()
+    keyed = {
+        "$route": {"customers": {"alice": 1}},
+        "$xml": {"customer_alice": 1},
+        "$hint": {"order/paid": 1, "file_arrived": {"SHIP_*_*/csv": 1}},
+    }
+    for n in range(3):
+        record = parsed(parser.parse(raw(json.dumps(keyed), locator=f"j.log:line:{n}")))
+    assert record.fields["$route.customers.alice"] == "1"  # the field's own three records
+    route = parsed(
+        parser.parse(raw(access_line("GET /customers/alice", 7), locator="a.log:line:7"))
+    )
+    assert route.template_text == f"GET /{MASK}/{MASK} 2xx"
+    xml = parsed(parser.parse(raw("<customer_alice><status>OK</status></customer_alice>")))
+    assert xml.template_text == MASK
+    hook = parsed(
+        parser.parse(
+            raw(
+                fields={"data": {"id": 1}},
+                kind=EventKind.WEBHOOK,
+                locator="webhook:1",
+                template_hint="order.paid",
+            )
+        )
+    )
+    assert hook.template_text == MASK
+    shipped = parsed(
+        parser.parse(
+            raw(
+                fields={"name": "SHIP_20260921_2112.csv", "size": 1},
+                kind=EventKind.FILE_ARRIVED,
+                locator="file:SHIP_20260921_2112.csv",
+                template_hint="file_arrived SHIP_*_*.csv",
+            )
+        )
+    )
+    assert shipped.template_text == f"file_arrived {MASK}"
+    # The other way round: a map under the field ``$route`` leaves the route channel counting.
+    store = FieldNameStore(_FlagDetector(()), map_min_keys=4)
+    parser = RecordParser(source(), TemplateStore(min_cluster_size=1), store)
+    for n in range(3):
+        many = {"$route": {f"k{letter}": 1 for letter in "abcdefgh"}}
+        parser.parse(raw(json.dumps(many), locator=f"j.log:line:{n}"))
+    records = [
+        parsed(parser.parse(raw(access_line("GET /customers/alice", n), locator=f"a.log:line:{n}")))
+        for n in range(3)
+    ]
+    assert [r.template_text for r in records] == [
+        f"GET /{MASK}/{MASK} 2xx",
+        f"GET /{MASK}/{MASK} 2xx",
+        "GET /customers/alice 2xx",
+    ]
+
+
 def test_parser_template_hint_words_are_gated_like_a_mined_template() -> None:
     """A connector's template hint carries customer text (a generalized file name, a table
     name, a webhook event type): every token goes through ``mask_tokens`` and the name gate;

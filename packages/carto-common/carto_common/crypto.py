@@ -73,6 +73,7 @@ __all__ = [
     "key_fingerprint",
     "sign_assertion",
     "token",
+    "vault_ssl_context",
     "verify_assertion",
     "write_private_file",
 ]
@@ -526,11 +527,14 @@ class VaultTransitKms:
     from the environment or a config value (spec 8.4). Vault is the customer's secret store,
     not a source system, so these POSTs are outside the read-only rule of spec 8.1.
 
-    The HTTP client it builds ignores the process environment (``trust_env=False``: no
-    ``HTTPS_PROXY``, no ``SSL_CERT_FILE``), verifies the server with the system trust store or
-    the ``ca_file`` given, TLS 1.2 at least, and never follows a redirect, so neither the token
-    nor the key material can be steered to another host (ADR 0070 section 7). A caller-supplied
-    ``client`` (tests) is still asked not to follow redirects on every request.
+    The HTTP client it builds ignores the process environment: ``trust_env=False`` (no
+    ``HTTPS_PROXY``) and a TLS context that trusts the ``ca_file`` bundle alone
+    (:func:`vault_ssl_context`: never the system store, so ``SSL_CERT_FILE`` and
+    ``SSL_CERT_DIR`` play no part), TLS 1.2 at least with the hostname checked, and it never
+    follows a redirect, so neither the token nor the key material can be steered to another
+    host (ADR 0070 section 7 and its amendment of 2026-11-02). ``ca_file`` is required unless
+    the caller supplies the ``client`` (tests), which is still asked not to follow redirects
+    on every request.
     """
 
     ALGORITHM: Final = "vault-transit"
@@ -558,16 +562,20 @@ class VaultTransitKms:
         self._key_name = key_name
         self._mount = mount.strip("/")
         self._headers = {"X-Vault-Token": token_value, "X-Vault-Request": "true"}
-        self._client = (
-            client
-            if client is not None
-            else httpx.Client(
+        if client is None:
+            if ca_file is None:
+                msg = (
+                    "Vault Transit needs ca_file: the CA bundle that alone verifies Vault's "
+                    "certificate (the system trust store is never used)"
+                )
+                raise CryptoError(msg)
+            client = httpx.Client(
                 timeout=timeout_seconds,
                 trust_env=False,
                 follow_redirects=False,
-                verify=_vault_ssl_context(ca_file),
+                verify=vault_ssl_context(ca_file),
             )
-        )
+        self._client = client
         self._key_id = f"vault:{self._mount}/{key_name}"
 
     def __repr__(self) -> str:
@@ -652,20 +660,27 @@ class VaultTransitKms:
         )
 
 
-def _vault_ssl_context(ca_file: Path | None) -> ssl.SSLContext:
-    """Server verification for Vault: the system trust store or ``ca_file`` alone (never the
-    environment's ``SSL_CERT_FILE``), TLS 1.2 minimum (spec 14.4)."""
-    if ca_file is not None and not ca_file.is_file():
+def vault_ssl_context(ca_file: Path) -> ssl.SSLContext:
+    """Server verification for Vault from ``ca_file`` alone: a client context that loads no
+    default certificates (OpenSSL's paths, ``SSL_CERT_FILE`` and ``SSL_CERT_DIR`` play no
+    part; :func:`ssl.create_default_context` would honour them), verifies the chain and the
+    hostname, TLS 1.2 minimum (spec 14.4). A missing, unreadable or empty bundle is refused
+    by name (ADR 0070 section 7, amendment of 2026-11-02)."""
+    if not ca_file.is_file():
         msg = f"Vault ca_file {ca_file} is not a readable file"
         raise CryptoError(msg)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    context.verify_mode = ssl.CERT_REQUIRED
+    context.check_hostname = True
     try:
-        context = ssl.create_default_context(
-            purpose=ssl.Purpose.SERVER_AUTH, cafile=str(ca_file) if ca_file is not None else None
-        )
+        context.load_verify_locations(cafile=str(ca_file))
     except (OSError, ssl.SSLError) as exc:
         msg = f"Vault ca_file {ca_file} cannot be loaded"
         raise CryptoError(msg) from exc
-    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    if not context.get_ca_certs(binary_form=True):
+        msg = f"Vault ca_file {ca_file} holds no CA certificate"
+        raise CryptoError(msg)
     return context
 
 

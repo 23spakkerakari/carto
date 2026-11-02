@@ -148,19 +148,30 @@ order, what a mined template gets:
    registry spells them, case-sensitive); anything else is `<*>`; an absent method stays `-`.
 4. The name gate's trust rule (ADR 0038): a word is a constant once three distinct records
    carried it under the same prefix and the detector does not flag it. The register is reused
-   as it is: the parser gates the words as the field path
-   `<channel>.<word 1>.<word 2>...` with one prefix per word, under the parents `$xml`,
-   `$route` and `$hint` (`$hint.file_arrived`, `$hint.file_removed` and `$hint.row_change`
-   are trusted from the first record: those verbs are the product's, what follows them is the
-   customer's), through `FieldNameStore.apply` with the record's id, so a record counts once
-   however often it is delivered and the analyzer's frozen second pass counts nothing. A word
-   is in clear only when the register returns its prefix with the word itself at the end; a
-   masked label, a map entry (a prefix with 256 distinct words under it) and a dropped
-   secret-named path all read as `<*>`. Counting under the channel's own parent keeps a route
-   vocabulary and a record's field names from ever making each other a map, and the prefix
-   tree keeps `alice` under `/customers` apart from `alice` under `/users` and lets
+   as it is: the parser gates the words as the path `<word 1>.<word 2>...` with one prefix
+   per word, in a **namespace** of the channel's own (`FieldNameStore.apply(namespace=
+   namespace_key("route"))`: the register parent keys `xml@`, `route@` and `hint@`; under
+   `hint@` the words `file_arrived`, `file_removed` and `row_change` are trusted from the
+   first record: those verbs are the product's, what follows them is the customer's), with
+   the record's id, so a record counts once however often it is delivered and the analyzer's
+   frozen second pass counts nothing. A word is in clear only when the register returns its
+   prefix with the word itself at the end; a masked label, a map entry (a prefix with 256
+   distinct words under it) and a dropped secret-named path all read as `<*>`. No field path
+   reaches a namespace: a field's parent keys are made of `safe_segment` outputs (which mask
+   any segment with an `@` past its first character to `*`), `#`, `~<digest>` and `value`,
+   and the register's cache is keyed by the namespace too, so a route vocabulary and a
+   record's field names never trust each other and never make each other a map, while the
+   prefix tree keeps `alice` under `/customers` apart from `alice` under `/users` and lets
    `/customers/<*>/orders` keep its last word once it repeats. The register is per system,
    so the sources of one system share a route vocabulary, as they share field names.
+   *Correction (review of 2026-11-02, Medium).* The first cut counted the channels under
+   the parents `$xml`, `$route` and `$hint`, which a JSON record's top-level key of the same
+   spelling shares: three records of the same system with a `$route` key holding
+   `{"customers": {"alice": ...}}` trusted `customers` and `alice` under it, and
+   `GET /customers/alice 2xx` reached core in clear on the first access-log request. The
+   namespace above closes it; `test_edge_parser.py` plants the three keys in three JSON
+   records and asserts the next access-log, XML and hint records still read `<*>`, and that
+   a map under the field `$route` leaves the route channel counting.
 
 Without a name store (parser unit tests only; the pipeline always passes one) rules 1 to 3
 apply alone, as for field names.
@@ -187,11 +198,29 @@ scenario's analyzer configuration and plants a marker in a root name, a route se
 request method and a file name, two records each, and asserts none crosses. The pipeline
 test `test_template_text_is_redacted_and_counted` now expects `row_change <*> <*>` for a hint
 carrying an e-mail address and no redaction count, since the address is masked before the
-redactor. Measured on 2026-11-02 (`make eval-engine`, memory engine, shop, 14 days, seed 1,
-114,468 events, the corpus of ADR 0068's after-run): the spec 18.4 table is identical (the
-five link and family rows pass, the rest are M3 and later as before), 19 engine links stored
-with 17 scored, 13 usable for families and 1 composite as before; 205 engine fields with 66
-tokenized and 16 in pass-1-only templates against 196, 59 and 0 before, the difference
-being the fields of the `<*>`, `row_change <*>` and `file_arrived <*>` templates that the
-first two records of each root, table and file name get in pass 1 (pass 2 runs on the
-frozen register, where every word trusted in pass 1 is in clear from the first record).
+redactor. Measured on 2026-11-02 with the namespace in place (`make eval-engine
+ENGINE=memory`, seed 1, `sim-out-final`, the corpora of ADR 0068's after-run; the reports
+are under `eval/reports-low/`, which is not in the tree, so this table carries them):
+
+| Spec 18.4 row | shop (14 days, 114,468 events) | people_ops (28 days, 28,036 events) |
+| --- | --- | --- |
+| Exact and bridge link precision (>= 0.95) | 1.00 pass | 1.00 pass |
+| Exact and bridge link recall (>= 0.90) | 1.00 pass | 0.80 fail (the two legacy links under the distinct floor, the founder call of the M2 note; unchanged) |
+| Composite link precision (>= 0.85) | 1.00 pass | 1.00 pass |
+| Composite link recall (>= 0.70) | 1.00 pass | 0.75 pass |
+| Entity family purity (>= 0.95) | 1.00 pass | 1.00 pass |
+| Other rows | M3 and later, as before | M3 and later, as before |
+
+| Engine counts | shop | people_ops |
+| --- | --- | --- |
+| Engine fields in the bundle / tokenized / pass-1-only | 205 / 66 / 16 | 133 / 45 / 12 |
+| Engine links stored / scored / usable for families / composite | 19 / 17 / 13 / 1 | 12 / 11 / 8 / 3 |
+| Candidates: ends, pairs verified (bridges) | 36, 99 (85) | 23, 53 (44) |
+
+Shop is identical to the run before the namespace (same five rows, 19 links with 17
+scored, 13 usable and 1 composite; 205 fields with 66 tokenized and 16 pass-1-only against
+196, 59 and 0 before the amendment, the difference being the fields of the `<*>`,
+`row_change <*>` and `file_arrived <*>` templates that the first two records of each root,
+table and file name get in pass 1; pass 2 runs on the frozen register, where every word
+trusted in pass 1 is in clear from the first record). Neither corpus has a key spelled like a
+channel, so the namespace changes no number.

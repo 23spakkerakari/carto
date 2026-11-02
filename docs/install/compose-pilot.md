@@ -199,6 +199,7 @@ fingerprints only. Options:
 | `--vault-transit-key NAME` | `carto` | Transit key name |
 | `--vault-mount PATH` | `transit` | Transit mount |
 | `--vault-token-file FILE` | none | File holding the Vault token; never an option value or an environment variable |
+| `--vault-ca-file FILE` | none | CA bundle that alone verifies Vault's certificate; required with `--kms vault`. The system trust store, `SSL_CERT_FILE` and `SSL_CERT_DIR` are never used |
 
 **Local KMS (pilots).** The master key file sits in the same volume as the keys it wraps, so the
 protection is the volume itself: disk encryption, host access control and how you handle
@@ -226,16 +227,18 @@ given the `vault_token` secret:
 ```sh
 docker compose -f deploy/compose/compose.yaml -f deploy/compose/compose.pilot.yaml run --rm \
   key-init key init --state-dir /var/lib/carto --tenant-id default --kms vault \
-  --vault-url https://vault.example.internal:8200 --vault-token-file /run/secrets/vault_token
+  --vault-url https://vault.example.internal:8200 --vault-token-file /run/secrets/vault_token \
+  --vault-ca-file /etc/carto/vault-ca.pem
 ```
 
 Then set the same KMS on `edge-gateway` in the override file: `CARTO_KMS__PROVIDER` to `vault`,
 `CARTO_KMS__VAULT_URL`, `CARTO_KMS__VAULT_TRANSIT_KEY` and `CARTO_KMS__VAULT_MOUNT` when they
-differ from `carto` and `transit`, and `CARTO_KMS__VAULT_TOKEN_FILE` pointing at a token file
-mounted as a Docker secret. The gateway reads the token file at startup to unwrap the keys.
-Vault's certificate must verify against the system trust store of the image; this build has no
-setting for a private Vault CA bundle. AWS KMS, Azure Key Vault and GCP KMS arrive in M6
-(ADR 0012).
+differ from `carto` and `transit`, `CARTO_KMS__VAULT_TOKEN_FILE` pointing at a token file
+mounted as a Docker secret, and `CARTO_KMS__VAULT_CA_FILE` pointing at the CA bundle (mount it
+read-only) that signs Vault's certificate: it is the only trust anchor the edge uses for Vault,
+also for a public CA, and the gateway refuses to start with the vault provider without it.
+The gateway reads the token file at startup to unwrap the keys. AWS KMS, Azure Key Vault and
+GCP KMS arrive in M6 (ADR 0012).
 
 **Rotation and loss.** Key rotation and KMS rewrapping follow
 [the key rotation runbook](../runbooks/key-rotation.md) (`carto-edge key status`, `key rotate`,
@@ -310,7 +313,7 @@ most 15 minutes, never written to disk in clear and never logged (spec 14.3, ADR
 
 | Scheme | In this build |
 | --- | --- |
-| `vault://<mount>/<path>[#<field>]` | HashiCorp Vault KV v2, field `value` by default. Needs `CARTO_KMS__VAULT_URL` and `CARTO_KMS__VAULT_TOKEN_FILE` on `edge-gateway`, also when the KMS provider is `local`. **The pilot path.** |
+| `vault://<mount>/<path>[#<field>]` | HashiCorp Vault KV v2, field `value` by default. Needs `CARTO_KMS__VAULT_URL`, `CARTO_KMS__VAULT_TOKEN_FILE` and `CARTO_KMS__VAULT_CA_FILE` on `edge-gateway`, also when the KMS provider is `local`. **The pilot path.** |
 | `local://<name>` | `secrets.sqlite` in the edge state volume: AES-256-GCM under a KMS-wrapped data key (ADR 0013). For Compose pilots without Vault. Write values with `carto-edge secret set` (below). |
 | `aws-sm://`, `azure-kv://`, `gcp-sm://` | Refused with a message naming M6 |
 

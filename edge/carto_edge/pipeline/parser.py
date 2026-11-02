@@ -62,7 +62,7 @@ from carto_edge.pipeline.parse.csv import CsvHeader, CsvParser, looks_like_csv_h
 from carto_edge.pipeline.parse.detect import FormatDetector
 from carto_edge.pipeline.parse.json import parse_json
 from carto_edge.pipeline.parse.logfmt import parse_logfmt
-from carto_edge.pipeline.parse.names import FieldNameStore, exempt_prefixes
+from carto_edge.pipeline.parse.names import FieldNameStore, namespace_key
 from carto_edge.pipeline.parse.text import parse_text
 from carto_edge.pipeline.parse.xml import parse_xml
 from carto_edge.pipeline.severity import (
@@ -92,20 +92,20 @@ REASON_INTERNAL: Final = "internal_error"
 FORMAT_FIELDS: Final = "fields"
 _LINE_MARKER: Final = ":line:"
 _MAX_TIMESTAMP_OVERRIDES: Final = 64
-_XML_CHANNEL: Final = "$xml"
-_ROUTE_CHANNEL: Final = "$route"
-_HINT_CHANNEL: Final = "$hint"
-"""Parents in the name register under which the three unmined template channels count their
-words (:meth:`RecordParser._constants`): never a field name's parent, so a route vocabulary
-and a record's keys never make each other a map."""
+_XML_CHANNEL: Final = "xml"
+_ROUTE_CHANNEL: Final = "route"
+_HINT_CHANNEL: Final = "hint"
+"""The three unmined template channels. Each counts its words in the name register under its
+own namespace (:func:`namespace_key`: ``xml@``, ``route@``, ``hint@``), a parent key no
+field path can reach, so a record's keys never trust a route vocabulary, nor the other way
+round, and neither makes the other a map (:meth:`RecordParser._constants`)."""
 _HINT_VERBS: Final = ("file_arrived", "file_removed", "row_change")
 """The product's own first words of a connector's template hint: constants from the first
 record. What follows them is customer text."""
 _MAX_GATED_WORDS: Final = 32
 """Words of one channel put through the register per record; later ones are masked."""
-_CHANNEL_TRUSTED: Final = exempt_prefixes(
-    (_XML_CHANNEL, _ROUTE_CHANNEL, *(f"{_HINT_CHANNEL}.{verb}" for verb in _HINT_VERBS))
-)
+_CHANNEL_TRUSTED: Final[dict[str, frozenset[str]]] = {_HINT_CHANNEL: frozenset(_HINT_VERBS)}
+"""First words trusted from the first record, per channel: the hint verbs only."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -359,13 +359,15 @@ class RecordParser:
         shape), the value-shape rule of field names (:func:`is_value_like`), then the name
         gate's trust rule (ADR 0038: a word is a constant once three distinct records carried
         it under the same prefix and the detector does not flag it). The words are counted in
-        the system's name register as the path ``<channel>.<word 1>.<word 2>...``, one
-        prefix per word, under the channel's own parent, so ``alice`` under ``/customers`` is
-        a different name from ``alice`` under ``/users`` and neither ever meets a field
-        name. A word is in clear only when the register returns its prefix with the word
-        itself at the end (a masked label, a map entry or a dropped secret-named path all read
-        as masked). Without a name store (parser unit tests only; the pipeline always passes
-        one) the shape rules alone apply, as for field names (ADR 0027).
+        the system's name register as the path ``<word 1>.<word 2>...``, one prefix per
+        word, in the channel's own namespace (``route@``, a parent key no field path can
+        reach: :func:`namespace_key`), so ``alice`` under ``/customers`` is a different name
+        from ``alice`` under ``/users`` and neither ever meets a field name, not even one
+        under a top-level key spelled like the channel. A word is in clear only when the
+        register returns its prefix with the word itself at the end (a masked label, a map
+        entry or a dropped secret-named path all read as masked). Without a name store (parser
+        unit tests only; the pipeline always passes one) the shape rules alone apply, as for
+        field names (ADR 0027).
         """
         masked, _ = mask_tokens(words)
         shaped = [MASK if token == MASK or is_value_like(token) else token for token in masked]
@@ -375,16 +377,17 @@ class RecordParser:
         fields: dict[str, str] = {}
         structure: dict[str, SegmentPath] = {}
         for end in range(1, len(keys) + 1):
-            label = ".".join((channel, *keys[:end]))
+            label = ".".join(keys[:end])
             fields[label] = str(end)
-            structure[label] = ((channel, False), *((key, False) for key in keys[:end]))
+            structure[label] = tuple((key, False) for key in keys[:end])
         gated = self._names.apply(
             raw.system_id,
             fields,
             (),
-            _CHANNEL_TRUSTED,
+            _CHANNEL_TRUSTED.get(channel, frozenset()),
             structure=structure,
             record_id=f"{raw.source_id}:{raw.locator}",
+            namespace=namespace_key(channel),
         )
         clear: dict[str, str] = {}
         for name, index in gated.fields.items():
@@ -395,7 +398,7 @@ class RecordParser:
                 out.append(MASK)
                 continue
             parts = clear.get(str(end), "").split(".")
-            out.append(word if len(parts) == end + 1 and parts[-1] == key else MASK)
+            out.append(word if len(parts) == end and parts[-1] == key else MASK)
         out.extend(MASK for _ in shaped[len(keys) :])
         return out
 

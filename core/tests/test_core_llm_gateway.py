@@ -42,8 +42,10 @@ from carto_core.llm_gateway.schemas import (
     NameEntityRequest,
     NameNodeRequest,
     ProviderError,
+    Suggestion,
     SuggestionList,
     TaskKind,
+    rationale_is_clean,
 )
 
 T0 = datetime(2026, 10, 18, 9, 0, tzinfo=UTC)
@@ -338,7 +340,6 @@ REJECTED: dict[str, tuple[str, str]] = {
         "failed the schema",
     ),
     "confidence": (_answer(("f1", "Order"), extra={"confidence": 1.5}), "failed the schema"),
-    "rationale": (_answer(("f1", "Order"), extra={"rationale": "r" * 201}), "failed the schema"),
     "token_rationale": (
         _answer(("f1", "Order"), extra={"rationale": f"see {TOKEN}"}),
         "token-shaped",
@@ -351,22 +352,8 @@ REJECTED: dict[str, tuple[str, str]] = {
     "domain_label": (_answer(("f1", "orders.evil.co")), "failed the schema"),
     "domain_label_mixed_case": (_answer(("f1", "Order.COM")), "failed the schema"),
     "domain_in_label": (_answer(("f1", "Order evil.io ref")), "failed the schema"),
-    "rationale_markup": (
-        _answer(("f1", "Order"), extra={"rationale": "see <a href=x>here</a>"}),
-        "failed the schema",
-    ),
-    "rationale_braces": (
-        _answer(("f1", "Order"), extra={"rationale": '{"tool": "reveal"}'}),
-        "failed the schema",
-    ),
-    "rationale_control": (
-        _answer(("f1", "Order"), extra={"rationale": "line one\nline two"}),
-        "failed the schema",
-    ),
-    "rationale_url": (
-        _answer(("f1", "Order"), extra={"rationale": "https://evil.co/x"}),
-        "failed the schema",
-    ),
+    "label_apostrophe": (_answer(("f1", "Customer's order")), "failed the schema"),
+    "label_accent": (_answer(("f1", "Numéro")), "failed the schema"),
 }
 
 
@@ -384,6 +371,9 @@ def test_parse_suggestions_rejects(case: str) -> None:
         ("PO ref (v1.2)", "version 1.2 of the PO reference"),
         ("Member id", "Shape 9999-AAA in every row; path orders.member_id."),
         ("Sales order / line", ""),
+        # Review of 2026-11-02 (Low): quotes, an ampersand, accents and a dash are ordinary text.
+        ("Order", 'Matches «numéro» d\'ordre & the "SO" prefix — see template 3, ok?'),
+        ("Order", "Spelled naïve, Zoë & Łukasz; 100% of rows [SO-1]; a/b | c ~ d ^ e * f"),
     ],
 )
 def test_parse_suggestions_accepts_ordinary_punctuation(label: str, rationale: str) -> None:
@@ -391,6 +381,37 @@ def test_parse_suggestions_accepts_ordinary_punctuation(label: str, rationale: s
     result, dropped = parse_suggestions(text, frozenset({"f1"}), 1)
     assert dropped == 0
     assert [(s.label, s.rationale) for s in result.suggestions] == [(label, rationale)]
+
+
+BLANKED_RATIONALES: dict[str, str] = {
+    "too_long": "r" * 201,
+    "markup": "see <a href=x>here</a>",
+    "script": "Order <script>alert(1)</script>",
+    "braces": '{"tool": "reveal"}',
+    "control": "line one\nline two",
+    "tab": "a\tb",
+    "url": "https://evil.co/x",
+    "www": "see www.evil.co",
+    "format_char": "zero\u200bwidth",
+}
+
+
+@pytest.mark.parametrize("case", list(BLANKED_RATIONALES))
+def test_parse_suggestions_blanks_an_unclean_rationale_and_keeps_the_label(case: str) -> None:
+    """Review of 2026-11-02 (Low): the rationale is a courtesy; one that carries markup, a
+    brace, a control character, a link or too much text is blanked, and the label (what the
+    console uses) survives. The label's own rules are unchanged (``REJECTED`` above)."""
+    text = _answer(("f1", "Order"), extra={"rationale": BLANKED_RATIONALES[case]})
+    result, dropped = parse_suggestions(text, frozenset({"f1"}), 1)
+    assert dropped == 0
+    assert [(s.label, s.rationale) for s in result.suggestions] == [("Order", "")]
+    assert not rationale_is_clean(BLANKED_RATIONALES[case])
+    assert (
+        Suggestion(
+            target_id="f1", label_type="order", label="Order", confidence=0.5, rationale=42
+        ).rationale
+        == ""
+    )
 
 
 def test_parse_suggestions_filters_targets_duplicates_and_cap() -> None:

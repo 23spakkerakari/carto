@@ -371,11 +371,26 @@ class KmsSettings(_Frozen):
     vault_token_file: Path | None = Field(
         default=None, description="File holding the Vault token (never an env var)."
     )
+    vault_ca_file: Path | None = Field(
+        default=None,
+        description=(
+            "CA bundle that alone verifies Vault's certificate; the system trust store and "
+            "SSL_CERT_FILE are never used (ADR 0070 section 7)."
+        ),
+    )
 
     @model_validator(mode="after")
     def _vault_needs_url(self) -> Self:
-        if self.provider == "vault" and (self.vault_url is None or self.vault_token_file is None):
+        if self.provider != "vault":
+            return self
+        if self.vault_url is None or self.vault_token_file is None:
             msg = "kms.vault_url and kms.vault_token_file are required for the vault provider"
+            raise ValueError(msg)
+        if self.vault_ca_file is None:
+            msg = (
+                "kms.vault_ca_file is required for the vault provider: the CA bundle that alone "
+                "verifies Vault's certificate (the system trust store is never used)"
+            )
             raise ValueError(msg)
         return self
 

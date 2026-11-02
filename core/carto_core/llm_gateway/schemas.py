@@ -34,6 +34,7 @@ __all__ = [
     "Suggestion",
     "SuggestionList",
     "TaskKind",
+    "rationale_is_clean",
 ]
 
 MAX_LABEL_LEN: Final = 48
@@ -43,9 +44,13 @@ MAX_TEMPLATE_TEXT_LEN: Final = 512
 LABEL_PATTERN: Final = r"^[A-Za-z0-9 _:/().-]+$"
 """Letters, digits, space and a little punctuation: no markup, no braces, no control
 characters, nothing a template engine or a shell would act on."""
-RATIONALE_PATTERN: Final = r"^[A-Za-z0-9 _:/().,;'?!-]*$"
-""":data:`LABEL_PATTERN` plus sentence punctuation; still no ``<>{}``, quotes of the double
-kind, backslashes or control characters (ADR 0070 section 7)."""
+RATIONALE_PATTERN: Final = r"^[^\x00-\x1f\x7f<>{}]*$"
+"""A rationale is any printable text, quotes, ampersands and accents included, without a
+control character, ``<``, ``>``, ``{`` or ``}``; :func:`rationale_is_clean` adds
+``str.isprintable`` (no format or line-separator characters either), the length and the URL
+rule. A rationale that fails is blanked, not refused (review of 2026-11-02): the label is what
+is used, and a tightened character class dropped whole answers over an apostrophe."""
+_RATIONALE_RE: Final = re.compile(RATIONALE_PATTERN)
 _LINK_SHAPED: Final = re.compile(
     r"://|(?:^|[^A-Za-z0-9])www\.|\.[A-Za-z]{2,6}(?![A-Za-z0-9])",
     re.IGNORECASE,
@@ -76,6 +81,19 @@ LABEL_DICTIONARY: Final[tuple[str, ...]] = (
     "batch",
 )
 """Spec 9.9: the heuristic dictionary of common field names, used with or without an LLM."""
+
+
+def rationale_is_clean(text: str) -> bool:
+    """Whether ``text`` may be shown as a suggestion's rationale (see :data:`RATIONALE_PATTERN`):
+    at most :data:`MAX_RATIONALE_LEN` printable characters, none of ``<>{}``, no control
+    character, and neither a URL scheme separator nor a ``www.`` host (a dotted field path is
+    fine)."""
+    return (
+        len(text) <= MAX_RATIONALE_LEN
+        and text.isprintable()
+        and _RATIONALE_RE.match(text) is not None
+        and not _URL_SHAPED.search(text)
+    )
 
 
 class _Strict(BaseModel):
@@ -162,7 +180,7 @@ class Suggestion(_Strict):
     label_type: LabelType
     label: Annotated[str, Field(min_length=1, max_length=MAX_LABEL_LEN, pattern=LABEL_PATTERN)]
     confidence: Annotated[float, Field(ge=0.0, le=1.0)]
-    rationale: Annotated[str, Field(max_length=MAX_RATIONALE_LEN, pattern=RATIONALE_PATTERN)] = ""
+    rationale: Annotated[str, Field(max_length=MAX_RATIONALE_LEN)] = ""
 
     @field_validator("label")
     @classmethod
@@ -174,13 +192,13 @@ class Suggestion(_Strict):
             raise ValueError(msg)
         return value
 
-    @field_validator("rationale")
+    @field_validator("rationale", mode="before")
     @classmethod
-    def _rationale_carries_no_url(cls, value: str) -> str:
-        if _URL_SHAPED.search(value):
-            msg = "must not carry a URL"
-            raise ValueError(msg)
-        return value
+    def _rationale_or_nothing(cls, value: object) -> str:
+        """A rationale that is not clean text (:func:`rationale_is_clean`) becomes ``""``
+        instead of failing the suggestion: the label carries the decision, the rationale is
+        a courtesy, and a reviewer is shown no markup, brace, control character or link."""
+        return value if isinstance(value, str) and rationale_is_clean(value) else ""
 
 
 class SuggestionList(_Strict):
