@@ -160,8 +160,14 @@ decision routes, `EntityRepository.set_name`, `compose.yaml` and CI at the same 
   2. `routes_links._decide` and `EntityPortAdapter.patch`: the demo enqueues a full assembly
      inside the decision route; the audit hook of ADR 0070 must run in the same transaction as
      that enqueue.
-  3. `EntityRepository.set_name` takes both the demo's `expected_version` and this branch's
-     `on_write`.
+  3. `EntityRepository.set_name` is rewritten by both branches and the merge is not mechanical:
+     the merged signature is `set_name(tenant_id, entity_id, *, name: str | None, description,
+     now, on_write=None, expected_version=None)`; the demo adds `expected_version`, `version + 1`
+     and `StaleVersionError`, this branch adds `on_write` and the conditional name (a description-
+     only write leaves `name` and `name_confirmed` alone, ADR 0070 section 6). `_SET_ENTITY_DESCRIPTION`
+     must also bump `version`, carry the `expected_version` predicate and the `rowcount == 0`
+     disambiguation; the in-memory repository keeps `version + 1` with the conditional name; the
+     adapter passes `name=name` unchanged.
   4. `make eval-engine` on both scenarios re-run on the rebased branch; deltas recorded.
   5. ADR 0060, `docs/plans/M3-demo.md` and `CLAUDE.md` say `fix-c2` is already merged through
      PR-1 so nobody merges it twice.
